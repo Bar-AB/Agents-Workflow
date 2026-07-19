@@ -1,5 +1,28 @@
 # Claude context / session files
 CLAUDE.md
-.claude/
+.claude/*
+# ...but keep project skills under version control
+!.claude/skills/
 
-# Pyth
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.venv/
+venv/
+
+# Loop state & local config (not source)
+*.db
+*.db-wal
+*.db-shm
+loopconfig.json
+agents.json
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
