@@ -1,6 +1,6 @@
 ---
 name: agentloop-loop-test
-description: Use when writing or updating an end-to-end test for agentloop's loop behavior — any test in tests/test_loop.py that drives a task through the Loop with a scripted MockRunner and asserts on status, metrics, or the prompts agents saw. Encodes the repo's test idiom so new decision rules get correctly-shaped coverage.
+description: Use when writing or updating an end-to-end test for agentloop's loop behavior in tests/test_loop.py — driving a task through the Loop with a scripted MockRunner and asserting on task status, escalation reason, metrics, verdicts, or the prompts agents received. Also when a new or changed decision rule needs test coverage.
 ---
 
 # Write an end-to-end loop test

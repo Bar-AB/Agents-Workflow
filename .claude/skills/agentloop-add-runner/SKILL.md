@@ -1,6 +1,6 @@
 ---
 name: agentloop-add-runner
-description: Use when adding a new model/provider backend to agentloop (litellm, OpenAI, a Codex cross-validator, or any non-Claude provider) — anything that plugs into the ModelRunner seam in runner.py. Covers implementing run(), registering it, and wiring pricing so budget caps and cost metrics stay correct.
+description: Use when adding a new model or provider backend to agentloop — litellm, OpenAI, a second-provider or Codex cross-validator, or any non-Claude runner that plugs into the ModelRunner seam in runner.py. Triggers include a new --runner choice, provider token/cost wiring, or MODEL_PRICING and budget-cap changes for a new backend.
 ---
 
 # Add a ModelRunner backend

@@ -1,6 +1,6 @@
 ---
 name: agentloop-store-schema
-description: Use when changing the SQLite store in agentloop — adding or altering a table/column in store.py's _SCHEMA, adding accessor methods, or touching the events/memory/attempts/verdicts tables. Encodes the load-bearing invariants (append-only audit log, approved-gated memory, Postgres-portable SQL) that are easy to violate by accident.
+description: Use when changing agentloop's SQLite store (store.py) — adding or altering a table or column in _SCHEMA, adding accessor methods, or touching the events, memory, attempts, or verdicts tables, or any change affecting the append-only audit log, approved-gated memory, or Postgres-portable schema.
 ---
 
 # Evolve the store safely
