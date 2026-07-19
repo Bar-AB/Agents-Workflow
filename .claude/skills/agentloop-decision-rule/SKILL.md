@@ -1,6 +1,6 @@
 ---
 name: agentloop-decision-rule
-description: Use when adding or changing any decision rule in the agentloop orchestration state machine — approve/revise/escalate logic, thresholds, budget caps, risk gating, or how a verdict maps to a task status. CLAUDE.md forbids changing these without updating tests + README, and this skill encodes that sync gate.
+description: Use when adding or changing any decision rule in agentloop's orchestration state machine (loop.py) — approve/revise/escalate logic, confidence thresholds, budget caps, risk gating, bounded revisions, or how a validator verdict maps to a task status.
 ---
 
 # Change a loop decision rule
