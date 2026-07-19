@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentloop"
+version = "0.1.0"
+description = "General-purpose agentic development loop: worker/validator agents, human-in-the-loop review, SQLite source of truth, metrics."
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = []
+
+[project.optional-dependencies]
+claude = ["claude-agent-sdk>=0.1.0"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+agentloop = "agentloop.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["agentloop*"]
