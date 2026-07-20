@@ -57,10 +57,25 @@ class LoopConfig:
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> "LoopConfig":
-        """Load from a JSON file if it exists, else defaults."""
+        """Load from a JSON file if it exists, else defaults.
+
+        Read as utf-8-sig: Windows editors (Notepad, PowerShell's Out-File)
+        write a BOM, and plain utf-8 would reject the file with a stack trace
+        that says nothing about the real problem.
+        """
         if path and Path(path).exists():
-            data = json.loads(Path(path).read_text(encoding="utf-8"))
+            raw = Path(path).read_text(encoding="utf-8-sig")
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{path} is not valid JSON: {exc}") from exc
             known = {f for f in cls.__dataclass_fields__}
+            unknown = sorted(set(data) - known)
+            if unknown:
+                # Surface typos rather than silently ignoring a setting the
+                # user believes is in effect.
+                print(f"warning: ignoring unknown config keys in {path}: "
+                      f"{', '.join(unknown)}")
             return cls(**{k: v for k, v in data.items() if k in known})
         return cls()
 

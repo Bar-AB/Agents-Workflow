@@ -70,7 +70,8 @@ class Registry:
     @classmethod
     def load(cls, path: str | Path | None = None) -> "Registry":
         if path and Path(path).exists():
-            raw = json.loads(Path(path).read_text(encoding="utf-8"))
+            # utf-8-sig: agents.json is hand-edited, often on Windows.
+            raw = json.loads(Path(path).read_text(encoding="utf-8-sig"))
             agents = {name: AgentSpec(**spec) for name, spec in raw.items()}
             return cls(agents)
         return cls(dict(DEFAULT_AGENTS))
