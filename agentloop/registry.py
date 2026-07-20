@@ -43,7 +43,7 @@ DEFAULT_AGENTS: dict[str, AgentSpec] = {
         role="worker",
         model="claude-sonnet-5",
         system_prompt=WORKER_SYSTEM,
-        tools=["file_io", "git", "search", "task_state"],  # shared baseline
+        tools=["file_io", "git", "search", "task_state"],
         context_budget_tokens=120_000,
         version="1",
     ),

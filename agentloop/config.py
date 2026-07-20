@@ -14,7 +14,7 @@ All values are tunable globally here or per task via Task.overrides.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 

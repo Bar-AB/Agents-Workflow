@@ -141,7 +141,7 @@ def test_budget_cap_trips_to_human(store):
     assert "Budget cap" in task.escalation_reason
 
 
-def test_resumability_from_store(store, tmp_path):
+def test_resumability_from_store(store):
     """Loop picks up pending tasks from the store after a 'restart'."""
     add_task(store)
     add_task(store)

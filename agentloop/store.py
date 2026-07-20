@@ -18,7 +18,7 @@ import sqlite3
 import time
 from pathlib import Path
 
-from .models import Task, TaskStatus, Verdict, VerdictKind
+from .models import Task, TaskStatus, Verdict
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
