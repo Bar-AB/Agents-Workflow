@@ -20,7 +20,8 @@ _VERDICT_RE = re.compile(
 
 
 def _invoke(store: Store, runner: ModelRunner, task: Task, kind: str,
-            role: str, model: str, system: str, prompt: str) -> RunResult:
+            role: str, model: str, system: str,
+            prompt: str) -> tuple[RunResult, int]:
     """Run one agent invocation with full attempt/metrics bookkeeping."""
     attempt_id = store.start_attempt(task.id, kind, role, model)
     store.log_event(task.id, f"{kind}_prompt", {"role": role, "prompt": prompt})
@@ -32,8 +33,7 @@ def _invoke(store: Store, runner: ModelRunner, task: Task, kind: str,
         "role": role, "output": result.output,
         "tokens_in": result.tokens_in, "tokens_out": result.tokens_out,
         "cost_usd": cost})
-    result.attempt_id = attempt_id  # type: ignore[attr-defined]
-    return result
+    return result, attempt_id
 
 
 def run_worker(store: Store, runner: ModelRunner, registry: Registry,
@@ -50,8 +50,9 @@ def run_worker(store: Store, runner: ModelRunner, registry: Registry,
             f"\n## Validator feedback (revision {task.revision_count})\n"
             f"{feedback}\n\nRevise your output to address the feedback."
         )
-    return _invoke(store, runner, task, "worker", spec.role, spec.model,
-                   spec.system_prompt, prompt)
+    result, _ = _invoke(store, runner, task, "worker", spec.role, spec.model,
+                        spec.system_prompt, prompt)
+    return result
 
 
 def run_validator(store: Store, runner: ModelRunner, registry: Registry,
@@ -63,11 +64,9 @@ def run_validator(store: Store, runner: ModelRunner, registry: Registry,
         f"## Acceptance criteria\n{task.acceptance_criteria}\n\n"
         f"## Worker output\n{worker_output}\n"
     )
-    result = _invoke(store, runner, task, "validator", spec.role, spec.model,
-                     spec.system_prompt, prompt)
-    verdict = parse_verdict(result.output)
-    attempt_id = getattr(result, "attempt_id", None)
-    return verdict, attempt_id
+    result, attempt_id = _invoke(store, runner, task, "validator", spec.role,
+                                 spec.model, spec.system_prompt, prompt)
+    return parse_verdict(result.output), attempt_id
 
 
 def parse_verdict(text: str) -> Verdict:

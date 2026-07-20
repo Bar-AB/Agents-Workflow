@@ -50,7 +50,7 @@ class Loop:
             if self._budget_tripped(task):
                 return task
 
-            # 1. Execute (spec §4.2–4.3: worker self-checks in its output)
+            # Worker self-checks in its own output (spec §4.2–4.3).
             self.store.set_status(task, TaskStatus.IN_PROGRESS)
             result = run_worker(self.store, self.runner, self.registry,
                                 task, feedback)
@@ -62,13 +62,12 @@ class Loop:
             task.output = result.output
             self.store.update_task(task)
 
-            # 2. Independent validation (spec §5)
+            # Validation runs in a separate context from the worker (spec §5).
             self.store.set_status(task, TaskStatus.VALIDATING)
             verdict, attempt_id = run_validator(
                 self.store, self.runner, self.registry, task, task.output)
             self.store.add_verdict(task.id, attempt_id, verdict)
 
-            # 3. Decide
             cfg = self.config
             severe = (verdict.kind == VerdictKind.ESCALATE
                       or verdict.confidence < cfg.severe_threshold)
@@ -94,7 +93,6 @@ class Loop:
                     self.store.set_status(task, TaskStatus.DONE)
                 return task
 
-            # Revise (bounded)
             if task.revision_count >= cfg.max_revisions:
                 self.store.set_status(
                     task, TaskStatus.NEEDS_HUMAN,

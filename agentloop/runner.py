@@ -14,6 +14,12 @@ from typing import Protocol
 
 from .models import RunResult
 
+try:  # optional extra: `pip install agentloop[claude]`
+    import anyio
+    from claude_agent_sdk import ClaudeAgentOptions, query
+except ImportError:  # core stays stdlib-only; MockRunner works without it
+    anyio = None
+
 
 class ModelRunner(Protocol):
     def run(self, system_prompt: str, prompt: str, model: str) -> RunResult:
@@ -46,14 +52,13 @@ class ClaudeSDKRunner:
     Anthropic credentials (ANTHROPIC_API_KEY or Claude Code auth)."""
 
     def run(self, system_prompt: str, prompt: str, model: str) -> RunResult:
-        import anyio
-
+        if anyio is None:
+            raise RuntimeError(
+                "ClaudeSDKRunner requires `pip install agentloop[claude]`")
         return anyio.run(self._run_async, system_prompt, prompt, model)
 
     async def _run_async(self, system_prompt: str, prompt: str,
                          model: str) -> RunResult:
-        from claude_agent_sdk import ClaudeAgentOptions, query
-
         options = ClaudeAgentOptions(
             system_prompt=system_prompt,
             model=model,
@@ -62,7 +67,6 @@ class ClaudeSDKRunner:
         chunks: list[str] = []
         tokens_in = tokens_out = 0
         async for message in query(prompt=prompt, options=options):
-            # Collect assistant text; pull usage off the result message.
             text = getattr(message, "result", None)
             if isinstance(text, str):
                 chunks.append(text)
