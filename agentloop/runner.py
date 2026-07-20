@@ -22,8 +22,13 @@ except ImportError:  # core stays stdlib-only; MockRunner works without it
 
 
 class ModelRunner(Protocol):
-    def run(self, system_prompt: str, prompt: str, model: str) -> RunResult:
-        """Execute one agent invocation and return output + token usage."""
+    def run(self, system_prompt: str, prompt: str, model: str,
+            tools: list[str] | None = None) -> RunResult:
+        """Execute one agent invocation and return output + token usage.
+
+        `tools` is the agent's allowlist from the registry (spec §3): the
+        shared baseline plus its role-specific tools.
+        """
         ...
 
 
@@ -35,9 +40,10 @@ class MockRunner:
         self.outputs = list(outputs or [])
         self.calls: list[dict] = []
 
-    def run(self, system_prompt: str, prompt: str, model: str) -> RunResult:
-        self.calls.append(
-            {"system": system_prompt, "prompt": prompt, "model": model})
+    def run(self, system_prompt: str, prompt: str, model: str,
+            tools: list[str] | None = None) -> RunResult:
+        self.calls.append({"system": system_prompt, "prompt": prompt,
+                           "model": model, "tools": list(tools or [])})
         output = self.outputs.pop(0) if self.outputs else "(mock output)"
         return RunResult(
             output=output,
@@ -47,23 +53,57 @@ class MockRunner:
         )
 
 
+# The registry names tools logically so it stays provider-neutral (spec §3);
+# translating to concrete vendor tool names is the seam's job, not the
+# registry's. An unknown logical name maps to nothing rather than being passed
+# through blind — an agent silently gaining an unintended tool is worse than
+# one missing a tool it asked for.
+LOGICAL_TOOL_MAP: dict[str, list[str]] = {
+    "file_io": ["Read", "Write", "Edit"],
+    "search": ["Glob", "Grep"],
+    "git": ["Bash"],
+    "shell": ["Bash"],
+    "task_state": [],      # served in-process via the store, not an SDK tool
+    "web": ["WebFetch", "WebSearch"],
+}
+
+
+def resolve_tools(logical: list[str] | None) -> list[str]:
+    """Map registry tool names to concrete SDK tool names, de-duplicated."""
+    resolved: list[str] = []
+    for name in logical or []:
+        for concrete in LOGICAL_TOOL_MAP.get(name, []):
+            if concrete not in resolved:
+                resolved.append(concrete)
+    return resolved
+
+
 class ClaudeSDKRunner:
     """Claude Agent SDK backend. Requires `pip install agentloop[claude]` and
     Anthropic credentials (ANTHROPIC_API_KEY or Claude Code auth)."""
 
-    def run(self, system_prompt: str, prompt: str, model: str) -> RunResult:
+    def run(self, system_prompt: str, prompt: str, model: str,
+            tools: list[str] | None = None) -> RunResult:
         if anyio is None:
             raise RuntimeError(
                 "ClaudeSDKRunner requires `pip install agentloop[claude]`")
-        return anyio.run(self._run_async, system_prompt, prompt, model)
+        return anyio.run(self._run_async, system_prompt, prompt, model, tools)
 
-    async def _run_async(self, system_prompt: str, prompt: str,
-                         model: str) -> RunResult:
-        options = ClaudeAgentOptions(
+    def build_options(self, system_prompt: str, model: str,
+                      tools: list[str] | None):
+        """Construct SDK options. Split out so the tool allowlist is testable
+        without credentials or a live call."""
+        allowed = resolve_tools(tools)
+        return ClaudeAgentOptions(
             system_prompt=system_prompt,
             model=model,
             max_turns=25,
+            allowed_tools=allowed,
         )
+
+    async def _run_async(self, system_prompt: str, prompt: str, model: str,
+                         tools: list[str] | None = None) -> RunResult:
+        options = self.build_options(system_prompt, model, tools)
         chunks: list[str] = []
         tokens_in = tokens_out = 0
         async for message in query(prompt=prompt, options=options):

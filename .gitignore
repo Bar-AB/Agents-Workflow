@@ -14,6 +14,18 @@ dist/
 .venv/
 venv/
 
+# Frontend (Phase 2). `dist/` above already covers web/dist.
+node_modules/
+
+# Agent task workspaces — scratch space for worker output, never source
+.agentloop/
+
+# Developer-facing working notes: delivery reports, goal prompts, design specs.
+# Process artifacts for whoever is driving the build, not part of the project
+# that runs. README.md is the product documentation.
+temp/
+docs/
+
 # Loop state & local config (not source)
 *.db
 *.db-wal

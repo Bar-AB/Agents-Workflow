@@ -7,8 +7,13 @@ Defaults reflect the seed spec:
 - max_revisions: bounded retries before escalation (spec §4.5).
 - max_cost_usd_per_task / max_tokens_per_task: hard budget caps (spec §11) —
   a stuck revision loop trips to human review instead of burning spend.
+- test_command / workspace_root / test_timeout_s: the sandboxed execution seam
+  (spec §5). Tests really run; their result is authoritative over the
+  validator's self-report.
+- memory_promote_threshold: project facts read this many times are promoted to
+  loop memory (spec §7).
 
-All values are tunable globally here or per task via Task.overrides.
+All values are tunable globally here or via loopconfig.json.
 """
 
 from __future__ import annotations
@@ -31,15 +36,46 @@ class LoopConfig:
     db_path: str = "agentloop.db"
     registry_path: str = "agents.json"
 
+    # Sandboxed test execution (spec §5). The command is allowlisted here, not
+    # taken from model output, and never runs through a shell.
+    allow_test_exec: bool = True
+    test_command: str = "pytest -q"
+    test_timeout_s: int = 120
+    workspace_root: str = ".agentloop/ws"
+
+    # Memory (spec §7): a project fact read this often is promoted to the
+    # cross-project loop tier.
+    memory_promote_threshold: int = 3
+
+    # Phase 2 dashboard server.
+    server_host: str = "127.0.0.1"
+    server_port: int = 8765
+    stream_poll_seconds: float = 0.5
+
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2)
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> "LoopConfig":
-        """Load from a JSON file if it exists, else defaults."""
+        """Load from a JSON file if it exists, else defaults.
+
+        Read as utf-8-sig: Windows editors (Notepad, PowerShell's Out-File)
+        write a BOM, and plain utf-8 would reject the file with a stack trace
+        that says nothing about the real problem.
+        """
         if path and Path(path).exists():
-            data = json.loads(Path(path).read_text(encoding="utf-8"))
+            raw = Path(path).read_text(encoding="utf-8-sig")
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{path} is not valid JSON: {exc}") from exc
             known = {f for f in cls.__dataclass_fields__}
+            unknown = sorted(set(data) - known)
+            if unknown:
+                # Surface typos rather than silently ignoring a setting the
+                # user believes is in effect.
+                print(f"warning: ignoring unknown config keys in {path}: "
+                      f"{', '.join(unknown)}")
             return cls(**{k: v for k, v in data.items() if k in known})
         return cls()
 

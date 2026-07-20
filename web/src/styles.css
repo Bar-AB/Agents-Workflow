@@ -1,0 +1,287 @@
+/* agentloop dashboard.
+   Status colors are the one semantic axis in the palette; everything else is
+   neutral so a glance at the board reads state, not decoration. */
+
+:root {
+  --bg: #0f1115;
+  --panel: #171a21;
+  --panel-2: #1d212a;
+  --line: #272c37;
+  --text: #e6e8ee;
+  --muted: #8b93a7;
+  --accent: #6ea8fe;
+
+  --pending: #6b7280;
+  --running: #6ea8fe;
+  --testing: #c084fc;
+  --validating: #f0b429;
+  --revising: #fb923c;
+  --needs-human: #f472b6;
+  --done: #34d399;
+  --failed: #f87171;
+
+  --radius: 10px;
+  --mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f6f7f9;
+    --panel: #ffffff;
+    --panel-2: #f0f2f6;
+    --line: #dfe3ea;
+    --text: #1a1d24;
+    --muted: #5b6478;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.5 system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+}
+
+.app { max-width: 1400px; margin: 0 auto; padding: 20px; }
+
+/* ---- header ---- */
+.header {
+  display: flex; align-items: center; gap: 16px;
+  flex-wrap: wrap; margin-bottom: 20px;
+}
+.header h1 {
+  font-size: 18px; margin: 0; letter-spacing: -0.01em;
+  font-family: var(--mono);
+}
+.header h1 span { color: var(--muted); font-weight: 400; }
+
+.conn {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 12px; color: var(--muted);
+  padding: 4px 10px; border: 1px solid var(--line);
+  border-radius: 999px;
+}
+.dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
+.conn.live .dot { background: var(--done); animation: pulse 2s infinite; }
+.conn.offline .dot { background: var(--failed); }
+@keyframes pulse { 50% { opacity: 0.35; } }
+
+.spacer { flex: 1; }
+
+/* ---- generic panel ---- */
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 16px;
+}
+.panel h2 {
+  font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em;
+  color: var(--muted); margin: 0 0 12px; font-weight: 600;
+}
+
+/* ---- stat tiles ---- */
+.stats {
+  display: grid; gap: 12px; margin-bottom: 16px;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+}
+.stat { background: var(--panel); border: 1px solid var(--line);
+        border-radius: var(--radius); padding: 12px 14px; }
+.stat .label {
+  font-size: 11px; color: var(--muted);
+  text-transform: uppercase; letter-spacing: 0.06em;
+}
+.stat .value {
+  font-size: 22px; font-family: var(--mono); margin-top: 4px;
+  font-variant-numeric: tabular-nums;
+}
+.stat .sub { font-size: 11px; color: var(--muted); margin-top: 2px; }
+
+/* ---- layout ---- */
+.grid { display: grid; gap: 16px; grid-template-columns: 2fr 1fr; }
+/* Grid items default to min-width:auto and refuse to shrink below their
+   content, which would push the whole page into horizontal scroll. Wide
+   content scrolls inside its own panel instead. */
+.grid > * { min-width: 0; }
+@media (max-width: 1000px) { .grid { grid-template-columns: 1fr; } }
+
+/* ---- task board ----
+   Five lifecycle columns stay on one row so the board reads left-to-right as
+   a task's journey; below that width it scrolls horizontally rather than
+   wrapping, since a wrapped board breaks the progression it exists to show. */
+.board {
+  display: grid; gap: 10px;
+  grid-template-columns: repeat(5, minmax(128px, 1fr));
+  overflow-x: auto;
+  padding-bottom: 4px;
+}
+.column { min-width: 0; }
+.column-head {
+  font-size: 10px; text-transform: uppercase; letter-spacing: 0.07em;
+  color: var(--muted); margin-bottom: 8px; display: flex;
+  justify-content: space-between; align-items: center;
+}
+.column-head .count {
+  font-family: var(--mono); background: var(--panel-2);
+  padding: 1px 6px; border-radius: 999px;
+}
+
+.card {
+  background: var(--panel-2); border: 1px solid var(--line);
+  border-left: 3px solid var(--pending);
+  border-radius: 8px; padding: 10px; margin-bottom: 8px;
+  cursor: pointer; transition: transform 0.12s, border-color 0.12s;
+}
+.card:hover { transform: translateY(-1px); border-color: var(--accent); }
+.card.selected { border-color: var(--accent); }
+.card .id { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+.card .title { font-size: 13px; margin-top: 2px; word-break: break-word; }
+.card .meta {
+  display: flex; gap: 8px; margin-top: 6px;
+  font-size: 10px; color: var(--muted); font-family: var(--mono);
+}
+
+/* Status is carried on the card's left edge and the column dot. */
+.s-pending { border-left-color: var(--pending); }
+.s-in_progress { border-left-color: var(--running); }
+.s-testing { border-left-color: var(--testing); }
+.s-validating { border-left-color: var(--validating); }
+.s-revising { border-left-color: var(--revising); }
+.s-needs_human { border-left-color: var(--needs-human); }
+.s-done { border-left-color: var(--done); }
+.s-failed { border-left-color: var(--failed); }
+
+.active-card { animation: working 1.6s ease-in-out infinite; }
+@keyframes working {
+  50% { box-shadow: 0 0 0 2px rgba(110, 168, 254, 0.18); }
+}
+
+.risk-2 { color: var(--needs-human); }
+
+/* ---- agents ---- */
+.agent { display: flex; align-items: center; gap: 10px;
+         padding: 8px 0; border-bottom: 1px solid var(--line); }
+.agent:last-child { border-bottom: none; }
+.agent .who { flex: 1; min-width: 0; }
+.agent .role { font-size: 13px; }
+.agent .model { font-size: 11px; color: var(--muted); font-family: var(--mono); }
+.agent .state {
+  font-size: 10px; font-family: var(--mono); text-transform: uppercase;
+  padding: 2px 7px; border-radius: 999px;
+  border: 1px solid var(--line); color: var(--muted);
+}
+.agent .state.busy {
+  color: var(--running); border-color: var(--running);
+  animation: pulse 1.4s infinite;
+}
+.tools { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+.tool {
+  font-size: 9px; font-family: var(--mono); color: var(--muted);
+  background: var(--panel-2); padding: 1px 5px; border-radius: 4px;
+}
+
+/* ---- event feed ---- */
+.feed { max-height: 340px; overflow-y: auto; font-family: var(--mono);
+        font-size: 11px; }
+.ev { display: flex; gap: 8px; padding: 4px 0;
+      border-bottom: 1px solid var(--line); }
+.ev:last-child { border-bottom: none; }
+.ev .t { color: var(--muted); flex-shrink: 0; }
+.ev .k { flex-shrink: 0; min-width: 108px; }
+.ev .p { color: var(--muted); overflow: hidden; text-overflow: ellipsis;
+         white-space: nowrap; }
+.k-verdict { color: var(--validating); }
+.k-test_run { color: var(--testing); }
+.k-test_disagreement { color: var(--failed); font-weight: 600; }
+.k-human_approve, .k-human_redo, .k-human_reject { color: var(--needs-human); }
+.k-memory_promoted, .k-memory_write { color: var(--done); }
+
+/* ---- detail ---- */
+.detail { margin-top: 16px; }
+.detail pre {
+  background: var(--panel-2); border: 1px solid var(--line);
+  border-radius: 8px; padding: 10px; overflow-x: auto;
+  font-size: 11px; max-height: 260px; white-space: pre-wrap;
+  word-break: break-word;
+}
+.kv { display: grid; grid-template-columns: 130px 1fr; gap: 4px 10px;
+      font-size: 12px; margin-bottom: 12px; }
+.kv dt { color: var(--muted); }
+.kv dd { margin: 0; font-family: var(--mono); }
+
+.verdicts { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
+.verdict {
+  font-family: var(--mono); font-size: 11px; padding: 3px 8px;
+  border-radius: 6px; border: 1px solid var(--line);
+}
+.v-approve { color: var(--done); border-color: var(--done); }
+.v-revise { color: var(--revising); border-color: var(--revising); }
+.v-escalate { color: var(--failed); border-color: var(--failed); }
+
+.test-row { font-family: var(--mono); font-size: 11px; padding: 6px 0;
+            border-bottom: 1px solid var(--line); }
+.t-pass { color: var(--done); }
+.t-fail, .t-error { color: var(--failed); }
+.t-na { color: var(--muted); }
+
+.banner {
+  background: rgba(244, 114, 182, 0.1); border: 1px solid var(--needs-human);
+  color: var(--needs-human); border-radius: 8px; padding: 10px;
+  font-size: 12px; margin-bottom: 12px;
+}
+.banner.err {
+  background: rgba(248, 113, 113, 0.1); border-color: var(--failed);
+  color: var(--failed);
+}
+
+/* ---- buttons & forms ---- */
+button {
+  font: inherit; font-size: 12px; cursor: pointer;
+  background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--line); border-radius: 7px; padding: 6px 12px;
+  transition: border-color 0.12s, color 0.12s;
+}
+button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+button:disabled { opacity: 0.45; cursor: not-allowed; }
+button.primary { background: var(--accent); color: #0b1220; border-color: var(--accent); }
+button.primary:hover:not(:disabled) { opacity: 0.9; color: #0b1220; }
+button.danger:hover:not(:disabled) { border-color: var(--failed); color: var(--failed); }
+.actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+
+input, textarea, select {
+  font: inherit; font-size: 13px; width: 100%;
+  background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--line); border-radius: 7px;
+  padding: 8px 10px; margin-bottom: 8px;
+}
+input:focus, textarea:focus, select:focus {
+  outline: none; border-color: var(--accent);
+}
+textarea { resize: vertical; min-height: 60px; }
+label { font-size: 11px; color: var(--muted); display: block; margin-bottom: 3px; }
+
+/* ---- memory ---- */
+.fact { padding: 8px 0; border-bottom: 1px solid var(--line); font-size: 12px; }
+.fact:last-child { border-bottom: none; }
+.fact .head { display: flex; align-items: center; gap: 8px; }
+.fact .key { font-family: var(--mono); flex: 1; word-break: break-all; }
+.fact .val { color: var(--muted); font-size: 11px; margin-top: 2px;
+             word-break: break-word; }
+.tier {
+  font-size: 9px; font-family: var(--mono); text-transform: uppercase;
+  padding: 1px 6px; border-radius: 4px; border: 1px solid var(--line);
+  color: var(--muted);
+}
+.tier.loop { color: var(--done); border-color: var(--done); }
+.pending-flag { color: var(--validating); font-size: 10px;
+                font-family: var(--mono); }
+
+.empty { color: var(--muted); font-size: 12px; padding: 8px 0; }
+
+.tabs { display: flex; gap: 4px; margin-bottom: 12px; }
+.tab { font-size: 12px; padding: 5px 11px; border-radius: 7px;
+       border: 1px solid transparent; background: none; color: var(--muted); }
+.tab.on { background: var(--panel-2); border-color: var(--line);
+          color: var(--text); }

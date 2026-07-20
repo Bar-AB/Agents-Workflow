@@ -1,4 +1,7 @@
-"""End-to-end tests of the vertical slice using MockRunner (no API keys)."""
+"""End-to-end tests of the loop using MockRunner (no API keys)."""
+
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -25,6 +28,11 @@ def store(tmp_path):
 
 
 def make_loop(store, outputs, **cfg_overrides):
+    # Workspaces live beside the test db so a run never touches the real repo,
+    # and test execution is off unless a test explicitly opts in.
+    cfg_overrides.setdefault(
+        "workspace_root", str(Path(store.db_path).parent / "ws"))
+    cfg_overrides.setdefault("allow_test_exec", False)
     config = LoopConfig(db_path=store.db_path, **cfg_overrides)
     runner = MockRunner(outputs)
     return Loop(store, runner, Registry.load(), config), runner
@@ -165,3 +173,126 @@ def test_memory_tiers_and_audit(store):
     assert store.memory_read("project", "sketchy_fact") is None  # gated
     kinds = [e["kind"] for e in store.events()]
     assert kinds.count("memory_write") == 2  # writes are auditable
+
+
+# -- executed tests are authoritative (spec §5) ------------------------------
+
+def make_testing_loop(store, tmp_path, outputs, files: dict[str, str],
+                      **overrides):
+    """A loop whose workspace really contains tests, with execution enabled."""
+    ws_root = tmp_path / "ws"
+    task_ws = ws_root / "task-1"
+    task_ws.mkdir(parents=True)
+    for name, body in files.items():
+        (task_ws / name).write_text(body, encoding="utf-8")
+    return make_loop(store, outputs, workspace_root=str(ws_root),
+                     allow_test_exec=True,
+                     test_command=f"{sys.executable} -m pytest -q",
+                     **overrides)
+
+
+PASSING = "def test_ok():\n    assert True\n"
+FAILING = "def test_bad():\n    assert False\n"
+
+
+def test_executed_failure_blocks_a_confident_approval(store, tmp_path):
+    """The core rule change: a validator can no longer approve past tests that
+    actually fail."""
+    task = add_task(store)
+    loop, _ = make_testing_loop(
+        store, tmp_path, ["out", APPROVE, "out2", APPROVE],
+        {"test_bad.py": FAILING}, max_revisions=1)
+    loop.run_task(task)
+
+    assert task.status == TaskStatus.NEEDS_HUMAN
+    assert task.revision_count == 1        # it revised rather than completing
+
+
+def test_executed_pass_allows_approval(store, tmp_path):
+    task = add_task(store)
+    loop, _ = make_testing_loop(store, tmp_path, ["out", APPROVE],
+                                {"test_ok.py": PASSING})
+    loop.run_task(task)
+    assert task.status == TaskStatus.DONE
+
+
+def test_validator_test_claim_mismatch_is_recorded(store, tmp_path):
+    task = add_task(store)
+    loop, _ = make_testing_loop(
+        store, tmp_path, ["out", APPROVE, "out2", APPROVE],
+        {"test_bad.py": FAILING}, max_revisions=1)
+    loop.run_task(task)
+
+    mismatches = [e for e in store.events(task.id)
+                  if e["kind"] == "test_disagreement"]
+    assert mismatches, "validator claiming pass over a real fail must be logged"
+    assert mismatches[0]["payload"]["validator_claimed"] is True
+    assert mismatches[0]["payload"]["actual"] is False
+
+
+def test_real_test_results_are_stored_and_reach_the_validator(store, tmp_path):
+    task = add_task(store)
+    loop, runner = make_testing_loop(store, tmp_path, ["out", APPROVE],
+                                     {"test_ok.py": PASSING})
+    loop.run_task(task)
+
+    runs = store.test_runs(task.id)
+    assert runs and runs[0]["status"] == "pass"
+    assert runs[0]["exit_code"] == 0
+    validator_prompt = runner.calls[1]["prompt"]
+    assert "Executed test results (authoritative)" in validator_prompt
+
+
+def test_no_workspace_falls_back_to_the_validator_claim(store, tmp_path):
+    """With nothing to execute, the old behavior stands — 'na' is not a fail."""
+    task = add_task(store)
+    loop, _ = make_loop(store, ["out", APPROVE],
+                        workspace_root=str(tmp_path / "empty"),
+                        allow_test_exec=True)
+    loop.run_task(task)
+    assert task.status == TaskStatus.DONE
+
+
+def test_redo_wipes_the_workspace(store, tmp_path):
+    task = add_task(store)
+    loop, _ = make_testing_loop(store, tmp_path, ["out", SEVERE],
+                                {"test_ok.py": PASSING})
+    loop.run_task(task)
+    stale = tmp_path / "ws" / "task-1" / "test_ok.py"
+    assert stale.exists()
+
+    loop.human_redo(task.id)
+    assert not stale.exists(), "a redo must not inherit the old attempt's files"
+
+
+# -- memory and tools reach the agents ---------------------------------------
+
+def test_approved_memory_is_injected_into_prompts(store):
+    store.memory_write("loop", "test_command", "pytest -q", approved=True)
+    store.memory_write("project", "unvetted", "do not trust me")
+
+    task = add_task(store)
+    loop, runner = make_loop(store, ["out", APPROVE])
+    loop.run_task(task)
+
+    worker_prompt = runner.calls[0]["prompt"]
+    assert "Known project facts" in worker_prompt
+    assert "pytest -q" in worker_prompt
+    assert "do not trust me" not in worker_prompt   # gating holds end-to-end
+
+
+def test_registry_tools_are_passed_to_the_runner(store):
+    task = add_task(store)
+    loop, runner = make_loop(store, ["out", APPROVE])
+    loop.run_task(task)
+
+    assert "file_io" in runner.calls[0]["tools"]     # worker
+    assert "git" in runner.calls[0]["tools"]
+    assert "git" not in runner.calls[1]["tools"]     # validator: read-only
+
+
+def test_worker_is_told_where_its_workspace_is(store):
+    task = add_task(store)
+    loop, runner = make_loop(store, ["out", APPROVE])
+    loop.run_task(task)
+    assert "task-1" in runner.calls[0]["prompt"]
