@@ -15,10 +15,11 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import time
 from pathlib import Path
 
-from .models import Task, TaskStatus, Verdict
+from .models import Task, TaskStatus, TestResult, Verdict
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
@@ -83,14 +84,78 @@ CREATE TABLE IF NOT EXISTS memory (
     created_at REAL NOT NULL,
     UNIQUE(tier, key)
 );
+
+-- Real, executed test results (spec §5). Authoritative over the validator's
+-- self-reported TESTS: field.
+CREATE TABLE IF NOT EXISTS test_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER NOT NULL REFERENCES tasks(id),
+    attempt_id INTEGER REFERENCES attempts(id),
+    status TEXT NOT NULL,             -- pass | fail | na | error
+    exit_code INTEGER,
+    summary TEXT NOT NULL DEFAULT '',
+    stdout_tail TEXT NOT NULL DEFAULT '',
+    duration_s REAL NOT NULL DEFAULT 0.0,
+    created_at REAL NOT NULL
+);
 """
+
+
+class _LockedConnection:
+    """Serializes access to one sqlite3 connection.
+
+    The Phase-2 dashboard reads this store from HTTP request threads while the
+    loop writes from the main thread, so the connection is opened with
+    `check_same_thread=False`. That alone is not enough — it only disables the
+    ownership check — so every statement goes through this lock. Wrapping the
+    connection rather than each method means no call site can forget to lock.
+    """
+
+    def __init__(self, conn: sqlite3.Connection):
+        self._conn = conn
+        self._lock = threading.RLock()
+
+    def execute(self, sql: str, params: tuple = ()) -> "_LockedCursor":
+        with self._lock:
+            cur = self._conn.execute(sql, params)
+            # Materialize under the lock: rows read later, off-lock, would
+            # race another thread's use of the same connection.
+            rows = cur.fetchall() if cur.description else []
+            return _LockedCursor(cur.lastrowid, rows)
+
+    def executescript(self, sql: str) -> None:
+        with self._lock:
+            self._conn.executescript(sql)
+
+    def commit(self) -> None:
+        with self._lock:
+            self._conn.commit()
+
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()
+
+
+class _LockedCursor:
+    """Cursor view over rows already fetched under the connection lock."""
+
+    def __init__(self, lastrowid: int | None, rows: list[sqlite3.Row]):
+        self.lastrowid = lastrowid
+        self._rows = rows
+
+    def fetchone(self) -> sqlite3.Row | None:
+        return self._rows[0] if self._rows else None
+
+    def fetchall(self) -> list[sqlite3.Row]:
+        return self._rows
 
 
 class Store:
     def __init__(self, db_path: str | Path):
         self.db_path = str(db_path)
-        self._conn = sqlite3.connect(self.db_path)
-        self._conn.row_factory = sqlite3.Row
+        raw = sqlite3.connect(self.db_path, check_same_thread=False)
+        raw.row_factory = sqlite3.Row
+        self._conn = _LockedConnection(raw)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(_SCHEMA)
@@ -130,7 +195,7 @@ class Store:
         statuses are picked up before untouched pending ones."""
         row = self._conn.execute(
             "SELECT * FROM tasks WHERE status IN"
-            " ('in_progress','validating','revising','pending')"
+            " ('in_progress','testing','validating','revising','pending')"
             " ORDER BY CASE status WHEN 'pending' THEN 1 ELSE 0 END, id"
             " LIMIT 1").fetchone()
         return self._row_to_task(row) if row else None
@@ -177,12 +242,29 @@ class Store:
         self._conn.commit()
         return cur.lastrowid
 
-    def finish_attempt(self, attempt_id: int, output: str,
-                       tokens_in: int, tokens_out: int, cost_usd: float) -> None:
-        self._conn.execute(
-            "UPDATE attempts SET finished_at=?, output=?, tokens_in=?,"
-            " tokens_out=?, cost_usd=? WHERE id=?",
-            (time.time(), output, tokens_in, tokens_out, cost_usd, attempt_id))
+    def finish_attempt(self, attempt_id: int, output: str, tokens_in: int,
+                       tokens_out: int, cost_usd: float,
+                       model: str | None = None) -> None:
+        """Record the result of an attempt.
+
+        `model` is what actually served the request, which can differ from what
+        the registry asked for (a mock backend, or a provider substituting a
+        model). Cost is derived from the serving model, so the row stores that
+        one — otherwise the per-model rollup attributes spend to a model that
+        never ran.
+        """
+        if model:
+            self._conn.execute(
+                "UPDATE attempts SET finished_at=?, output=?, tokens_in=?,"
+                " tokens_out=?, cost_usd=?, model=? WHERE id=?",
+                (time.time(), output, tokens_in, tokens_out, cost_usd, model,
+                 attempt_id))
+        else:
+            self._conn.execute(
+                "UPDATE attempts SET finished_at=?, output=?, tokens_in=?,"
+                " tokens_out=?, cost_usd=? WHERE id=?",
+                (time.time(), output, tokens_in, tokens_out, cost_usd,
+                 attempt_id))
         self._conn.commit()
 
     def task_spend(self, task_id: int) -> tuple[int, float]:
@@ -246,11 +328,14 @@ class Store:
 
     def memory_write(self, tier: str, key: str, value: str,
                      approved: bool = False) -> None:
+        # Approval is sticky: rewriting an already-approved fact must not
+        # silently revoke it (that would make approved memory quietly
+        # unreadable). Only an explicit approve=True can raise the flag.
         self._conn.execute(
             "INSERT INTO memory (tier, key, value, approved, created_at)"
             " VALUES (?,?,?,?,?)"
             " ON CONFLICT(tier, key) DO UPDATE SET value=excluded.value,"
-            " approved=excluded.approved",
+            " approved=MAX(memory.approved, excluded.approved)",
             (tier, key, value, int(approved), time.time()))
         self._conn.commit()
         self.log_event(None, "memory_write",
@@ -268,3 +353,107 @@ class Store:
                 (tier, key))
             self._conn.commit()
         return row["value"] if row else None
+
+    def memory_list(self, tier: str | None = None,
+                    approved_only: bool = False) -> list[dict]:
+        q = "SELECT * FROM memory"
+        params: list = []
+        where = []
+        if tier:
+            where.append("tier=?")
+            params.append(tier)
+        if approved_only:
+            where.append("approved=1")
+        if where:
+            q += " WHERE " + " AND ".join(where)
+        q += " ORDER BY tier, key"
+        return [dict(r) for r in self._conn.execute(q, tuple(params)).fetchall()]
+
+    def memory_set_approved(self, mem_id: int, approved: bool) -> None:
+        row = self._conn.execute(
+            "SELECT tier, key FROM memory WHERE id=?", (mem_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"No memory row {mem_id}")
+        self._conn.execute("UPDATE memory SET approved=? WHERE id=?",
+                           (int(approved), mem_id))
+        self._conn.commit()
+        self.log_event(None, "memory_approved" if approved else "memory_revoked",
+                       {"tier": row["tier"], "key": row["key"]})
+
+    def memory_delete(self, mem_id: int) -> None:
+        row = self._conn.execute(
+            "SELECT tier, key FROM memory WHERE id=?", (mem_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"No memory row {mem_id}")
+        self._conn.execute("DELETE FROM memory WHERE id=?", (mem_id,))
+        self._conn.commit()
+        self.log_event(None, "memory_deleted",
+                       {"tier": row["tier"], "key": row["key"]})
+
+    # -- executed test results (spec §5) -------------------------------------
+
+    def add_test_run(self, task_id: int, attempt_id: int | None,
+                     result: TestResult) -> int:
+        cur = self._conn.execute(
+            "INSERT INTO test_runs (task_id, attempt_id, status, exit_code,"
+            " summary, stdout_tail, duration_s, created_at)"
+            " VALUES (?,?,?,?,?,?,?,?)",
+            (task_id, attempt_id, result.status, result.exit_code,
+             result.summary, result.stdout_tail, result.duration_s,
+             time.time()))
+        self._conn.commit()
+        self.log_event(task_id, "test_run", {
+            "status": result.status, "exit_code": result.exit_code,
+            "summary": result.summary, "duration_s": result.duration_s})
+        return cur.lastrowid
+
+    def test_runs(self, task_id: int) -> list[dict]:
+        return [dict(r) for r in self._conn.execute(
+            "SELECT * FROM test_runs WHERE task_id=? ORDER BY id",
+            (task_id,)).fetchall()]
+
+    # -- change feed for the Phase-2 dashboard --------------------------------
+
+    def events_since(self, event_id: int, limit: int = 500) -> list[dict]:
+        """Audit-log rows after `event_id`. The append-only log doubles as the
+        dashboard's change feed: monotonic ids make SSE resumable by cursor."""
+        rows = self._conn.execute(
+            "SELECT * FROM events WHERE id > ? ORDER BY id LIMIT ?",
+            (event_id, limit)).fetchall()
+        return [dict(r) | {"payload": json.loads(r["payload"])} for r in rows]
+
+    def latest_event_id(self) -> int:
+        row = self._conn.execute(
+            "SELECT COALESCE(MAX(id), 0) AS m FROM events").fetchone()
+        return int(row["m"])
+
+    def run_metrics(self) -> dict:
+        """Run-level rollup across all tasks (spec §6)."""
+        totals = self._conn.execute(
+            "SELECT COALESCE(SUM(tokens_in),0) AS tin,"
+            " COALESCE(SUM(tokens_out),0) AS tout,"
+            " COALESCE(SUM(cost_usd),0.0) AS cost,"
+            " COUNT(*) AS attempts,"
+            " COALESCE(SUM(finished_at-started_at),0) AS wall"
+            " FROM attempts WHERE finished_at IS NOT NULL").fetchone()
+        by_status = {r["status"]: r["n"] for r in self._conn.execute(
+            "SELECT status, COUNT(*) AS n FROM tasks GROUP BY status"
+        ).fetchall()}
+        by_model = [dict(r) for r in self._conn.execute(
+            "SELECT model, COUNT(*) AS attempts,"
+            " COALESCE(SUM(tokens_in),0) AS tokens_in,"
+            " COALESCE(SUM(tokens_out),0) AS tokens_out,"
+            " COALESCE(SUM(cost_usd),0.0) AS cost_usd"
+            " FROM attempts GROUP BY model ORDER BY cost_usd DESC").fetchall()]
+        revisions = self._conn.execute(
+            "SELECT COALESCE(SUM(revision_count),0) AS r FROM tasks").fetchone()
+        return {
+            "tokens_in": int(totals["tin"]), "tokens_out": int(totals["tout"]),
+            "tokens": int(totals["tin"]) + int(totals["tout"]),
+            "cost_usd": round(float(totals["cost"]), 6),
+            "attempts": int(totals["attempts"]),
+            "wall_seconds": round(float(totals["wall"]), 3),
+            "revisions": int(revisions["r"]),
+            "tasks_by_status": by_status,
+            "by_model": by_model,
+        }

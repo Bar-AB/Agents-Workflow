@@ -1,4 +1,4 @@
-"""CLI — plain structured output for Phase 1 (viz is Phase 2, spec §8).
+"""CLI — plain structured output, plus the Phase-2 dashboard server.
 
   agentloop add "Title" --goal "..." --criteria "..." [--risk 0|1|2]
   agentloop run [--runner claude|mock] [--max-tasks N]
@@ -7,6 +7,8 @@
   agentloop reject TASK_ID [--note ...]
   agentloop redo TASK_ID [--note ...]
   agentloop events TASK_ID
+  agentloop serve [--host H] [--port P]   # live dashboard (spec §8)
+  agentloop memory list|approve|reject|add
   agentloop init-registry          # write default agents.json for editing
 """
 
@@ -21,7 +23,31 @@ from .loop import Loop
 from .models import Task
 from .registry import DEFAULT_AGENTS, Registry
 from .runner import get_runner
+from .server import serve_forever
 from .store import Store
+
+
+def _memory_cmd(store: Store, args) -> int:
+    if args.mem_cmd == "list":
+        rows = store.memory_list()
+        if not rows:
+            print("(no memory yet)")
+        for r in rows:
+            flag = "approved" if r["approved"] else "PENDING "
+            print(f"[{r['id']:3d}] {flag} {r['tier']:8s} hits={r['hit_count']:<3d}"
+                  f" {r['key']}: {r['value'][:60]}")
+    elif args.mem_cmd == "approve":
+        store.memory_set_approved(args.memory_id, True)
+        print(f"Memory {args.memory_id} approved — agents may now read it.")
+    elif args.mem_cmd == "reject":
+        store.memory_delete(args.memory_id)
+        print(f"Memory {args.memory_id} deleted.")
+    elif args.mem_cmd == "add":
+        store.memory_write(args.tier, args.key, args.value,
+                           approved=args.approved)
+        state = "approved" if args.approved else "pending approval"
+        print(f"Wrote {args.tier}/{args.key} ({state}).")
+    return 0
 
 
 def _build(args) -> tuple[Store, Loop]:
@@ -57,6 +83,23 @@ def main(argv: list[str] | None = None) -> int:
 
     e = sub.add_parser("events", help="Audit trail for a task")
     e.add_argument("task_id", type=int)
+
+    sv = sub.add_parser("serve", help="Run the live dashboard (Phase 2)")
+    sv.add_argument("--host", default=None)
+    sv.add_argument("--port", type=int, default=None)
+    sv.add_argument("--runner", default="mock", choices=["claude", "mock"])
+
+    m = sub.add_parser("memory", help="Inspect and gate the memory store")
+    msub = m.add_subparsers(dest="mem_cmd", required=True)
+    msub.add_parser("list", help="Show all facts, both tiers")
+    for name in ("approve", "reject"):
+        mc = msub.add_parser(name, help=f"{name} a candidate fact")
+        mc.add_argument("memory_id", type=int)
+    ma = msub.add_parser("add", help="Add a fact directly")
+    ma.add_argument("key")
+    ma.add_argument("value")
+    ma.add_argument("--tier", default="project", choices=["project", "loop"])
+    ma.add_argument("--approved", action="store_true")
 
     sub.add_parser("init-registry", help="Write default agents.json")
 
@@ -112,6 +155,14 @@ def main(argv: list[str] | None = None) -> int:
             for ev in store.events(args.task_id):
                 print(f"{ev['ts']:.0f} {ev['kind']:20s} "
                       f"{json.dumps(ev['payload'])[:120]}")
+
+        elif args.cmd == "serve":
+            config = LoopConfig.load(args.config or "loopconfig.json")
+            serve_forever(store, loop, Registry.load(config.registry_path),
+                          config, args.host, args.port)
+
+        elif args.cmd == "memory":
+            return _memory_cmd(store, args)
     finally:
         store.close()
     return 0

@@ -9,6 +9,7 @@ from enum import Enum
 class TaskStatus(str, Enum):
     PENDING = "pending"            # defined, waiting for the loop
     IN_PROGRESS = "in_progress"    # worker executing
+    TESTING = "testing"            # executing the task's tests for real
     VALIDATING = "validating"      # validator reviewing
     REVISING = "revising"          # validator said revise; bounded retry
     NEEDS_HUMAN = "needs_human"    # escalated: ambiguity, severe disagreement,
@@ -46,6 +47,31 @@ class RunResult:
     tokens_in: int = 0
     tokens_out: int = 0
     model: str = "unknown"
+
+
+@dataclass
+class TestResult:
+    """Outcome of really executing a task's tests (spec §5).
+
+    `status` is authoritative over the validator's self-reported TESTS: field.
+    `na` means no workspace or execution disabled — not a failure.
+    """
+    __test__ = False                # not a pytest test class, despite the name
+
+    status: str = "na"              # pass | fail | na | error
+    exit_code: int | None = None
+    summary: str = ""
+    stdout_tail: str = ""
+    duration_s: float = 0.0
+
+    @property
+    def passed(self) -> bool | None:
+        """Tri-state for the approval gate: True/False, or None when n/a."""
+        if self.status == "pass":
+            return True
+        if self.status in ("fail", "error"):
+            return False
+        return None
 
 
 @dataclass

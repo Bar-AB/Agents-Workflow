@@ -14,6 +14,12 @@ dist/
 .venv/
 venv/
 
+# Frontend (Phase 2). `dist/` above already covers web/dist.
+node_modules/
+
+# Agent task workspaces — scratch space for worker output, never source
+.agentloop/
+
 # Loop state & local config (not source)
 *.db
 *.db-wal

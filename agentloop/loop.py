@@ -10,13 +10,21 @@ Decision rules per validation round:
 - otherwise                             -> revise, bounded by max_revisions;
                                            exhausted retries -> needs_human
 - budget cap exceeded at any point      -> needs_human (never burn unbounded)
+
+"Tests not failing" means the *executed* result (spec §5). Tests run in the
+task's workspace between the worker and the validator; the validator sees the
+real output, and the gate consults the real status rather than the validator's
+self-reported TESTS: field. A validator claiming pass against an executed fail
+is recorded as a `test_disagreement` event — the loop measures its validators.
 """
 
 from __future__ import annotations
 
 from .agents import run_validator, run_worker
 from .config import LoopConfig
-from .models import Task, TaskStatus, VerdictKind
+from .executor import TestExecutor, clear_workspace, workspace_for
+from .memory import MemoryService
+from .models import Task, TaskStatus, TestResult, VerdictKind
 from .registry import Registry
 from .runner import ModelRunner
 from .store import Store
@@ -24,11 +32,20 @@ from .store import Store
 
 class Loop:
     def __init__(self, store: Store, runner: ModelRunner,
-                 registry: Registry, config: LoopConfig):
+                 registry: Registry, config: LoopConfig,
+                 executor: TestExecutor | None = None,
+                 memory: MemoryService | None = None):
         self.store = store
         self.runner = runner
         self.registry = registry
         self.config = config
+        self.executor = executor or TestExecutor(
+            command=config.test_command,
+            timeout_s=config.test_timeout_s,
+            enabled=config.allow_test_exec,
+        )
+        self.memory = memory or MemoryService(
+            store, promote_threshold=config.memory_promote_threshold)
 
     # -- public API ----------------------------------------------------------
 
@@ -46,14 +63,17 @@ class Loop:
 
     def run_task(self, task: Task) -> Task:
         feedback = ""
+        test_result = TestResult()
         while True:
             if self._budget_tripped(task):
                 return task
 
             # Worker self-checks in its own output (spec §4.2–4.3).
             self.store.set_status(task, TaskStatus.IN_PROGRESS)
+            ws = workspace_for(self.config.workspace_root, task.id, create=True)
             result = run_worker(self.store, self.runner, self.registry,
-                                task, feedback)
+                                task, feedback, memory=self.memory,
+                                workspace=str(ws), test_result=test_result)
             if result.output.strip().upper().startswith("ESCALATE:"):
                 self.store.set_status(
                     task, TaskStatus.NEEDS_HUMAN,
@@ -62,18 +82,37 @@ class Loop:
             task.output = result.output
             self.store.update_task(task)
 
+            # Tests are part of validation, executed for real (spec §5).
+            self.store.set_status(task, TaskStatus.TESTING)
+            test_result = self.executor.run(ws)
+            self.store.add_test_run(task.id, None, test_result)
+
             # Validation runs in a separate context from the worker (spec §5).
             self.store.set_status(task, TaskStatus.VALIDATING)
             verdict, attempt_id = run_validator(
-                self.store, self.runner, self.registry, task, task.output)
+                self.store, self.runner, self.registry, task, task.output,
+                memory=self.memory, test_result=test_result)
             self.store.add_verdict(task.id, attempt_id, verdict)
+
+            # Executed truth beats the validator's account of it. Record the
+            # mismatch: a validator that rubber-stamps failing tests is a
+            # measurable reliability problem, not a silent one.
+            tests_ok = test_result.passed
+            if tests_ok is None:
+                tests_ok = verdict.tests_passed
+            elif (verdict.tests_passed is not None
+                    and verdict.tests_passed != test_result.passed):
+                self.store.log_event(task.id, "test_disagreement", {
+                    "validator_claimed": verdict.tests_passed,
+                    "actual": test_result.passed,
+                    "summary": test_result.summary})
 
             cfg = self.config
             severe = (verdict.kind == VerdictKind.ESCALATE
                       or verdict.confidence < cfg.severe_threshold)
             approved = (verdict.kind == VerdictKind.APPROVE
                         and verdict.confidence >= cfg.approve_threshold
-                        and verdict.tests_passed is not False)
+                        and tests_ok is not False)
 
             if severe:
                 self.store.set_status(
@@ -126,6 +165,9 @@ class Loop:
         task.output = ""
         task.revision_count = 0
         task.escalation_reason = ""
+        # Wipe the workspace too: a redo that reran over the previous attempt's
+        # files would not be a fresh start.
+        clear_workspace(self.config.workspace_root, task_id)
         self.store.update_task(task)
         self.store.set_status(task, TaskStatus.PENDING, reason="")
         return task

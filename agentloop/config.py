@@ -7,8 +7,13 @@ Defaults reflect the seed spec:
 - max_revisions: bounded retries before escalation (spec §4.5).
 - max_cost_usd_per_task / max_tokens_per_task: hard budget caps (spec §11) —
   a stuck revision loop trips to human review instead of burning spend.
+- test_command / workspace_root / test_timeout_s: the sandboxed execution seam
+  (spec §5). Tests really run; their result is authoritative over the
+  validator's self-report.
+- memory_promote_threshold: project facts read this many times are promoted to
+  loop memory (spec §7).
 
-All values are tunable globally here or per task via Task.overrides.
+All values are tunable globally here or via loopconfig.json.
 """
 
 from __future__ import annotations
@@ -30,6 +35,22 @@ class LoopConfig:
     human_review_risk_level: int = 2
     db_path: str = "agentloop.db"
     registry_path: str = "agents.json"
+
+    # Sandboxed test execution (spec §5). The command is allowlisted here, not
+    # taken from model output, and never runs through a shell.
+    allow_test_exec: bool = True
+    test_command: str = "pytest -q"
+    test_timeout_s: int = 120
+    workspace_root: str = ".agentloop/ws"
+
+    # Memory (spec §7): a project fact read this often is promoted to the
+    # cross-project loop tier.
+    memory_promote_threshold: int = 3
+
+    # Phase 2 dashboard server.
+    server_host: str = "127.0.0.1"
+    server_port: int = 8765
+    stream_poll_seconds: float = 0.5
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2)
