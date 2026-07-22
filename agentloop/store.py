@@ -34,6 +34,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     validator_role TEXT NOT NULL DEFAULT 'validator',
     output TEXT NOT NULL DEFAULT '',
     escalation_reason TEXT NOT NULL DEFAULT '',
+    -- Mid-run human control signal (spec: pause/resume/abort), read at each
+    -- loop iteration boundary. Persisted so a human in another process (CLI or
+    -- dashboard) can steer a running loop, and a paused task survives restart.
+    control TEXT NOT NULL DEFAULT 'run',   -- 'run' | 'pause' | 'abort'
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
@@ -47,9 +51,11 @@ CREATE TABLE IF NOT EXISTS attempts (
     started_at REAL NOT NULL,
     finished_at REAL,
     output TEXT NOT NULL DEFAULT '',
-    tokens_in INTEGER NOT NULL DEFAULT 0,
+    tokens_in INTEGER NOT NULL DEFAULT 0,      -- new input only
     tokens_out INTEGER NOT NULL DEFAULT 0,
-    cost_usd REAL NOT NULL DEFAULT 0.0
+    cache_creation_tokens INTEGER NOT NULL DEFAULT 0,  -- prompt-cache writes
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0,      -- prompt-cache reads
+    cost_usd REAL NOT NULL DEFAULT 0.0         -- includes cache cost
 );
 
 CREATE TABLE IF NOT EXISTS verdicts (
@@ -81,6 +87,10 @@ CREATE TABLE IF NOT EXISTS memory (
     value TEXT NOT NULL,
     hit_count INTEGER NOT NULL DEFAULT 0,
     approved INTEGER NOT NULL DEFAULT 0,
+    -- Pinned approved facts sort first and get a reserved slice of the prompt
+    -- budget, so a fact that must always be present is not dropped by the
+    -- alphabetical tail-off once the injection cap is reached.
+    pinned INTEGER NOT NULL DEFAULT 0,
     created_at REAL NOT NULL,
     UNIQUE(tier, key)
 );
@@ -96,6 +106,19 @@ CREATE TABLE IF NOT EXISTS test_runs (
     summary TEXT NOT NULL DEFAULT '',
     stdout_tail TEXT NOT NULL DEFAULT '',
     duration_s REAL NOT NULL DEFAULT 0.0,
+    created_at REAL NOT NULL
+);
+
+-- Validator calibration harness results (spec: eval). One row per harness run;
+-- the per-fixture detail and the summary (agreement, confusion matrix,
+-- calibration table) are stored as JSON so the schema stays boring.
+CREATE TABLE IF NOT EXISTS eval_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    runner TEXT NOT NULL,
+    n_fixtures INTEGER NOT NULL,
+    agreement REAL NOT NULL,
+    summary TEXT NOT NULL DEFAULT '{}',
+    detail TEXT NOT NULL DEFAULT '[]',
     created_at REAL NOT NULL
 );
 """
@@ -159,7 +182,28 @@ class Store:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(_SCHEMA)
+        self._migrate()
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Add columns introduced after a database was first created.
+
+        `CREATE TABLE IF NOT EXISTS` never alters an existing table, so a store
+        opened against an older db is missing the newer columns. Add them
+        idempotently; SQLite ignores the change once the column exists.
+        """
+        additions = [
+            ("attempts", "cache_creation_tokens", "INTEGER NOT NULL DEFAULT 0"),
+            ("attempts", "cache_read_tokens", "INTEGER NOT NULL DEFAULT 0"),
+            ("tasks", "control", "TEXT NOT NULL DEFAULT 'run'"),
+            ("memory", "pinned", "INTEGER NOT NULL DEFAULT 0"),
+        ]
+        for table, column, decl in additions:
+            cols = {r["name"] for r in self._conn.execute(
+                f"PRAGMA table_info({table})").fetchall()}
+            if column not in cols:
+                self._conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
     def close(self) -> None:
         self._conn.close()
@@ -205,6 +249,10 @@ class Store:
         return [self._row_to_task(r) for r in rows]
 
     def update_task(self, task: Task) -> None:
+        # Deliberately does NOT write the `control` column: the loop holds a
+        # task object loaded at the start of the run, and writing its stale
+        # `control` here would clobber a pause/abort a human set concurrently
+        # from another process. `set_control` is the sole writer of control.
         self._conn.execute(
             "UPDATE tasks SET status=?, revision_count=?, output=?,"
             " escalation_reason=?, updated_at=? WHERE id=?",
@@ -212,6 +260,22 @@ class Store:
              task.escalation_reason, time.time(), task.id),
         )
         self._conn.commit()
+
+    def set_control(self, task_id: int, control: str) -> None:
+        """Write the mid-run control signal (run/pause/abort). The sole writer
+        of the control column, so a human in another process can steer a
+        running loop without racing the loop's own task writes."""
+        self._conn.execute("UPDATE tasks SET control=?, updated_at=? WHERE id=?",
+                           (control, time.time(), task_id))
+        self._conn.commit()
+        self.log_event(task_id, f"control:{control}", {})
+
+    def get_control(self, task_id: int) -> str:
+        """Read the control signal fresh from the store — the loop re-reads this
+        each iteration so a cross-process pause/abort is seen promptly."""
+        row = self._conn.execute(
+            "SELECT control FROM tasks WHERE id=?", (task_id,)).fetchone()
+        return row["control"] if row else "run"
 
     def set_status(self, task: Task, status: TaskStatus, reason: str = "") -> None:
         task.status = status
@@ -231,6 +295,7 @@ class Store:
             worker_role=row["worker_role"],
             validator_role=row["validator_role"], output=row["output"],
             escalation_reason=row["escalation_reason"],
+            control=row["control"],
         )
 
     # -- attempts / metrics --------------------------------------------------
@@ -244,33 +309,40 @@ class Store:
 
     def finish_attempt(self, attempt_id: int, output: str, tokens_in: int,
                        tokens_out: int, cost_usd: float,
-                       model: str | None = None) -> None:
+                       model: str | None = None,
+                       cache_creation_tokens: int = 0,
+                       cache_read_tokens: int = 0) -> None:
         """Record the result of an attempt.
 
         `model` is what actually served the request, which can differ from what
         the registry asked for (a mock backend, or a provider substituting a
         model). Cost is derived from the serving model, so the row stores that
         one — otherwise the per-model rollup attributes spend to a model that
-        never ran.
+        never ran. `cost_usd` already includes cache cost; the cache token
+        columns keep the breakdown auditable and feed the token budget cap.
         """
+        base = ("UPDATE attempts SET finished_at=?, output=?, tokens_in=?,"
+                " tokens_out=?, cache_creation_tokens=?, cache_read_tokens=?,"
+                " cost_usd=?")
+        vals = [time.time(), output, tokens_in, tokens_out,
+                cache_creation_tokens, cache_read_tokens, cost_usd]
         if model:
-            self._conn.execute(
-                "UPDATE attempts SET finished_at=?, output=?, tokens_in=?,"
-                " tokens_out=?, cost_usd=?, model=? WHERE id=?",
-                (time.time(), output, tokens_in, tokens_out, cost_usd, model,
-                 attempt_id))
-        else:
-            self._conn.execute(
-                "UPDATE attempts SET finished_at=?, output=?, tokens_in=?,"
-                " tokens_out=?, cost_usd=? WHERE id=?",
-                (time.time(), output, tokens_in, tokens_out, cost_usd,
-                 attempt_id))
+            base += ", model=?"
+            vals.append(model)
+        base += " WHERE id=?"
+        vals.append(attempt_id)
+        self._conn.execute(base, tuple(vals))
         self._conn.commit()
 
     def task_spend(self, task_id: int) -> tuple[int, float]:
-        """Total (tokens, cost_usd) across all attempts — for budget caps."""
+        """Total (tokens, cost_usd) across all attempts — for budget caps.
+
+        The token total includes prompt-cache tokens: on a cached run they are
+        the bulk of the real context consumed, so a cap that ignored them would
+        measure almost nothing (the defect this fix addresses)."""
         row = self._conn.execute(
-            "SELECT COALESCE(SUM(tokens_in+tokens_out),0) AS toks,"
+            "SELECT COALESCE(SUM(tokens_in+tokens_out+cache_creation_tokens"
+            "+cache_read_tokens),0) AS toks,"
             " COALESCE(SUM(cost_usd),0.0) AS cost"
             " FROM attempts WHERE task_id=?", (task_id,)).fetchone()
         return int(row["toks"]), float(row["cost"])
@@ -327,19 +399,23 @@ class Store:
     # -- memory (spec §7) ----------------------------------------------------
 
     def memory_write(self, tier: str, key: str, value: str,
-                     approved: bool = False) -> None:
-        # Approval is sticky: rewriting an already-approved fact must not
-        # silently revoke it (that would make approved memory quietly
-        # unreadable). Only an explicit approve=True can raise the flag.
+                     approved: bool = False, pinned: bool = False) -> None:
+        # Approval and pinning are both sticky: rewriting an already-approved or
+        # pinned fact must not silently revoke it (that would make approved
+        # memory quietly unreadable, or drop a pinned fact from the prompt).
+        # Only an explicit flag can raise them; lowering is via the dedicated
+        # setter methods.
         self._conn.execute(
-            "INSERT INTO memory (tier, key, value, approved, created_at)"
-            " VALUES (?,?,?,?,?)"
+            "INSERT INTO memory (tier, key, value, approved, pinned, created_at)"
+            " VALUES (?,?,?,?,?,?)"
             " ON CONFLICT(tier, key) DO UPDATE SET value=excluded.value,"
-            " approved=MAX(memory.approved, excluded.approved)",
-            (tier, key, value, int(approved), time.time()))
+            " approved=MAX(memory.approved, excluded.approved),"
+            " pinned=MAX(memory.pinned, excluded.pinned)",
+            (tier, key, value, int(approved), int(pinned), time.time()))
         self._conn.commit()
         self.log_event(None, "memory_write",
-                       {"tier": tier, "key": key, "approved": approved})
+                       {"tier": tier, "key": key, "approved": approved,
+                        "pinned": pinned})
 
     def memory_read(self, tier: str, key: str,
                     approved_only: bool = True) -> str | None:
@@ -380,6 +456,17 @@ class Store:
         self.log_event(None, "memory_approved" if approved else "memory_revoked",
                        {"tier": row["tier"], "key": row["key"]})
 
+    def memory_set_pinned(self, mem_id: int, pinned: bool) -> None:
+        row = self._conn.execute(
+            "SELECT tier, key FROM memory WHERE id=?", (mem_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"No memory row {mem_id}")
+        self._conn.execute("UPDATE memory SET pinned=? WHERE id=?",
+                           (int(pinned), mem_id))
+        self._conn.commit()
+        self.log_event(None, "memory_pinned" if pinned else "memory_unpinned",
+                       {"tier": row["tier"], "key": row["key"]})
+
     def memory_delete(self, mem_id: int) -> None:
         row = self._conn.execute(
             "SELECT tier, key FROM memory WHERE id=?", (mem_id,)).fetchone()
@@ -412,6 +499,32 @@ class Store:
             "SELECT * FROM test_runs WHERE task_id=? ORDER BY id",
             (task_id,)).fetchall()]
 
+    # -- validator eval harness ----------------------------------------------
+
+    def add_eval_run(self, runner: str, n_fixtures: int, agreement: float,
+                     summary: dict, detail: list) -> int:
+        cur = self._conn.execute(
+            "INSERT INTO eval_runs (runner, n_fixtures, agreement, summary,"
+            " detail, created_at) VALUES (?,?,?,?,?,?)",
+            (runner, n_fixtures, agreement, json.dumps(summary),
+             json.dumps(detail), time.time()))
+        self._conn.commit()
+        self.log_event(None, "eval_run", {
+            "runner": runner, "n_fixtures": n_fixtures,
+            "agreement": round(agreement, 4)})
+        return cur.lastrowid
+
+    def eval_runs(self) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM eval_runs ORDER BY id").fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["summary"] = json.loads(d["summary"])
+            d["detail"] = json.loads(d["detail"])
+            out.append(d)
+        return out
+
     # -- change feed for the Phase-2 dashboard --------------------------------
 
     def events_since(self, event_id: int, limit: int = 500) -> list[dict]:
@@ -432,6 +545,8 @@ class Store:
         totals = self._conn.execute(
             "SELECT COALESCE(SUM(tokens_in),0) AS tin,"
             " COALESCE(SUM(tokens_out),0) AS tout,"
+            " COALESCE(SUM(cache_creation_tokens),0) AS cwrite,"
+            " COALESCE(SUM(cache_read_tokens),0) AS cread,"
             " COALESCE(SUM(cost_usd),0.0) AS cost,"
             " COUNT(*) AS attempts,"
             " COALESCE(SUM(finished_at-started_at),0) AS wall"
@@ -447,9 +562,12 @@ class Store:
             " FROM attempts GROUP BY model ORDER BY cost_usd DESC").fetchall()]
         revisions = self._conn.execute(
             "SELECT COALESCE(SUM(revision_count),0) AS r FROM tasks").fetchone()
+        cwrite, cread = int(totals["cwrite"]), int(totals["cread"])
         return {
             "tokens_in": int(totals["tin"]), "tokens_out": int(totals["tout"]),
-            "tokens": int(totals["tin"]) + int(totals["tout"]),
+            "cache_creation_tokens": cwrite, "cache_read_tokens": cread,
+            "tokens": (int(totals["tin"]) + int(totals["tout"])
+                       + cwrite + cread),
             "cost_usd": round(float(totals["cost"]), 6),
             "attempts": int(totals["attempts"]),
             "wall_seconds": round(float(totals["wall"]), 3),

@@ -150,8 +150,10 @@ body {
 .s-validating { border-left-color: var(--validating); }
 .s-revising { border-left-color: var(--revising); }
 .s-needs_human { border-left-color: var(--needs-human); }
+.s-paused { border-left-color: var(--pending); }
 .s-done { border-left-color: var(--done); }
 .s-failed { border-left-color: var(--failed); }
+.s-aborted { border-left-color: var(--failed); }
 
 .active-card { animation: working 1.6s ease-in-out infinite; }
 @keyframes working {

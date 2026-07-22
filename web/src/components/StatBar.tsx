@@ -31,6 +31,12 @@ export function StatBar({ metrics }: { metrics: RunMetrics | null }) {
         <div className="value">{fmtTokens(metrics.tokens)}</div>
         <div className="sub">
           {fmtTokens(metrics.tokens_in)} in / {fmtTokens(metrics.tokens_out)} out
+          {' / '}
+          {fmtTokens(
+            (metrics.cache_creation_tokens ?? 0) +
+              (metrics.cache_read_tokens ?? 0),
+          )}{' '}
+          cache
         </div>
       </div>
       <div className="stat">

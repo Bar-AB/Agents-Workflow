@@ -11,7 +11,10 @@ export function MemoryPanel({
 }) {
   const [busy, setBusy] = useState<number | null>(null)
 
-  const gate = async (id: number, action: 'approve' | 'reject') => {
+  const gate = async (
+    id: number,
+    action: 'approve' | 'reject' | 'pin' | 'unpin',
+  ) => {
     setBusy(id)
     try {
       onChanged(await api.gateMemory(id, action))
@@ -20,10 +23,13 @@ export function MemoryPanel({
     }
   }
 
-  // Unapproved facts first: they're the ones that need a decision, and until
-  // someone makes it they cannot reach any prompt.
+  // Unapproved facts first (they need a decision); then pinned ahead of the
+  // rest, matching the order they're injected into prompts.
   const sorted = [...memory].sort(
-    (a, b) => a.approved - b.approved || a.key.localeCompare(b.key),
+    (a, b) =>
+      a.approved - b.approved ||
+      b.pinned - a.pinned ||
+      a.key.localeCompare(b.key),
   )
   const pending = memory.filter((m) => !m.approved).length
 
@@ -41,28 +47,39 @@ export function MemoryPanel({
         <div className="fact" key={f.id}>
           <div className="head">
             <span className={`tier ${f.tier}`}>{f.tier}</span>
-            <span className="key">{f.key}</span>
+            <span className="key">
+              {f.pinned ? '📌 ' : ''}
+              {f.key}
+            </span>
             <span className="pending-flag">{f.hit_count} hits</span>
           </div>
           <div className="val">{f.value}</div>
-          {!f.approved && (
-            <div className="actions" style={{ marginTop: 6 }}>
-              <button
-                className="primary"
-                disabled={busy === f.id}
-                onClick={() => gate(f.id, 'approve')}
-              >
-                Approve
-              </button>
-              <button
-                className="danger"
-                disabled={busy === f.id}
-                onClick={() => gate(f.id, 'reject')}
-              >
-                Discard
-              </button>
-            </div>
-          )}
+          <div className="actions" style={{ marginTop: 6 }}>
+            {!f.approved && (
+              <>
+                <button
+                  className="primary"
+                  disabled={busy === f.id}
+                  onClick={() => gate(f.id, 'approve')}
+                >
+                  Approve
+                </button>
+                <button
+                  className="danger"
+                  disabled={busy === f.id}
+                  onClick={() => gate(f.id, 'reject')}
+                >
+                  Discard
+                </button>
+              </>
+            )}
+            <button
+              disabled={busy === f.id}
+              onClick={() => gate(f.id, f.pinned ? 'unpin' : 'pin')}
+            >
+              {f.pinned ? 'Unpin' : 'Pin'}
+            </button>
+          </div>
         </div>
       ))}
     </div>

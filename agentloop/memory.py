@@ -19,8 +19,13 @@ from __future__ import annotations
 
 from .store import Store
 
-# Cap injected context so memory can't crowd out the actual task.
+# Cap injected context so memory can't crowd out the actual task. Pinned facts
+# get a separate, smaller ceiling *above* the main cap: they are the facts a
+# human declared must always be present, so they bypass the alphabetical
+# tail-off that drops ordinary facts past the cap — but are still bounded, so
+# pinning everything can't reintroduce the crowding the cap exists to prevent.
 _MAX_FACTS_IN_PROMPT = 20
+_MAX_PINNED_FACTS = 10
 _MAX_VALUE_CHARS = 400
 
 
@@ -31,16 +36,24 @@ class MemoryService:
 
     # -- reads ---------------------------------------------------------------
 
-    def facts_for_prompt(self, limit: int = _MAX_FACTS_IN_PROMPT) -> str:
-        """Approved facts as a prompt block. Loop-tier facts come first: they
-        are the cross-project ones that earned their place."""
-        rows = [r for r in self.store.memory_list(approved_only=True)]
-        rows.sort(key=lambda r: (0 if r["tier"] == "loop" else 1, r["key"]))
-        rows = rows[:limit]
+    def facts_for_prompt(self, limit: int = _MAX_FACTS_IN_PROMPT,
+                         pinned_limit: int = _MAX_PINNED_FACTS) -> str:
+        """Approved facts as a prompt block.
+
+        Ordering: pinned facts first (they bypass the main cap under their own
+        ceiling), then the rest. Within each group, loop-tier before project,
+        then alphabetical — loop facts are the cross-project ones that earned
+        their place. Without pinning, the alphabetical tail past `limit` drops
+        by accident; pinning is how a must-have fact keeps its slot."""
+        approved = list(self.store.memory_list(approved_only=True))
+        order = lambda r: (0 if r["tier"] == "loop" else 1, r["key"])
+        pinned = sorted((r for r in approved if r["pinned"]), key=order)
+        unpinned = sorted((r for r in approved if not r["pinned"]), key=order)
+        rows = pinned[:pinned_limit] + unpinned[:limit]
         if not rows:
             return ""
-        lines = [f"- ({r['tier']}) {r['key']}: {r['value'][:_MAX_VALUE_CHARS]}"
-                 for r in rows]
+        lines = [f"- ({r['tier']}){' *' if r['pinned'] else ''} {r['key']}: "
+                 f"{r['value'][:_MAX_VALUE_CHARS]}" for r in rows]
         self._record_reads(rows)
         return "\n".join(lines)
 
@@ -53,10 +66,12 @@ class MemoryService:
     # -- writes --------------------------------------------------------------
 
     def remember(self, tier: str, key: str, value: str,
-                 approved: bool = False) -> None:
+                 approved: bool = False, pinned: bool = False) -> None:
         """Record a candidate fact. Unapproved by default: a human gates it
-        before it can ever influence a prompt."""
-        self.store.memory_write(tier, key, value, approved=approved)
+        before it can ever influence a prompt. Pinning still requires approval
+        to be injected — a pinned but unapproved fact is not read."""
+        self.store.memory_write(tier, key, value, approved=approved,
+                                pinned=pinned)
 
     # -- promotion -----------------------------------------------------------
 

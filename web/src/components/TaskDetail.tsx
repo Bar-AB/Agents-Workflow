@@ -45,7 +45,25 @@ export function TaskDetail({
     }
   }
 
+  const control = async (action: 'pause' | 'resume' | 'abort') => {
+    setBusy(true)
+    try {
+      await api.control(task.id, action)
+      onChanged()
+      setDetail(await api.task(task.id))
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
   const latestTest = test_runs[test_runs.length - 1]
+  // A task is "in flight" while the loop can still be working it — those are
+  // the states where pause/abort are meaningful.
+  const inFlight = ['pending', 'in_progress', 'testing', 'validating',
+    'revising'].includes(task.status)
+  const terminal = ['done', 'failed', 'aborted'].includes(task.status)
 
   return (
     <div className="panel detail">
@@ -112,6 +130,28 @@ export function TaskDetail({
         </>
       )}
 
+      {(inFlight || task.status === 'paused') && (
+        <div className="actions" style={{ marginBottom: 8 }}>
+          {inFlight && (
+            <button disabled={busy} onClick={() => control('pause')}>
+              Pause
+            </button>
+          )}
+          {task.status === 'paused' && (
+            <button className="primary" disabled={busy} onClick={() => control('resume')}>
+              Resume
+            </button>
+          )}
+          <button
+            className="danger"
+            disabled={busy}
+            onClick={() => control('abort')}
+          >
+            Abort
+          </button>
+        </div>
+      )}
+
       <div className="actions">
         <button
           className="primary"
@@ -125,7 +165,7 @@ export function TaskDetail({
         </button>
         <button
           className="danger"
-          disabled={busy || task.status === 'failed'}
+          disabled={busy || terminal}
           onClick={() => decide('reject')}
         >
           Reject

@@ -58,7 +58,13 @@ export const api = {
       (r) => r.task,
     ),
 
-  gateMemory: (id: number, action: 'approve' | 'reject') =>
+  // Mid-run control: pause/resume/abort a task while the loop is working it.
+  control: (id: number, action: 'pause' | 'resume' | 'abort', note = '') =>
+    post<{ task: Task }>(`/api/tasks/${id}/${action}`, { note }).then(
+      (r) => r.task,
+    ),
+
+  gateMemory: (id: number, action: 'approve' | 'reject' | 'pin' | 'unpin') =>
     post<{ memory: MemoryFact[] }>(`/api/memory/${id}/${action}`).then(
       (r) => r.memory,
     ),
