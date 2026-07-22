@@ -8,8 +8,12 @@ export type TaskStatus =
   | 'validating'
   | 'revising'
   | 'needs_human'
+  | 'paused'
   | 'done'
   | 'failed'
+  | 'aborted'
+
+export type TaskControl = 'run' | 'pause' | 'abort'
 
 export type VerdictKind = 'approve' | 'revise' | 'escalate'
 export type TestStatus = 'pass' | 'fail' | 'na' | 'error'
@@ -26,6 +30,7 @@ export interface Task {
   validator_role: string
   output: string
   escalation_reason: string
+  control: TaskControl
 }
 
 export interface VerdictRow {
@@ -72,6 +77,8 @@ export interface ModelRollup {
 export interface RunMetrics {
   tokens_in: number
   tokens_out: number
+  cache_creation_tokens: number
+  cache_read_tokens: number
   tokens: number
   cost_usd: number
   attempts: number
@@ -96,6 +103,7 @@ export interface MemoryFact {
   value: string
   hit_count: number
   approved: number
+  pinned: number
   created_at: number
 }
 

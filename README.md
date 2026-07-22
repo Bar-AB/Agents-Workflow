@@ -23,12 +23,14 @@ agentloop/
   agents.py    worker/validator prompt building + verdict parsing
   executor.py  sandboxed test execution in a per-task workspace
   memory.py    two-tier memory policy: gating + auto-promotion
-  loop.py      orchestration state machine + human decisions
+  loop.py      orchestration state machine + human decisions + mid-run control
+  eval.py      validator calibration harness (fixtures + agreement/confusion/
+               calibration report)
   server.py    REST + SSE dashboard backend (stdlib only)
-  cli.py       add / run / status / approve / reject / redo / events /
-               serve / memory
+  cli.py       add / run / status / approve / reject / redo / pause / resume /
+               abort / events / serve / memory / eval
 web/           Vite + React + TypeScript dashboard
-tests/         61 tests on MockRunner + real subprocesses (no API keys needed)
+tests/         91 tests on MockRunner + real subprocesses (no API keys needed)
 ```
 
 ## Quick start
@@ -47,7 +49,9 @@ agentloop status 1               # metrics: tokens, cost, wall time, verdicts
 agentloop events 1               # immutable audit trail
 agentloop approve 1              # human sign-off for escalated/high-risk tasks
 agentloop redo 1                 # full redo: fresh start, no carried context
-agentloop memory list            # inspect + gate what agents may remember
+agentloop pause 1                # steer a running loop: pause / resume / abort
+agentloop memory add k v --pinned --approved   # a fact that always injects
+agentloop eval --runner mock     # validator calibration report (mock or claude)
 ```
 
 ### Dashboard (Phase 2)
@@ -94,6 +98,43 @@ dashboard (or `agentloop memory`) for a human to accept or discard. A project
 fact read `memory_promote_threshold` times is promoted to the loop tier —
 re-answering the same question is exactly the wasted spend tiering removes.
 
+**Pinned facts.** Prompt injection is capped (20 facts) so memory can't crowd
+out the task; past the cap, ordinary facts drop by alphabetical accident. Mark
+a must-have fact `--pinned` (or pin it in the dashboard) and it sorts first and
+bypasses the cap under its own smaller ceiling (10). Pinning does not bypass
+approval — a pinned but unvetted fact still never reaches a prompt.
+
+## Token & cost accounting
+
+Usage is read from the SDK's terminal `ResultMessage` only (it already carries
+the whole-run total, so summing per-message double-counts) and captures all
+four fields: new input, output, and **prompt-cache** writes and reads. Cache is
+priced off the input rate — writes ×1.25, reads ×0.10 — and counts toward both
+the cost and token budget caps. This matters: a cached run can report 2 new
+input tokens against ~21,000 in cache, so the pre-fix cap, blind to cache,
+measured almost nothing. `estimate_cost_usd`'s cache arguments default to 0, so
+the zero-priced `MockRunner` stays free.
+
+## Mid-run human control
+
+A running task can be steered between iterations without killing the process:
+`agentloop pause|resume|abort <id>`, or the buttons in the dashboard. The signal
+is written through the store, so it works cross-process and is read fresh at
+each loop boundary (where the budget cap is checked). A paused task survives a
+restart and does not auto-resume; an aborted task is terminal but defensible —
+its output and full audit trail are left intact. Every transition is an event.
+
+## Validator calibration harness
+
+The decision rules lean on the validator's `CONFIDENCE` number, so `agentloop
+eval` measures whether it's calibrated. It runs ~20 fixtures with known-correct
+verdicts through `run_validator` and reports agreement rate, an
+approve/revise/escalate confusion matrix, and a confidence-vs-correctness
+calibration table (buckets straddling the 0.40/0.70 thresholds). `--runner mock`
+is deterministic and runs in CI to exercise the harness mechanics; `--runner
+claude` (opt-in, skipped without `ANTHROPIC_API_KEY`) produces a genuine
+calibration measurement. Results persist to the `eval_runs` table.
+
 ## Sandboxing
 
 The test command is allowlisted in config, never taken from model output. It
@@ -119,8 +160,14 @@ Anthropic credentials.
       validator; registry tools passed through to the SDK
 - [x] Memory wired into prompts, with gating and auto-promotion
 - [x] Phase 2: live dashboard (REST + SSE) over the same store
+- [x] Accurate token/cost accounting incl. prompt cache, feeding the budget cap
+- [x] Validator calibration harness (`agentloop eval`)
+- [x] Mid-run human control: pause / resume / abort, cross-process
+- [x] Pinned memory facts that bypass the injection cap
 - [ ] Context-budget handoff (summarize + fresh agent at <70% confidence)
 - [ ] RAG store (Chroma/LanceDB) behind the memory tables
+- [ ] Retrieval / tool-call provenance events (with the RAG/MCP work that needs
+      them)
 - [ ] Planner agent + task graph; parallel workers
 - [ ] Second-provider cross-validator
 - [ ] Agent-requested tools with an auto-approval policy

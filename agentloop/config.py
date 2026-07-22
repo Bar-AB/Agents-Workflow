@@ -92,6 +92,22 @@ MODEL_PRICING: dict[str, tuple[float, float]] = {
 DEFAULT_PRICING: tuple[float, float] = (3.00, 15.00)
 
 
-def estimate_cost_usd(model: str, tokens_in: int, tokens_out: int) -> float:
+# Prompt-cache multipliers on the input rate (Anthropic pricing model):
+# writing a cache entry costs more than fresh input, reading one costs far less.
+CACHE_WRITE_MULTIPLIER = 1.25
+CACHE_READ_MULTIPLIER = 0.10
+
+
+def estimate_cost_usd(model: str, tokens_in: int, tokens_out: int,
+                      cache_creation_tokens: int = 0,
+                      cache_read_tokens: int = 0) -> float:
+    """Cost of one invocation in USD.
+
+    Cache arguments default to 0 so existing callers and the zero-priced
+    MockRunner stay at $0. Cache tokens are priced off the input rate: writes
+    at 1.25x, reads at 0.10x; output is unaffected.
+    """
     pin, pout = MODEL_PRICING.get(model, DEFAULT_PRICING)
-    return (tokens_in * pin + tokens_out * pout) / 1_000_000
+    return (tokens_in * pin + tokens_out * pout
+            + cache_creation_tokens * pin * CACHE_WRITE_MULTIPLIER
+            + cache_read_tokens * pin * CACHE_READ_MULTIPLIER) / 1_000_000

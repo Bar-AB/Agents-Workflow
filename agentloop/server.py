@@ -139,14 +139,25 @@ class _Handler(BaseHTTPRequestHandler):
                 task = getattr(self.server.loop, f"human_{parts[3]}")(
                     int(parts[2]), body.get("note", ""))
                 self._send_json({"task": self._task_json(task)})
-            # /api/memory/{id}/{approve|reject}
+            # /api/tasks/{id}/{pause|resume|abort} — mid-run control
+            elif (len(parts) == 4 and parts[0] == "api" and parts[1] == "tasks"
+                    and parts[3] in ("pause", "resume", "abort")):
+                loop = self.server.loop
+                if parts[3] == "abort":
+                    task = loop.abort(int(parts[2]), body.get("note", ""))
+                else:
+                    task = getattr(loop, parts[3])(int(parts[2]))
+                self._send_json({"task": self._task_json(task)})
+            # /api/memory/{id}/{approve|reject|pin|unpin}
             elif (len(parts) == 4 and parts[0] == "api" and parts[1] == "memory"
-                    and parts[3] in ("approve", "reject")):
+                    and parts[3] in ("approve", "reject", "pin", "unpin")):
                 mem_id = int(parts[2])
                 if parts[3] == "approve":
                     self.store.memory_set_approved(mem_id, True)
-                else:
+                elif parts[3] == "reject":
                     self.store.memory_delete(mem_id)
+                else:
+                    self.store.memory_set_pinned(mem_id, parts[3] == "pin")
                 self._send_json({"memory": self.store.memory_list()})
             else:
                 self._error(404, f"No such endpoint: {url.path}")
@@ -266,6 +277,7 @@ class _Handler(BaseHTTPRequestHandler):
             "validator_role": task.validator_role,
             "output": task.output,
             "escalation_reason": task.escalation_reason,
+            "control": task.control,
         }
 
 

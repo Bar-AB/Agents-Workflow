@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 
 from .config import LoopConfig
@@ -44,9 +45,36 @@ def _memory_cmd(store: Store, args) -> int:
         print(f"Memory {args.memory_id} deleted.")
     elif args.mem_cmd == "add":
         store.memory_write(args.tier, args.key, args.value,
-                           approved=args.approved)
+                           approved=args.approved, pinned=args.pinned)
         state = "approved" if args.approved else "pending approval"
-        print(f"Wrote {args.tier}/{args.key} ({state}).")
+        pin = ", pinned" if args.pinned else ""
+        print(f"Wrote {args.tier}/{args.key} ({state}{pin}).")
+    elif args.mem_cmd in ("pin", "unpin"):
+        store.memory_set_pinned(args.memory_id, args.mem_cmd == "pin")
+        print(f"Memory {args.memory_id} {args.mem_cmd}ned.")
+    return 0
+
+
+def _eval_cmd(store: Store, args) -> int:
+    """Run the validator calibration harness (spec: eval)."""
+    from . import eval as evalmod
+    registry = Registry.load(
+        LoopConfig.load(getattr(args, "config", None) or "loopconfig.json")
+        .registry_path)
+    if args.runner == "claude":
+        # Opt-in and skipped without credentials — never a hard failure in CI.
+        from .runner import anyio as _sdk
+        if _sdk is None or not os.environ.get("ANTHROPIC_API_KEY"):
+            print("eval --runner claude skipped: set ANTHROPIC_API_KEY and "
+                  "install agentloop[claude] to run a real calibration.")
+            return 0
+        from .runner import ClaudeSDKRunner
+        runner = ClaudeSDKRunner()
+    else:
+        runner = evalmod.mock_runner_for(evalmod.FIXTURES)
+
+    result = evalmod.run_eval(store, runner, registry)
+    print(evalmod.format_report(result))
     return 0
 
 
@@ -81,6 +109,11 @@ def main(argv: list[str] | None = None) -> int:
         c.add_argument("task_id", type=int)
         c.add_argument("--note", default="")
 
+    for name in ("pause", "resume", "abort"):
+        c = sub.add_parser(name, help=f"Mid-run control: {name} a task")
+        c.add_argument("task_id", type=int)
+        c.add_argument("--note", default="")
+
     e = sub.add_parser("events", help="Audit trail for a task")
     e.add_argument("task_id", type=int)
 
@@ -92,14 +125,20 @@ def main(argv: list[str] | None = None) -> int:
     m = sub.add_parser("memory", help="Inspect and gate the memory store")
     msub = m.add_subparsers(dest="mem_cmd", required=True)
     msub.add_parser("list", help="Show all facts, both tiers")
-    for name in ("approve", "reject"):
-        mc = msub.add_parser(name, help=f"{name} a candidate fact")
+    for name in ("approve", "reject", "pin", "unpin"):
+        mc = msub.add_parser(name, help=f"{name} a memory fact")
         mc.add_argument("memory_id", type=int)
     ma = msub.add_parser("add", help="Add a fact directly")
     ma.add_argument("key")
     ma.add_argument("value")
     ma.add_argument("--tier", default="project", choices=["project", "loop"])
     ma.add_argument("--approved", action="store_true")
+    ma.add_argument("--pinned", action="store_true",
+                    help="Pin: always injected, ahead of the cap (still needs "
+                         "approval to be read)")
+
+    ev = sub.add_parser("eval", help="Validator calibration harness")
+    ev.add_argument("--runner", default="mock", choices=["claude", "mock"])
 
     sub.add_parser("init-registry", help="Write default agents.json")
 
@@ -151,6 +190,15 @@ def main(argv: list[str] | None = None) -> int:
             t = getattr(loop, f"human_{args.cmd}")(args.task_id, args.note)
             print(f"Task {t.id} -> {t.status.value}")
 
+        elif args.cmd in ("pause", "resume", "abort"):
+            if args.cmd == "resume":
+                t = loop.resume(args.task_id)
+            elif args.cmd == "pause":
+                t = loop.pause(args.task_id)
+            else:
+                t = loop.abort(args.task_id, args.note)
+            print(f"Task {t.id} -> {t.status.value} (control={t.control})")
+
         elif args.cmd == "events":
             for ev in store.events(args.task_id):
                 print(f"{ev['ts']:.0f} {ev['kind']:20s} "
@@ -160,6 +208,9 @@ def main(argv: list[str] | None = None) -> int:
             config = LoopConfig.load(args.config or "loopconfig.json")
             serve_forever(store, loop, Registry.load(config.registry_path),
                           config, args.host, args.port)
+
+        elif args.cmd == "eval":
+            return _eval_cmd(store, args)
 
         elif args.cmd == "memory":
             return _memory_cmd(store, args)

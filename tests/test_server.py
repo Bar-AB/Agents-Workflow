@@ -174,6 +174,34 @@ def test_memory_gating_over_http(live):
     assert body["memory"] == []
 
 
+def test_memory_pin_over_http(live):
+    base, store, _, _ = live
+    store.memory_write("loop", "always", "a must-have fact", approved=True)
+    mem_id = store.memory_list()[0]["id"]
+
+    _, body = post(base, f"/api/memory/{mem_id}/pin")
+    assert body["memory"][0]["pinned"] == 1
+    _, body = post(base, f"/api/memory/{mem_id}/unpin")
+    assert body["memory"][0]["pinned"] == 0
+
+
+def test_pause_resume_abort_over_http(live):
+    base, store, loop, _ = live
+    task = seed(store)
+
+    _, body = post(base, f"/api/tasks/{task.id}/pause")
+    assert body["task"]["status"] == "paused"
+    assert store.get_control(task.id) == "pause"
+
+    _, body = post(base, f"/api/tasks/{task.id}/resume")
+    assert body["task"]["status"] == "pending"
+    assert store.get_control(task.id) == "run"
+
+    _, body = post(base, f"/api/tasks/{task.id}/abort", {"note": "stop"})
+    assert body["task"]["status"] == "aborted"
+    assert store.get_control(task.id) == "abort"
+
+
 def test_unknown_post_endpoint_is_404(live):
     base, _, _, _ = live
     with pytest.raises(urllib.error.HTTPError) as exc:

@@ -14,8 +14,12 @@ class TaskStatus(str, Enum):
     REVISING = "revising"          # validator said revise; bounded retry
     NEEDS_HUMAN = "needs_human"    # escalated: ambiguity, severe disagreement,
                                    # budget trip, or high-risk sign-off
+    PAUSED = "paused"              # human paused mid-run; survives restart,
+                                   # resumes on explicit resume (not auto)
     DONE = "done"
     FAILED = "failed"              # human rejected / redo abandoned
+    ABORTED = "aborted"            # human aborted mid-run; terminal but the
+                                   # output and audit trail are left intact
 
 
 class VerdictKind(str, Enum):
@@ -38,14 +42,25 @@ class Task:
     # Latest worker output (also stored per-attempt in the attempts table).
     output: str = ""
     escalation_reason: str = ""
+    # Mid-run human control signal, read at each loop iteration boundary.
+    control: str = "run"             # 'run' | 'pause' | 'abort'
 
 
 @dataclass
 class RunResult:
-    """What a ModelRunner returns for one agent invocation."""
+    """What a ModelRunner returns for one agent invocation.
+
+    `tokens_in` is *new* input only. Prompt-cache tokens are tracked separately
+    because they are priced differently (write 1.25x, read 0.10x the input
+    rate) and a real run can hold thousands of cache tokens against a handful
+    of new-input tokens — folding them into `tokens_in` both mis-prices the run
+    and hides where the spend actually went.
+    """
     output: str
     tokens_in: int = 0
     tokens_out: int = 0
+    cache_creation_tokens: int = 0
+    cache_read_tokens: int = 0
     model: str = "unknown"
 
 

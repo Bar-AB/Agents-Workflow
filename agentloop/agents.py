@@ -28,12 +28,18 @@ def _invoke(store: Store, runner: ModelRunner, task: Task, kind: str,
     store.log_event(task.id, f"{kind}_prompt",
                     {"role": role, "prompt": prompt, "tools": list(tools or [])})
     result = runner.run(system, prompt, model, tools)
-    cost = estimate_cost_usd(result.model, result.tokens_in, result.tokens_out)
+    cost = estimate_cost_usd(result.model, result.tokens_in, result.tokens_out,
+                             result.cache_creation_tokens,
+                             result.cache_read_tokens)
     store.finish_attempt(attempt_id, result.output, result.tokens_in,
-                         result.tokens_out, cost, model=result.model)
+                         result.tokens_out, cost, model=result.model,
+                         cache_creation_tokens=result.cache_creation_tokens,
+                         cache_read_tokens=result.cache_read_tokens)
     store.log_event(task.id, f"{kind}_output", {
         "role": role, "output": result.output,
         "tokens_in": result.tokens_in, "tokens_out": result.tokens_out,
+        "cache_creation_tokens": result.cache_creation_tokens,
+        "cache_read_tokens": result.cache_read_tokens,
         "cost_usd": cost})
     return result, attempt_id
 

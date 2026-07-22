@@ -24,10 +24,21 @@ function digest(ev: EventRow): string {
     case 'memory_promoted':
       return `${p.key} → loop (${p.hit_count} hits)`
     case 'memory_write':
-      return `${p.tier}/${p.key}${p.approved ? '' : ' (pending)'}`
+      return `${p.tier}/${p.key}${p.approved ? '' : ' (pending)'}${p.pinned ? ' 📌' : ''}`
+    case 'memory_pinned':
+    case 'memory_unpinned':
+      return `${p.tier}/${p.key}`
+    case 'eval_run':
+      return `${p.runner}: ${p.n_fixtures} fixtures, agreement ${p.agreement}`
+    case 'human_abort':
+      return p.note ? String(p.note) : 'aborted mid-run'
     case 'task_defined':
       return String(p.title ?? '')
     default:
+      // control:pause / control:abort / status:paused etc. carry no payload
+      // worth digesting; the kind itself is the message.
+      if (ev.kind.startsWith('control:') || ev.kind.startsWith('status:'))
+        return ''
       return p.reason ? String(p.reason) : JSON.stringify(p).slice(0, 90)
   }
 }

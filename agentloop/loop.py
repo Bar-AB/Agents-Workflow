@@ -65,6 +65,11 @@ class Loop:
         feedback = ""
         test_result = TestResult()
         while True:
+            # Human control is read fresh from the store at each iteration
+            # boundary, so a pause/abort set from another process (CLI or
+            # dashboard) is honored between rounds rather than only on kill.
+            if self._control_stop(task):
+                return task
             if self._budget_tripped(task):
                 return task
 
@@ -142,6 +147,66 @@ class Loop:
             self.store.set_status(task, TaskStatus.REVISING)
             feedback = verdict.reasoning
 
+    # -- mid-run human control (pause / resume / abort) -----------------------
+
+    _TERMINAL = (TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.ABORTED)
+
+    def pause(self, task_id: int) -> Task:
+        """Signal a running loop to pause at its next iteration boundary. Also
+        marks the task PAUSED now so it's visible and the loop won't pick it up
+        even when nothing is mid-flight. A paused task survives a restart."""
+        task = self._require(task_id)
+        if task.status in self._TERMINAL:
+            return task
+        self.store.set_control(task_id, "pause")
+        self.store.set_status(task, TaskStatus.PAUSED,
+                              reason="Paused by human; resume to continue.")
+        return self._require(task_id)
+
+    def resume(self, task_id: int) -> Task:
+        """Clear the pause and return the task to the pending queue so the loop
+        continues it. Preserves revision_count/output — resume is not a redo.
+        A no-op on a terminal task (nothing to resume)."""
+        task = self._require(task_id)
+        if task.status in self._TERMINAL:
+            return task
+        self.store.set_control(task_id, "run")
+        if task.status == TaskStatus.PAUSED:
+            self.store.set_status(task, TaskStatus.PENDING, reason="")
+        return self._require(task_id)
+
+    def abort(self, task_id: int, note: str = "") -> Task:
+        """Terminally stop a task mid-run. Defensible: output and the full audit
+        trail are left intact; nothing is wiped. A no-op on an already-terminal
+        task — aborting a DONE/FAILED task must not discard its final status."""
+        task = self._require(task_id)
+        if task.status in self._TERMINAL:
+            return task
+        self.store.set_control(task_id, "abort")
+        self.store.log_event(task_id, "human_abort", {"note": note})
+        self.store.set_status(task, TaskStatus.ABORTED,
+                              reason=note or "Aborted by human mid-run.")
+        return self._require(task_id)
+
+    def _control_stop(self, task: Task) -> bool:
+        """Honor a pause/abort signal set since the last boundary. Returns True
+        if the loop should stop working this task."""
+        control = self.store.get_control(task.id)
+        if control == "abort":
+            # Preserve a reason the human's abort() call already stored (e.g. a
+            # --note); only fall back to the generic message when there is none.
+            current = self.store.get_task(task.id)
+            reason = (current.escalation_reason if current
+                      and current.escalation_reason
+                      else "Aborted by human mid-run.")
+            self.store.set_status(task, TaskStatus.ABORTED, reason=reason)
+            return True
+        if control == "pause":
+            self.store.set_status(task, TaskStatus.PAUSED,
+                                  reason="Paused by human; resume to continue.")
+            return True
+        return False
+
     # -- human decisions (spec §4.6–4.7) --------------------------------------
 
     def human_approve(self, task_id: int, note: str = "") -> Task:
@@ -162,6 +227,9 @@ class Loop:
         The audit trail of the failed run is preserved in events/attempts."""
         task = self._require(task_id)
         self.store.log_event(task_id, "human_redo", {"note": note})
+        # A fresh start clears any lingering pause/abort signal, otherwise the
+        # redo would stop again at its first iteration boundary.
+        self.store.set_control(task_id, "run")
         task.output = ""
         task.revision_count = 0
         task.escalation_reason = ""

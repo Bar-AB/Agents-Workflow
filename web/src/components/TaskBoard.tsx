@@ -10,9 +10,10 @@ const COLUMNS: { key: string; label: string; statuses: TaskStatus[] }[] = [
     label: 'Working',
     statuses: ['in_progress', 'testing', 'validating', 'revising'],
   },
+  { key: 'paused', label: 'Paused', statuses: ['paused'] },
   { key: 'needs_human', label: 'Needs you', statuses: ['needs_human'] },
   { key: 'done', label: 'Done', statuses: ['done'] },
-  { key: 'failed', label: 'Failed', statuses: ['failed'] },
+  { key: 'failed', label: 'Failed', statuses: ['failed', 'aborted'] },
 ]
 
 const ACTIVE: TaskStatus[] = ['in_progress', 'testing', 'validating', 'revising']
