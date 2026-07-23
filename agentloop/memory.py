@@ -36,8 +36,9 @@ class MemoryService:
 
     # -- reads ---------------------------------------------------------------
 
-    def facts_for_prompt(self, limit: int = _MAX_FACTS_IN_PROMPT,
-                         pinned_limit: int = _MAX_PINNED_FACTS) -> str:
+    def facts_for_prompt(
+        self, limit: int = _MAX_FACTS_IN_PROMPT, pinned_limit: int = _MAX_PINNED_FACTS
+    ) -> str:
         """Approved facts as a prompt block.
 
         Ordering: pinned facts first (they bypass the main cap under their own
@@ -52,8 +53,11 @@ class MemoryService:
         rows = pinned[:pinned_limit] + unpinned[:limit]
         if not rows:
             return ""
-        lines = [f"- ({r['tier']}){' *' if r['pinned'] else ''} {r['key']}: "
-                 f"{r['value'][:_MAX_VALUE_CHARS]}" for r in rows]
+        lines = [
+            f"- ({r['tier']}){' *' if r['pinned'] else ''} {r['key']}: "
+            f"{r['value'][:_MAX_VALUE_CHARS]}"
+            for r in rows
+        ]
         self._record_reads(rows)
         return "\n".join(lines)
 
@@ -65,13 +69,18 @@ class MemoryService:
 
     # -- writes --------------------------------------------------------------
 
-    def remember(self, tier: str, key: str, value: str,
-                 approved: bool = False, pinned: bool = False) -> None:
+    def remember(
+        self,
+        tier: str,
+        key: str,
+        value: str,
+        approved: bool = False,
+        pinned: bool = False,
+    ) -> None:
         """Record a candidate fact. Unapproved by default: a human gates it
         before it can ever influence a prompt. Pinning still requires approval
         to be injected — a pinned but unapproved fact is not read."""
-        self.store.memory_write(tier, key, value, approved=approved,
-                                pinned=pinned)
+        self.store.memory_write(tier, key, value, approved=approved, pinned=pinned)
 
     # -- promotion -----------------------------------------------------------
 
@@ -84,11 +93,19 @@ class MemoryService:
             return False
         # Carry approval across: a fact already vetted for this project does
         # not need re-vetting to be reused, and it stays visible in the log.
-        self.store.memory_write("loop", key, row["value"],
-                                approved=bool(row["approved"]))
-        self.store.log_event(None, "memory_promoted", {
-            "key": key, "from": "project", "to": "loop",
-            "hit_count": row["hit_count"]})
+        self.store.memory_write(
+            "loop", key, row["value"], approved=bool(row["approved"])
+        )
+        self.store.log_event(
+            None,
+            "memory_promoted",
+            {
+                "key": key,
+                "from": "project",
+                "to": "loop",
+                "hit_count": row["hit_count"],
+            },
+        )
         return True
 
     def _record_reads(self, rows: list[dict]) -> None:

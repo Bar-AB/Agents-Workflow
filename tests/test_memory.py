@@ -40,7 +40,7 @@ def test_rewriting_an_approved_fact_keeps_it_approved(store):
     """Regression: the ON CONFLICT clause used to copy the incoming (default
     False) approval over an existing True, silently hiding vetted memory."""
     store.memory_write("project", "k", "v1", approved=True)
-    store.memory_write("project", "k", "v2")          # agent rewrite, unapproved
+    store.memory_write("project", "k", "v2")  # agent rewrite, unapproved
 
     assert store.memory_read("project", "k") == "v2"
     assert store.memory_list(tier="project")[0]["approved"] == 1

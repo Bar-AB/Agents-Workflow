@@ -80,8 +80,8 @@ def test_fixture_lines_are_all_parseable(store):
     # A malformed scripted line would silently become an escalate@0 verdict.
     from agentloop.agents import parse_verdict
     from agentloop.models import VerdictKind
+
     for fx in evalmod.FIXTURES:
         v = parse_verdict(fx.mock_line)
-        assert v.kind in (VerdictKind.APPROVE, VerdictKind.REVISE,
-                          VerdictKind.ESCALATE)
+        assert v.kind in (VerdictKind.APPROVE, VerdictKind.REVISE, VerdictKind.ESCALATE)
         assert 0.0 <= v.confidence <= 1.0

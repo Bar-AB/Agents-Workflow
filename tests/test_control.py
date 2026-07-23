@@ -40,14 +40,18 @@ class ControllingRunner:
             self.store.set_control(self.task_id, self.control)
         out = self.outputs.pop(0) if self.outputs else "(out)"
         from agentloop.models import RunResult
+
         return RunResult(output=out, tokens_in=1, tokens_out=1, model="mock")
 
 
 def _cfg(store):
     from agentloop.config import LoopConfig
-    return LoopConfig(db_path=store.db_path,
-                      workspace_root=str(Path(store.db_path).parent / "ws"),
-                      allow_test_exec=False)
+
+    return LoopConfig(
+        db_path=store.db_path,
+        workspace_root=str(Path(store.db_path).parent / "ws"),
+        allow_test_exec=False,
+    )
 
 
 def test_pause_before_run_is_not_picked_up(store):
@@ -64,15 +68,16 @@ def test_pause_mid_run_stops_at_boundary(store):
     task = add_task(store)
     # Revise on the first validation, and a human pauses during that first
     # round; the loop must stop at the next boundary instead of revising on.
-    runner = ControllingRunner(["v1", REVISE, "v2", APPROVE], store, task.id,
-                               "pause", at_call=2)
+    runner = ControllingRunner(
+        ["v1", REVISE, "v2", APPROVE], store, task.id, "pause", at_call=2
+    )
     loop = Loop(store, runner, Registry.load(), _cfg(store))
     loop.run_task(task)
 
     fresh = store.get_task(task.id)
     assert fresh.status == TaskStatus.PAUSED
-    assert fresh.revision_count == 1        # it revised once, then paused
-    assert runner.n == 2                     # stopped before the 2nd worker call
+    assert fresh.revision_count == 1  # it revised once, then paused
+    assert runner.n == 2  # stopped before the 2nd worker call
 
 
 def test_paused_task_survives_restart_and_resumes(store):
@@ -95,8 +100,9 @@ def test_paused_task_survives_restart_and_resumes(store):
 
 def test_abort_mid_run_is_terminal_but_defensible(store):
     task = add_task(store)
-    runner = ControllingRunner(["v1", REVISE, "v2", APPROVE], store, task.id,
-                               "abort", at_call=2)
+    runner = ControllingRunner(
+        ["v1", REVISE, "v2", APPROVE], store, task.id, "abort", at_call=2
+    )
     loop = Loop(store, runner, Registry.load(), _cfg(store))
     loop.run_task(task)
 
@@ -106,7 +112,7 @@ def test_abort_mid_run_is_terminal_but_defensible(store):
     assert fresh.output == "v1"
     kinds = [e["kind"] for e in store.events(task.id)]
     assert "control:abort" in kinds
-    assert "verdict" in kinds                # earlier work still recorded
+    assert "verdict" in kinds  # earlier work still recorded
 
 
 def test_aborted_task_is_not_resumable_by_the_loop(store):
@@ -114,7 +120,7 @@ def test_aborted_task_is_not_resumable_by_the_loop(store):
     loop, _ = make_loop(store, ["out", APPROVE])
     loop.abort(task.id, note="wrong direction")
     assert store.get_task(task.id).status == TaskStatus.ABORTED
-    assert loop.run() == 0                    # loop leaves it alone
+    assert loop.run() == 0  # loop leaves it alone
 
 
 def test_every_control_transition_is_audited(store):
@@ -136,11 +142,11 @@ def test_abort_and_resume_are_noops_on_a_terminal_task(store):
     assert store.get_task(task.id).status == TaskStatus.DONE
 
     loop.abort(task.id, note="oops wrong id")
-    assert store.get_task(task.id).status == TaskStatus.DONE     # unchanged
-    assert store.get_control(task.id) == "run"                   # not flipped
+    assert store.get_task(task.id).status == TaskStatus.DONE  # unchanged
+    assert store.get_control(task.id) == "run"  # not flipped
 
     loop.resume(task.id)
-    assert store.get_task(task.id).status == TaskStatus.DONE     # still done
+    assert store.get_task(task.id).status == TaskStatus.DONE  # still done
 
 
 def test_control_stop_keeps_an_existing_abort_reason(store):
@@ -158,8 +164,9 @@ def test_pause_survives_the_loops_own_task_writes(store):
     """The loop holds a task loaded with control='run'; its status writes must
     not clobber a concurrent pause (update_task never writes control)."""
     task = add_task(store)
-    runner = ControllingRunner(["v1", REVISE, "v2", APPROVE], store, task.id,
-                               "pause", at_call=1)
+    runner = ControllingRunner(
+        ["v1", REVISE, "v2", APPROVE], store, task.id, "pause", at_call=1
+    )
     loop = Loop(store, runner, Registry.load(), _cfg(store))
     loop.run_task(task)
     # Pause was set during call 1; despite the loop's set_status writes through
