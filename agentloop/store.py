@@ -9,10 +9,18 @@ Every agent and (later) the Phase-2 UI reads and writes here. Design notes:
 - Schema is deliberately boring SQL so a later move to Postgres is a
   connection-string change, not a rewrite (spec §9).
 - The loop is resumable (spec §11): all state needed to continue lives here.
+- A state change and its audit event commit together via `transaction()`, so a
+  crash never leaves the row without its event (or an event without its row).
+  Rollback discards only uncommitted writes — committed `events` are never
+  touched, so the log stays append-only.
+- `claim_next_task` hands a task to exactly one worker (atomic select+claim via
+  a `claimed_by` lease column), the prerequisite for parallel workers; the
+  sequential loop uses one stable worker id and is behaviorally unchanged.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sqlite3
 import threading
@@ -38,6 +46,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- loop iteration boundary. Persisted so a human in another process (CLI or
     -- dashboard) can steer a running loop, and a paused task survives restart.
     control TEXT NOT NULL DEFAULT 'run',   -- 'run' | 'pause' | 'abort'
+    -- Which worker holds this task. NULL = unclaimed. Set atomically by
+    -- claim_next_task so exactly one worker runs a task (parallel-worker
+    -- prerequisite); a worker only resumes in-flight tasks it owns.
+    claimed_by TEXT,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
@@ -137,6 +149,10 @@ class _LockedConnection:
     def __init__(self, conn: sqlite3.Connection):
         self._conn = conn
         self._lock = threading.RLock()
+        # >0 while a transaction() is open (reentrant). Inner commit() calls
+        # are deferred to the outermost transaction's single commit, so a
+        # state change and its audit event land together or not at all.
+        self._txn_depth = 0
 
     def execute(self, sql: str, params: tuple = ()) -> "_LockedCursor":
         with self._lock:
@@ -152,7 +168,35 @@ class _LockedConnection:
 
     def commit(self) -> None:
         with self._lock:
-            self._conn.commit()
+            # Inside a transaction, defer to the outermost boundary; otherwise
+            # commit eagerly (the store's per-operation default).
+            if self._txn_depth == 0:
+                self._conn.commit()
+
+    @contextlib.contextmanager
+    def transaction(self):
+        """Group writes into one commit. The lock is held for the whole block
+        (SQL is already serialized), inner `commit()` calls become no-ops, and
+        an exception rolls the whole group back — so no partial state, and the
+        append-only `events` log never diverges from the row it describes.
+
+        Reentrant: a helper that opens its own transaction while inside one
+        joins the outer transaction rather than committing early."""
+        with self._lock:
+            self._txn_depth += 1
+            try:
+                yield
+            except BaseException:
+                # Abort the entire (possibly nested) transaction. Rollback only
+                # discards uncommitted writes; it never touches committed
+                # `events` rows, so the append-only rule holds.
+                self._conn.rollback()
+                self._txn_depth = 0
+                raise
+            else:
+                self._txn_depth -= 1
+                if self._txn_depth == 0:
+                    self._conn.commit()
 
     def close(self) -> None:
         with self._lock:
@@ -196,42 +240,65 @@ class Store:
             ("attempts", "cache_creation_tokens", "INTEGER NOT NULL DEFAULT 0"),
             ("attempts", "cache_read_tokens", "INTEGER NOT NULL DEFAULT 0"),
             ("tasks", "control", "TEXT NOT NULL DEFAULT 'run'"),
+            ("tasks", "claimed_by", "TEXT"),
             ("memory", "pinned", "INTEGER NOT NULL DEFAULT 0"),
         ]
         for table, column, decl in additions:
-            cols = {r["name"] for r in self._conn.execute(
-                f"PRAGMA table_info({table})").fetchall()}
+            cols = {
+                r["name"]
+                for r in self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
             if column not in cols:
-                self._conn.execute(
-                    f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+                self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
     def close(self) -> None:
         self._conn.close()
+
+    def transaction(self):
+        """Commit a state change and its audit event as one unit. Use around
+        paired writes so a crash can't leave the row without its event (or the
+        reverse). Rollback never deletes committed `events` — the log stays
+        append-only. See `_LockedConnection.transaction`."""
+        return self._conn.transaction()
 
     # -- tasks ---------------------------------------------------------------
 
     def add_task(self, task: Task) -> int:
         now = time.time()
-        cur = self._conn.execute(
-            "INSERT INTO tasks (title, goal, acceptance_criteria, status,"
-            " risk_level, worker_role, validator_role, created_at, updated_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?)",
-            (task.title, task.goal, task.acceptance_criteria,
-             task.status.value, task.risk_level, task.worker_role,
-             task.validator_role, now, now),
-        )
-        task.id = cur.lastrowid
-        self.log_event(task.id, "task_defined", {
-            "title": task.title, "goal": task.goal,
-            "acceptance_criteria": task.acceptance_criteria,
-            "risk_level": task.risk_level,
-        })
-        self._conn.commit()
+        with self.transaction():
+            cur = self._conn.execute(
+                "INSERT INTO tasks (title, goal, acceptance_criteria, status,"
+                " risk_level, worker_role, validator_role, created_at,"
+                " updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                (
+                    task.title,
+                    task.goal,
+                    task.acceptance_criteria,
+                    task.status.value,
+                    task.risk_level,
+                    task.worker_role,
+                    task.validator_role,
+                    now,
+                    now,
+                ),
+            )
+            task.id = cur.lastrowid
+            self.log_event(
+                task.id,
+                "task_defined",
+                {
+                    "title": task.title,
+                    "goal": task.goal,
+                    "acceptance_criteria": task.acceptance_criteria,
+                    "risk_level": task.risk_level,
+                },
+            )
         return task.id
 
     def get_task(self, task_id: int) -> Task | None:
         row = self._conn.execute(
-            "SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+            "SELECT * FROM tasks WHERE id=?", (task_id,)
+        ).fetchone()
         return self._row_to_task(row) if row else None
 
     def next_pending_task(self) -> Task | None:
@@ -241,8 +308,43 @@ class Store:
             "SELECT * FROM tasks WHERE status IN"
             " ('in_progress','testing','validating','revising','pending')"
             " ORDER BY CASE status WHEN 'pending' THEN 1 ELSE 0 END, id"
-            " LIMIT 1").fetchone()
+            " LIMIT 1"
+        ).fetchone()
         return self._row_to_task(row) if row else None
+
+    def claim_next_task(self, worker_id: str) -> Task | None:
+        """Atomically hand the next actionable task to exactly one worker.
+
+        Select and claim happen in a single transaction, so two workers racing
+        for one pending task can never both win (parallel-worker prerequisite).
+        A pending task is flipped to `in_progress` and stamped `claimed_by`; an
+        in-flight task is resumable only by the worker that already owns it, so
+        a crashed run resumes without another worker stealing it. With a single
+        stable `worker_id` this reproduces `next_pending_task`'s ordering
+        (in-flight before pending), so the sequential loop is unchanged."""
+        with self.transaction():
+            row = self._conn.execute(
+                "SELECT * FROM tasks WHERE"
+                " status='pending'"
+                " OR (status IN ('in_progress','testing','validating',"
+                "'revising') AND claimed_by=?)"
+                " ORDER BY CASE status WHEN 'pending' THEN 1 ELSE 0 END, id"
+                " LIMIT 1",
+                (worker_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            task = self._row_to_task(row)
+            if task.status == TaskStatus.PENDING:
+                self._conn.execute(
+                    "UPDATE tasks SET status='in_progress', claimed_by=?,"
+                    " updated_at=? WHERE id=?",
+                    (worker_id, time.time(), task.id),
+                )
+                task.status = TaskStatus.IN_PROGRESS
+                task.claimed_by = worker_id
+                self.log_event(task.id, "task_claimed", {"worker": worker_id})
+            return task
 
     def list_tasks(self) -> list[Task]:
         rows = self._conn.execute("SELECT * FROM tasks ORDER BY id").fetchall()
@@ -256,8 +358,14 @@ class Store:
         self._conn.execute(
             "UPDATE tasks SET status=?, revision_count=?, output=?,"
             " escalation_reason=?, updated_at=? WHERE id=?",
-            (task.status.value, task.revision_count, task.output,
-             task.escalation_reason, time.time(), task.id),
+            (
+                task.status.value,
+                task.revision_count,
+                task.output,
+                task.escalation_reason,
+                time.time(),
+                task.id,
+            ),
         )
         self._conn.commit()
 
@@ -265,37 +373,47 @@ class Store:
         """Write the mid-run control signal (run/pause/abort). The sole writer
         of the control column, so a human in another process can steer a
         running loop without racing the loop's own task writes."""
-        self._conn.execute("UPDATE tasks SET control=?, updated_at=? WHERE id=?",
-                           (control, time.time(), task_id))
-        self._conn.commit()
-        self.log_event(task_id, f"control:{control}", {})
+        with self.transaction():
+            self._conn.execute(
+                "UPDATE tasks SET control=?, updated_at=? WHERE id=?",
+                (control, time.time(), task_id),
+            )
+            self.log_event(task_id, f"control:{control}", {})
 
     def get_control(self, task_id: int) -> str:
         """Read the control signal fresh from the store — the loop re-reads this
         each iteration so a cross-process pause/abort is seen promptly."""
         row = self._conn.execute(
-            "SELECT control FROM tasks WHERE id=?", (task_id,)).fetchone()
+            "SELECT control FROM tasks WHERE id=?", (task_id,)
+        ).fetchone()
         return row["control"] if row else "run"
 
     def set_status(self, task: Task, status: TaskStatus, reason: str = "") -> None:
         task.status = status
         if reason:
             task.escalation_reason = reason
-        self.update_task(task)
-        self.log_event(task.id, f"status:{status.value}",
-                       {"reason": reason} if reason else {})
+        with self.transaction():  # row change + its event: one commit
+            self.update_task(task)
+            self.log_event(
+                task.id, f"status:{status.value}", {"reason": reason} if reason else {}
+            )
 
     @staticmethod
     def _row_to_task(row: sqlite3.Row) -> Task:
         return Task(
-            id=row["id"], title=row["title"], goal=row["goal"],
+            id=row["id"],
+            title=row["title"],
+            goal=row["goal"],
             acceptance_criteria=row["acceptance_criteria"],
-            status=TaskStatus(row["status"]), risk_level=row["risk_level"],
+            status=TaskStatus(row["status"]),
+            risk_level=row["risk_level"],
             revision_count=row["revision_count"],
             worker_role=row["worker_role"],
-            validator_role=row["validator_role"], output=row["output"],
+            validator_role=row["validator_role"],
+            output=row["output"],
             escalation_reason=row["escalation_reason"],
             control=row["control"],
+            claimed_by=row["claimed_by"],
         )
 
     # -- attempts / metrics --------------------------------------------------
@@ -303,15 +421,23 @@ class Store:
     def start_attempt(self, task_id: int, kind: str, role: str, model: str) -> int:
         cur = self._conn.execute(
             "INSERT INTO attempts (task_id, kind, agent_role, model, started_at)"
-            " VALUES (?,?,?,?,?)", (task_id, kind, role, model, time.time()))
+            " VALUES (?,?,?,?,?)",
+            (task_id, kind, role, model, time.time()),
+        )
         self._conn.commit()
         return cur.lastrowid
 
-    def finish_attempt(self, attempt_id: int, output: str, tokens_in: int,
-                       tokens_out: int, cost_usd: float,
-                       model: str | None = None,
-                       cache_creation_tokens: int = 0,
-                       cache_read_tokens: int = 0) -> None:
+    def finish_attempt(
+        self,
+        attempt_id: int,
+        output: str,
+        tokens_in: int,
+        tokens_out: int,
+        cost_usd: float,
+        model: str | None = None,
+        cache_creation_tokens: int = 0,
+        cache_read_tokens: int = 0,
+    ) -> None:
         """Record the result of an attempt.
 
         `model` is what actually served the request, which can differ from what
@@ -321,11 +447,20 @@ class Store:
         never ran. `cost_usd` already includes cache cost; the cache token
         columns keep the breakdown auditable and feed the token budget cap.
         """
-        base = ("UPDATE attempts SET finished_at=?, output=?, tokens_in=?,"
-                " tokens_out=?, cache_creation_tokens=?, cache_read_tokens=?,"
-                " cost_usd=?")
-        vals = [time.time(), output, tokens_in, tokens_out,
-                cache_creation_tokens, cache_read_tokens, cost_usd]
+        base = (
+            "UPDATE attempts SET finished_at=?, output=?, tokens_in=?,"
+            " tokens_out=?, cache_creation_tokens=?, cache_read_tokens=?,"
+            " cost_usd=?"
+        )
+        vals = [
+            time.time(),
+            output,
+            tokens_in,
+            tokens_out,
+            cache_creation_tokens,
+            cache_read_tokens,
+            cost_usd,
+        ]
         if model:
             base += ", model=?"
             vals.append(model)
@@ -344,7 +479,9 @@ class Store:
             "SELECT COALESCE(SUM(tokens_in+tokens_out+cache_creation_tokens"
             "+cache_read_tokens),0) AS toks,"
             " COALESCE(SUM(cost_usd),0.0) AS cost"
-            " FROM attempts WHERE task_id=?", (task_id,)).fetchone()
+            " FROM attempts WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
         return int(row["toks"]), float(row["cost"])
 
     def task_metrics(self, task_id: int) -> dict:
@@ -353,29 +490,47 @@ class Store:
             "SELECT COUNT(*) AS n,"
             " COALESCE(SUM(finished_at-started_at),0) AS wall"
             " FROM attempts WHERE task_id=? AND finished_at IS NOT NULL",
-            (task_id,)).fetchone()
+            (task_id,),
+        ).fetchone()
         verdicts = self._conn.execute(
             "SELECT kind, confidence, tests_passed FROM verdicts"
-            " WHERE task_id=? ORDER BY id", (task_id,)).fetchall()
+            " WHERE task_id=? ORDER BY id",
+            (task_id,),
+        ).fetchall()
         return {
-            "tokens": toks, "cost_usd": round(cost, 6),
-            "attempts": row["n"], "wall_seconds": round(row["wall"], 3),
+            "tokens": toks,
+            "cost_usd": round(cost, 6),
+            "attempts": row["n"],
+            "wall_seconds": round(row["wall"], 3),
             "verdicts": [dict(v) for v in verdicts],
         }
 
     # -- verdicts ------------------------------------------------------------
 
     def add_verdict(self, task_id: int, attempt_id: int | None, v: Verdict) -> int:
-        cur = self._conn.execute(
-            "INSERT INTO verdicts (task_id, attempt_id, kind, confidence,"
-            " reasoning, tests_passed, created_at) VALUES (?,?,?,?,?,?,?)",
-            (task_id, attempt_id, v.kind.value, v.confidence, v.reasoning,
-             None if v.tests_passed is None else int(v.tests_passed),
-             time.time()))
-        self._conn.commit()
-        self.log_event(task_id, "verdict", {
-            "kind": v.kind.value, "confidence": v.confidence,
-            "tests_passed": v.tests_passed})
+        with self.transaction():
+            cur = self._conn.execute(
+                "INSERT INTO verdicts (task_id, attempt_id, kind, confidence,"
+                " reasoning, tests_passed, created_at) VALUES (?,?,?,?,?,?,?)",
+                (
+                    task_id,
+                    attempt_id,
+                    v.kind.value,
+                    v.confidence,
+                    v.reasoning,
+                    None if v.tests_passed is None else int(v.tests_passed),
+                    time.time(),
+                ),
+            )
+            self.log_event(
+                task_id,
+                "verdict",
+                {
+                    "kind": v.kind.value,
+                    "confidence": v.confidence,
+                    "tests_passed": v.tests_passed,
+                },
+            )
         return cur.lastrowid
 
     # -- audit log -----------------------------------------------------------
@@ -383,42 +538,52 @@ class Store:
     def log_event(self, task_id: int | None, kind: str, payload: dict) -> None:
         self._conn.execute(
             "INSERT INTO events (task_id, ts, kind, payload) VALUES (?,?,?,?)",
-            (task_id, time.time(), kind, json.dumps(payload)))
+            (task_id, time.time(), kind, json.dumps(payload)),
+        )
         self._conn.commit()
 
     def events(self, task_id: int | None = None) -> list[dict]:
         if task_id is None:
-            rows = self._conn.execute(
-                "SELECT * FROM events ORDER BY id").fetchall()
+            rows = self._conn.execute("SELECT * FROM events ORDER BY id").fetchall()
         else:
             rows = self._conn.execute(
-                "SELECT * FROM events WHERE task_id=? ORDER BY id",
-                (task_id,)).fetchall()
+                "SELECT * FROM events WHERE task_id=? ORDER BY id", (task_id,)
+            ).fetchall()
         return [dict(r) | {"payload": json.loads(r["payload"])} for r in rows]
 
     # -- memory (spec §7) ----------------------------------------------------
 
-    def memory_write(self, tier: str, key: str, value: str,
-                     approved: bool = False, pinned: bool = False) -> None:
+    def memory_write(
+        self,
+        tier: str,
+        key: str,
+        value: str,
+        approved: bool = False,
+        pinned: bool = False,
+    ) -> None:
         # Approval and pinning are both sticky: rewriting an already-approved or
         # pinned fact must not silently revoke it (that would make approved
         # memory quietly unreadable, or drop a pinned fact from the prompt).
         # Only an explicit flag can raise them; lowering is via the dedicated
         # setter methods.
-        self._conn.execute(
-            "INSERT INTO memory (tier, key, value, approved, pinned, created_at)"
-            " VALUES (?,?,?,?,?,?)"
-            " ON CONFLICT(tier, key) DO UPDATE SET value=excluded.value,"
-            " approved=MAX(memory.approved, excluded.approved),"
-            " pinned=MAX(memory.pinned, excluded.pinned)",
-            (tier, key, value, int(approved), int(pinned), time.time()))
-        self._conn.commit()
-        self.log_event(None, "memory_write",
-                       {"tier": tier, "key": key, "approved": approved,
-                        "pinned": pinned})
+        with self.transaction():
+            self._conn.execute(
+                "INSERT INTO memory (tier, key, value, approved, pinned,"
+                " created_at) VALUES (?,?,?,?,?,?)"
+                " ON CONFLICT(tier, key) DO UPDATE SET value=excluded.value,"
+                " approved=MAX(memory.approved, excluded.approved),"
+                " pinned=MAX(memory.pinned, excluded.pinned)",
+                (tier, key, value, int(approved), int(pinned), time.time()),
+            )
+            self.log_event(
+                None,
+                "memory_write",
+                {"tier": tier, "key": key, "approved": approved, "pinned": pinned},
+            )
 
-    def memory_read(self, tier: str, key: str,
-                    approved_only: bool = True) -> str | None:
+    def memory_read(
+        self, tier: str, key: str, approved_only: bool = True
+    ) -> str | None:
         q = "SELECT value FROM memory WHERE tier=? AND key=?"
         if approved_only:
             q += " AND approved=1"
@@ -426,12 +591,14 @@ class Store:
         if row:
             self._conn.execute(
                 "UPDATE memory SET hit_count=hit_count+1 WHERE tier=? AND key=?",
-                (tier, key))
+                (tier, key),
+            )
             self._conn.commit()
         return row["value"] if row else None
 
-    def memory_list(self, tier: str | None = None,
-                    approved_only: bool = False) -> list[dict]:
+    def memory_list(
+        self, tier: str | None = None, approved_only: bool = False
+    ) -> list[dict]:
         q = "SELECT * FROM memory"
         params: list = []
         where = []
@@ -447,76 +614,125 @@ class Store:
 
     def memory_set_approved(self, mem_id: int, approved: bool) -> None:
         row = self._conn.execute(
-            "SELECT tier, key FROM memory WHERE id=?", (mem_id,)).fetchone()
+            "SELECT tier, key FROM memory WHERE id=?", (mem_id,)
+        ).fetchone()
         if row is None:
             raise KeyError(f"No memory row {mem_id}")
-        self._conn.execute("UPDATE memory SET approved=? WHERE id=?",
-                           (int(approved), mem_id))
-        self._conn.commit()
-        self.log_event(None, "memory_approved" if approved else "memory_revoked",
-                       {"tier": row["tier"], "key": row["key"]})
+        with self.transaction():
+            self._conn.execute(
+                "UPDATE memory SET approved=? WHERE id=?", (int(approved), mem_id)
+            )
+            self.log_event(
+                None,
+                "memory_approved" if approved else "memory_revoked",
+                {"tier": row["tier"], "key": row["key"]},
+            )
 
     def memory_set_pinned(self, mem_id: int, pinned: bool) -> None:
         row = self._conn.execute(
-            "SELECT tier, key FROM memory WHERE id=?", (mem_id,)).fetchone()
+            "SELECT tier, key FROM memory WHERE id=?", (mem_id,)
+        ).fetchone()
         if row is None:
             raise KeyError(f"No memory row {mem_id}")
-        self._conn.execute("UPDATE memory SET pinned=? WHERE id=?",
-                           (int(pinned), mem_id))
-        self._conn.commit()
-        self.log_event(None, "memory_pinned" if pinned else "memory_unpinned",
-                       {"tier": row["tier"], "key": row["key"]})
+        with self.transaction():
+            self._conn.execute(
+                "UPDATE memory SET pinned=? WHERE id=?", (int(pinned), mem_id)
+            )
+            self.log_event(
+                None,
+                "memory_pinned" if pinned else "memory_unpinned",
+                {"tier": row["tier"], "key": row["key"]},
+            )
 
     def memory_delete(self, mem_id: int) -> None:
         row = self._conn.execute(
-            "SELECT tier, key FROM memory WHERE id=?", (mem_id,)).fetchone()
+            "SELECT tier, key FROM memory WHERE id=?", (mem_id,)
+        ).fetchone()
         if row is None:
             raise KeyError(f"No memory row {mem_id}")
-        self._conn.execute("DELETE FROM memory WHERE id=?", (mem_id,))
-        self._conn.commit()
-        self.log_event(None, "memory_deleted",
-                       {"tier": row["tier"], "key": row["key"]})
+        with self.transaction():
+            self._conn.execute("DELETE FROM memory WHERE id=?", (mem_id,))
+            self.log_event(
+                None, "memory_deleted", {"tier": row["tier"], "key": row["key"]}
+            )
 
     # -- executed test results (spec §5) -------------------------------------
 
-    def add_test_run(self, task_id: int, attempt_id: int | None,
-                     result: TestResult) -> int:
-        cur = self._conn.execute(
-            "INSERT INTO test_runs (task_id, attempt_id, status, exit_code,"
-            " summary, stdout_tail, duration_s, created_at)"
-            " VALUES (?,?,?,?,?,?,?,?)",
-            (task_id, attempt_id, result.status, result.exit_code,
-             result.summary, result.stdout_tail, result.duration_s,
-             time.time()))
-        self._conn.commit()
-        self.log_event(task_id, "test_run", {
-            "status": result.status, "exit_code": result.exit_code,
-            "summary": result.summary, "duration_s": result.duration_s})
+    def add_test_run(
+        self, task_id: int, attempt_id: int | None, result: TestResult
+    ) -> int:
+        with self.transaction():
+            cur = self._conn.execute(
+                "INSERT INTO test_runs (task_id, attempt_id, status, exit_code,"
+                " summary, stdout_tail, duration_s, created_at)"
+                " VALUES (?,?,?,?,?,?,?,?)",
+                (
+                    task_id,
+                    attempt_id,
+                    result.status,
+                    result.exit_code,
+                    result.summary,
+                    result.stdout_tail,
+                    result.duration_s,
+                    time.time(),
+                ),
+            )
+            self.log_event(
+                task_id,
+                "test_run",
+                {
+                    "status": result.status,
+                    "exit_code": result.exit_code,
+                    "summary": result.summary,
+                    "duration_s": result.duration_s,
+                },
+            )
         return cur.lastrowid
 
     def test_runs(self, task_id: int) -> list[dict]:
-        return [dict(r) for r in self._conn.execute(
-            "SELECT * FROM test_runs WHERE task_id=? ORDER BY id",
-            (task_id,)).fetchall()]
+        return [
+            dict(r)
+            for r in self._conn.execute(
+                "SELECT * FROM test_runs WHERE task_id=? ORDER BY id", (task_id,)
+            ).fetchall()
+        ]
 
     # -- validator eval harness ----------------------------------------------
 
-    def add_eval_run(self, runner: str, n_fixtures: int, agreement: float,
-                     summary: dict, detail: list) -> int:
-        cur = self._conn.execute(
-            "INSERT INTO eval_runs (runner, n_fixtures, agreement, summary,"
-            " detail, created_at) VALUES (?,?,?,?,?,?)",
-            (runner, n_fixtures, agreement, json.dumps(summary),
-             json.dumps(detail), time.time()))
-        self._conn.commit()
-        self.log_event(None, "eval_run", {
-            "runner": runner, "n_fixtures": n_fixtures,
-            "agreement": round(agreement, 4)})
+    def add_eval_run(
+        self,
+        runner: str,
+        n_fixtures: int,
+        agreement: float,
+        summary: dict,
+        detail: list,
+    ) -> int:
+        with self.transaction():
+            cur = self._conn.execute(
+                "INSERT INTO eval_runs (runner, n_fixtures, agreement, summary,"
+                " detail, created_at) VALUES (?,?,?,?,?,?)",
+                (
+                    runner,
+                    n_fixtures,
+                    agreement,
+                    json.dumps(summary),
+                    json.dumps(detail),
+                    time.time(),
+                ),
+            )
+            self.log_event(
+                None,
+                "eval_run",
+                {
+                    "runner": runner,
+                    "n_fixtures": n_fixtures,
+                    "agreement": round(agreement, 4),
+                },
+            )
         return cur.lastrowid
 
     def eval_runs(self) -> list[dict]:
-        rows = self._conn.execute(
-            "SELECT * FROM eval_runs ORDER BY id").fetchall()
+        rows = self._conn.execute("SELECT * FROM eval_runs ORDER BY id").fetchall()
         out = []
         for r in rows:
             d = dict(r)
@@ -531,13 +747,14 @@ class Store:
         """Audit-log rows after `event_id`. The append-only log doubles as the
         dashboard's change feed: monotonic ids make SSE resumable by cursor."""
         rows = self._conn.execute(
-            "SELECT * FROM events WHERE id > ? ORDER BY id LIMIT ?",
-            (event_id, limit)).fetchall()
+            "SELECT * FROM events WHERE id > ? ORDER BY id LIMIT ?", (event_id, limit)
+        ).fetchall()
         return [dict(r) | {"payload": json.loads(r["payload"])} for r in rows]
 
     def latest_event_id(self) -> int:
         row = self._conn.execute(
-            "SELECT COALESCE(MAX(id), 0) AS m FROM events").fetchone()
+            "SELECT COALESCE(MAX(id), 0) AS m FROM events"
+        ).fetchone()
         return int(row["m"])
 
     def run_metrics(self) -> dict:
@@ -550,24 +767,34 @@ class Store:
             " COALESCE(SUM(cost_usd),0.0) AS cost,"
             " COUNT(*) AS attempts,"
             " COALESCE(SUM(finished_at-started_at),0) AS wall"
-            " FROM attempts WHERE finished_at IS NOT NULL").fetchone()
-        by_status = {r["status"]: r["n"] for r in self._conn.execute(
-            "SELECT status, COUNT(*) AS n FROM tasks GROUP BY status"
-        ).fetchall()}
-        by_model = [dict(r) for r in self._conn.execute(
-            "SELECT model, COUNT(*) AS attempts,"
-            " COALESCE(SUM(tokens_in),0) AS tokens_in,"
-            " COALESCE(SUM(tokens_out),0) AS tokens_out,"
-            " COALESCE(SUM(cost_usd),0.0) AS cost_usd"
-            " FROM attempts GROUP BY model ORDER BY cost_usd DESC").fetchall()]
+            " FROM attempts WHERE finished_at IS NOT NULL"
+        ).fetchone()
+        by_status = {
+            r["status"]: r["n"]
+            for r in self._conn.execute(
+                "SELECT status, COUNT(*) AS n FROM tasks GROUP BY status"
+            ).fetchall()
+        }
+        by_model = [
+            dict(r)
+            for r in self._conn.execute(
+                "SELECT model, COUNT(*) AS attempts,"
+                " COALESCE(SUM(tokens_in),0) AS tokens_in,"
+                " COALESCE(SUM(tokens_out),0) AS tokens_out,"
+                " COALESCE(SUM(cost_usd),0.0) AS cost_usd"
+                " FROM attempts GROUP BY model ORDER BY cost_usd DESC"
+            ).fetchall()
+        ]
         revisions = self._conn.execute(
-            "SELECT COALESCE(SUM(revision_count),0) AS r FROM tasks").fetchone()
+            "SELECT COALESCE(SUM(revision_count),0) AS r FROM tasks"
+        ).fetchone()
         cwrite, cread = int(totals["cwrite"]), int(totals["cread"])
         return {
-            "tokens_in": int(totals["tin"]), "tokens_out": int(totals["tout"]),
-            "cache_creation_tokens": cwrite, "cache_read_tokens": cread,
-            "tokens": (int(totals["tin"]) + int(totals["tout"])
-                       + cwrite + cread),
+            "tokens_in": int(totals["tin"]),
+            "tokens_out": int(totals["tout"]),
+            "cache_creation_tokens": cwrite,
+            "cache_read_tokens": cread,
+            "tokens": (int(totals["tin"]) + int(totals["tout"]) + cwrite + cread),
             "cost_usd": round(float(totals["cost"]), 6),
             "attempts": int(totals["attempts"]),
             "wall_seconds": round(float(totals["wall"]), 3),

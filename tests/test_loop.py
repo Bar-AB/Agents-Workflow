@@ -14,10 +14,14 @@ from agentloop.store import Store
 
 
 APPROVE = "VERDICT: approve CONFIDENCE: 0.92 TESTS: pass\nMeets all criteria."
-REVISE = ("VERDICT: revise CONFIDENCE: 0.55 TESTS: fail\n"
-          "Edge case for empty input is not handled; add a guard and a test.")
-SEVERE = ("VERDICT: escalate CONFIDENCE: 0.10 TESTS: fail\n"
-          "Fundamentally wrong approach; solves a different problem.")
+REVISE = (
+    "VERDICT: revise CONFIDENCE: 0.55 TESTS: fail\n"
+    "Edge case for empty input is not handled; add a guard and a test."
+)
+SEVERE = (
+    "VERDICT: escalate CONFIDENCE: 0.10 TESTS: fail\n"
+    "Fundamentally wrong approach; solves a different problem."
+)
 
 
 @pytest.fixture()
@@ -30,8 +34,7 @@ def store(tmp_path):
 def make_loop(store, outputs, **cfg_overrides):
     # Workspaces live beside the test db so a run never touches the real repo,
     # and test execution is off unless a test explicitly opts in.
-    cfg_overrides.setdefault(
-        "workspace_root", str(Path(store.db_path).parent / "ws"))
+    cfg_overrides.setdefault("workspace_root", str(Path(store.db_path).parent / "ws"))
     cfg_overrides.setdefault("allow_test_exec", False)
     config = LoopConfig(db_path=store.db_path, **cfg_overrides)
     runner = MockRunner(outputs)
@@ -39,10 +42,13 @@ def make_loop(store, outputs, **cfg_overrides):
 
 
 def add_task(store, risk=1) -> Task:
-    task = Task(id=None, title="Add slugify util",
-                goal="Write a slugify(text) function.",
-                acceptance_criteria="Lowercase, hyphen-separated, tested.",
-                risk_level=risk)
+    task = Task(
+        id=None,
+        title="Add slugify util",
+        goal="Write a slugify(text) function.",
+        acceptance_criteria="Lowercase, hyphen-separated, tested.",
+        risk_level=risk,
+    )
     store.add_task(task)
     return task
 
@@ -63,8 +69,7 @@ def test_happy_path_approved_first_try(store):
 
 def test_revise_then_approve(store):
     task = add_task(store)
-    loop, runner = make_loop(
-        store, ["v1 output", REVISE, "v2 output fixed", APPROVE])
+    loop, runner = make_loop(store, ["v1 output", REVISE, "v2 output fixed", APPROVE])
     loop.run_task(task)
 
     assert task.status == TaskStatus.DONE
@@ -107,8 +112,7 @@ def test_low_confidence_approve_is_not_done(store):
 
 def test_worker_ambiguity_escalates(store):
     task = add_task(store)
-    loop, _ = make_loop(
-        store, ["ESCALATE: which locale rules should slugify follow?"])
+    loop, _ = make_loop(store, ["ESCALATE: which locale rules should slugify follow?"])
     loop.run_task(task)
     assert task.status == TaskStatus.NEEDS_HUMAN
     assert "locale" in task.escalation_reason
@@ -142,8 +146,9 @@ def test_human_redo_resets_context(store):
 
 def test_budget_cap_trips_to_human(store):
     task = add_task(store)
-    loop, _ = make_loop(store, ["v1", REVISE, "v2", REVISE],
-                        max_tokens_per_task=10)  # tiny cap
+    loop, _ = make_loop(
+        store, ["v1", REVISE, "v2", REVISE], max_tokens_per_task=10
+    )  # tiny cap
     loop.run_task(task)
     assert task.status == TaskStatus.NEEDS_HUMAN
     assert "Budget cap" in task.escalation_reason
@@ -166,6 +171,44 @@ def test_unparseable_verdict_escalates(store):
     assert task.status == TaskStatus.NEEDS_HUMAN
 
 
+# -- infra error handling (0d): transient failures don't kill the batch ------
+
+
+def test_infra_error_escalates_and_the_batch_continues(store):
+    """A runner that keeps raising exhausts retries -> the task lands in
+    NEEDS_HUMAN with an infra_error reason, an infra_error event is logged, and
+    the next pending task still runs."""
+    add_task(store)  # task 1: its worker call always fails
+    add_task(store)  # task 2: healthy, must still complete
+    boom = RuntimeError("API 503")
+    # retries=1 -> two failing worker calls exhaust it; then task 2 succeeds.
+    loop, _ = make_loop(
+        store, [boom, boom, "task2 output", APPROVE], infra_max_retries=1
+    )
+    processed = loop.run()
+
+    assert processed == 2
+    t1, t2 = store.list_tasks()
+    assert t1.status == TaskStatus.NEEDS_HUMAN
+    assert "infra_error" in t1.escalation_reason
+    assert "API 503" in t1.escalation_reason
+    assert t2.status == TaskStatus.DONE  # a flaky call didn't abort the run
+
+    kinds = [e["kind"] for e in store.events(t1.id)]
+    assert "infra_error" in kinds
+
+
+def test_infra_error_is_not_a_revision(store):
+    """A transient failure retried to success does not consume a revision."""
+    task = add_task(store)
+    boom = RuntimeError("network blip")
+    loop, _ = make_loop(store, [boom, "worker output", APPROVE], infra_max_retries=2)
+    loop.run_task(task)
+
+    assert task.status == TaskStatus.DONE
+    assert task.revision_count == 0  # retry != revise
+
+
 def test_memory_tiers_and_audit(store):
     store.memory_write("loop", "test_command", "pytest -q", approved=True)
     store.memory_write("project", "sketchy_fact", "maybe wrong")  # unapproved
@@ -177,18 +220,22 @@ def test_memory_tiers_and_audit(store):
 
 # -- executed tests are authoritative (spec §5) ------------------------------
 
-def make_testing_loop(store, tmp_path, outputs, files: dict[str, str],
-                      **overrides):
+
+def make_testing_loop(store, tmp_path, outputs, files: dict[str, str], **overrides):
     """A loop whose workspace really contains tests, with execution enabled."""
     ws_root = tmp_path / "ws"
     task_ws = ws_root / "task-1"
     task_ws.mkdir(parents=True)
     for name, body in files.items():
         (task_ws / name).write_text(body, encoding="utf-8")
-    return make_loop(store, outputs, workspace_root=str(ws_root),
-                     allow_test_exec=True,
-                     test_command=f"{sys.executable} -m pytest -q",
-                     **overrides)
+    return make_loop(
+        store,
+        outputs,
+        workspace_root=str(ws_root),
+        allow_test_exec=True,
+        test_command=f"{sys.executable} -m pytest -q",
+        **overrides,
+    )
 
 
 PASSING = "def test_ok():\n    assert True\n"
@@ -200,18 +247,23 @@ def test_executed_failure_blocks_a_confident_approval(store, tmp_path):
     actually fail."""
     task = add_task(store)
     loop, _ = make_testing_loop(
-        store, tmp_path, ["out", APPROVE, "out2", APPROVE],
-        {"test_bad.py": FAILING}, max_revisions=1)
+        store,
+        tmp_path,
+        ["out", APPROVE, "out2", APPROVE],
+        {"test_bad.py": FAILING},
+        max_revisions=1,
+    )
     loop.run_task(task)
 
     assert task.status == TaskStatus.NEEDS_HUMAN
-    assert task.revision_count == 1        # it revised rather than completing
+    assert task.revision_count == 1  # it revised rather than completing
 
 
 def test_executed_pass_allows_approval(store, tmp_path):
     task = add_task(store)
-    loop, _ = make_testing_loop(store, tmp_path, ["out", APPROVE],
-                                {"test_ok.py": PASSING})
+    loop, _ = make_testing_loop(
+        store, tmp_path, ["out", APPROVE], {"test_ok.py": PASSING}
+    )
     loop.run_task(task)
     assert task.status == TaskStatus.DONE
 
@@ -219,12 +271,15 @@ def test_executed_pass_allows_approval(store, tmp_path):
 def test_validator_test_claim_mismatch_is_recorded(store, tmp_path):
     task = add_task(store)
     loop, _ = make_testing_loop(
-        store, tmp_path, ["out", APPROVE, "out2", APPROVE],
-        {"test_bad.py": FAILING}, max_revisions=1)
+        store,
+        tmp_path,
+        ["out", APPROVE, "out2", APPROVE],
+        {"test_bad.py": FAILING},
+        max_revisions=1,
+    )
     loop.run_task(task)
 
-    mismatches = [e for e in store.events(task.id)
-                  if e["kind"] == "test_disagreement"]
+    mismatches = [e for e in store.events(task.id) if e["kind"] == "test_disagreement"]
     assert mismatches, "validator claiming pass over a real fail must be logged"
     assert mismatches[0]["payload"]["validator_claimed"] is True
     assert mismatches[0]["payload"]["actual"] is False
@@ -232,8 +287,9 @@ def test_validator_test_claim_mismatch_is_recorded(store, tmp_path):
 
 def test_real_test_results_are_stored_and_reach_the_validator(store, tmp_path):
     task = add_task(store)
-    loop, runner = make_testing_loop(store, tmp_path, ["out", APPROVE],
-                                     {"test_ok.py": PASSING})
+    loop, runner = make_testing_loop(
+        store, tmp_path, ["out", APPROVE], {"test_ok.py": PASSING}
+    )
     loop.run_task(task)
 
     runs = store.test_runs(task.id)
@@ -246,17 +302,21 @@ def test_real_test_results_are_stored_and_reach_the_validator(store, tmp_path):
 def test_no_workspace_falls_back_to_the_validator_claim(store, tmp_path):
     """With nothing to execute, the old behavior stands — 'na' is not a fail."""
     task = add_task(store)
-    loop, _ = make_loop(store, ["out", APPROVE],
-                        workspace_root=str(tmp_path / "empty"),
-                        allow_test_exec=True)
+    loop, _ = make_loop(
+        store,
+        ["out", APPROVE],
+        workspace_root=str(tmp_path / "empty"),
+        allow_test_exec=True,
+    )
     loop.run_task(task)
     assert task.status == TaskStatus.DONE
 
 
 def test_redo_wipes_the_workspace(store, tmp_path):
     task = add_task(store)
-    loop, _ = make_testing_loop(store, tmp_path, ["out", SEVERE],
-                                {"test_ok.py": PASSING})
+    loop, _ = make_testing_loop(
+        store, tmp_path, ["out", SEVERE], {"test_ok.py": PASSING}
+    )
     loop.run_task(task)
     stale = tmp_path / "ws" / "task-1" / "test_ok.py"
     assert stale.exists()
@@ -266,6 +326,7 @@ def test_redo_wipes_the_workspace(store, tmp_path):
 
 
 # -- memory and tools reach the agents ---------------------------------------
+
 
 def test_approved_memory_is_injected_into_prompts(store):
     store.memory_write("loop", "test_command", "pytest -q", approved=True)
@@ -278,7 +339,7 @@ def test_approved_memory_is_injected_into_prompts(store):
     worker_prompt = runner.calls[0]["prompt"]
     assert "Known project facts" in worker_prompt
     assert "pytest -q" in worker_prompt
-    assert "do not trust me" not in worker_prompt   # gating holds end-to-end
+    assert "do not trust me" not in worker_prompt  # gating holds end-to-end
 
 
 def test_registry_tools_are_passed_to_the_runner(store):
@@ -286,9 +347,9 @@ def test_registry_tools_are_passed_to_the_runner(store):
     loop, runner = make_loop(store, ["out", APPROVE])
     loop.run_task(task)
 
-    assert "file_io" in runner.calls[0]["tools"]     # worker
+    assert "file_io" in runner.calls[0]["tools"]  # worker
     assert "git" in runner.calls[0]["tools"]
-    assert "git" not in runner.calls[1]["tools"]     # validator: read-only
+    assert "git" not in runner.calls[1]["tools"]  # validator: read-only
 
 
 def test_worker_is_told_where_its_workspace_is(store):

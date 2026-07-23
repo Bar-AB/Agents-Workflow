@@ -49,7 +49,7 @@ DEFAULT_AGENTS: dict[str, AgentSpec] = {
     ),
     "validator": AgentSpec(
         role="validator",
-        model="claude-sonnet-5",   # separate context; can be a cheaper tier
+        model="claude-sonnet-5",  # separate context; can be a cheaper tier
         system_prompt=VALIDATOR_SYSTEM,
         tools=["file_io", "search", "task_state"],
         context_budget_tokens=60_000,
@@ -78,6 +78,6 @@ class Registry:
 
     def save(self, path: str | Path) -> None:
         Path(path).write_text(
-            json.dumps({n: asdict(s) for n, s in self.agents.items()},
-                       indent=2),
-            encoding="utf-8")
+            json.dumps({n: asdict(s) for n, s in self.agents.items()}, indent=2),
+            encoding="utf-8",
+        )

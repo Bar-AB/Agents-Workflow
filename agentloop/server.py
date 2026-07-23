@@ -38,8 +38,9 @@ class DashboardServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, addr, store: Store, loop: Loop, registry: Registry,
-                 config: LoopConfig):
+    def __init__(
+        self, addr, store: Store, loop: Loop, registry: Registry, config: LoopConfig
+    ):
         self.store = store
         self.loop = loop
         self.registry = registry
@@ -55,6 +56,18 @@ class _Handler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):  # keep CLI output clean
         pass
+
+    def handle(self) -> None:
+        """Swallow client disconnects for the whole persistent connection.
+
+        A reset can surface not only mid-response but in the base class's
+        keep-alive loop, where it reads the *next* request line off a socket the
+        client already closed (WinError 10054). That path is outside do_GET/
+        do_POST, so it must be caught here or it prints a spurious traceback."""
+        try:
+            super().handle()
+        except ConnectionError:
+            pass
 
     @property
     def store(self) -> Store:
@@ -72,14 +85,30 @@ class _Handler(BaseHTTPRequestHandler):
     def _error(self, status: int, message: str) -> None:
         self._send_json({"error": message}, status=status)
 
+    def _safe_error(self, status: int, message: str) -> None:
+        """Send an error response, but never raise while doing so — the socket
+        may already be dead (a generic handler must not blow up trying to
+        report a failure on a closed connection)."""
+        try:
+            self._error(status, message)
+        except (ConnectionError, OSError):
+            pass
+
     def _read_json(self) -> dict:
+        """Parse the request body as a JSON object. Malformed JSON or a
+        non-object body raises ValueError -> the caller returns 400, rather
+        than silently defaulting to {} and masking a client bug."""
         length = int(self.headers.get("Content-Length") or 0)
         if not length:
             return {}
+        raw = self.rfile.read(length)
         try:
-            return json.loads(self.rfile.read(length) or b"{}")
-        except json.JSONDecodeError:
-            return {}
+            data = json.loads(raw or b"{}")
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"malformed JSON body: {exc}") from exc
+        if not isinstance(data, dict):
+            raise ValueError("request body must be a JSON object")
+        return data
 
     # -- routing -------------------------------------------------------------
 
@@ -88,60 +117,84 @@ class _Handler(BaseHTTPRequestHandler):
         path, query = url.path, parse_qs(url.query)
         try:
             if path == "/api/tasks":
-                self._send_json({"tasks": [self._task_json(t)
-                                           for t in self.store.list_tasks()]})
+                self._send_json(
+                    {"tasks": [self._task_json(t) for t in self.store.list_tasks()]}
+                )
             elif path.startswith("/api/tasks/"):
                 self._task_detail(path)
             elif path == "/api/events":
                 since = int((query.get("since") or ["0"])[0])
                 self._send_json({"events": self.store.events_since(since)})
             elif path == "/api/agents":
-                self._send_json({"agents": [
-                    {"role": s.role, "model": s.model, "tools": s.tools,
-                     "context_budget_tokens": s.context_budget_tokens,
-                     "version": s.version}
-                    for s in self.server.registry.agents.values()]})
+                self._send_json(
+                    {
+                        "agents": [
+                            {
+                                "role": s.role,
+                                "model": s.model,
+                                "tools": s.tools,
+                                "context_budget_tokens": s.context_budget_tokens,
+                                "version": s.version,
+                            }
+                            for s in self.server.registry.agents.values()
+                        ]
+                    }
+                )
             elif path == "/api/memory":
                 self._send_json({"memory": self.store.memory_list()})
             elif path == "/api/metrics":
                 self._send_json(self.store.run_metrics())
             elif path == "/api/config":
                 cfg = self.server.config
-                self._send_json({
-                    "approve_threshold": cfg.approve_threshold,
-                    "severe_threshold": cfg.severe_threshold,
-                    "max_revisions": cfg.max_revisions,
-                    "max_tokens_per_task": cfg.max_tokens_per_task,
-                    "max_cost_usd_per_task": cfg.max_cost_usd_per_task,
-                    "human_review_risk_level": cfg.human_review_risk_level,
-                    "test_command": cfg.test_command,
-                })
+                self._send_json(
+                    {
+                        "approve_threshold": cfg.approve_threshold,
+                        "severe_threshold": cfg.severe_threshold,
+                        "max_revisions": cfg.max_revisions,
+                        "max_tokens_per_task": cfg.max_tokens_per_task,
+                        "max_cost_usd_per_task": cfg.max_cost_usd_per_task,
+                        "human_review_risk_level": cfg.human_review_risk_level,
+                        "test_command": cfg.test_command,
+                    }
+                )
             elif path == "/api/stream":
                 self._stream(query)
             else:
                 self._serve_static(path)
-        except BrokenPipeError:            # client navigated away mid-response
+        except ConnectionError:  # client navigated away mid-response
+            # BrokenPipeError / ConnectionResetError (Windows WinError 10054) /
+            # ConnectionAbortedError all subclass ConnectionError. The socket is
+            # gone; there is nothing to report and nowhere to report it.
             pass
-        except Exception as exc:           # never take the server down
-            self._error(500, f"{type(exc).__name__}: {exc}")
+        except Exception as exc:  # never take the server down
+            self._safe_error(500, f"{type(exc).__name__}: {exc}")
 
     def do_POST(self) -> None:
         url = urlparse(self.path)
         parts = [p for p in url.path.split("/") if p]
-        body = self._read_json()
         try:
+            body = self._read_json()  # inside try: malformed body -> 400 below
             # /api/tasks
             if parts == ["api", "tasks"]:
                 self._create_task(body)
             # /api/tasks/{id}/{approve|reject|redo}
-            elif (len(parts) == 4 and parts[0] == "api" and parts[1] == "tasks"
-                    and parts[3] in ("approve", "reject", "redo")):
+            elif (
+                len(parts) == 4
+                and parts[0] == "api"
+                and parts[1] == "tasks"
+                and parts[3] in ("approve", "reject", "redo")
+            ):
                 task = getattr(self.server.loop, f"human_{parts[3]}")(
-                    int(parts[2]), body.get("note", ""))
+                    int(parts[2]), body.get("note", "")
+                )
                 self._send_json({"task": self._task_json(task)})
             # /api/tasks/{id}/{pause|resume|abort} — mid-run control
-            elif (len(parts) == 4 and parts[0] == "api" and parts[1] == "tasks"
-                    and parts[3] in ("pause", "resume", "abort")):
+            elif (
+                len(parts) == 4
+                and parts[0] == "api"
+                and parts[1] == "tasks"
+                and parts[3] in ("pause", "resume", "abort")
+            ):
                 loop = self.server.loop
                 if parts[3] == "abort":
                     task = loop.abort(int(parts[2]), body.get("note", ""))
@@ -149,8 +202,12 @@ class _Handler(BaseHTTPRequestHandler):
                     task = getattr(loop, parts[3])(int(parts[2]))
                 self._send_json({"task": self._task_json(task)})
             # /api/memory/{id}/{approve|reject|pin|unpin}
-            elif (len(parts) == 4 and parts[0] == "api" and parts[1] == "memory"
-                    and parts[3] in ("approve", "reject", "pin", "unpin")):
+            elif (
+                len(parts) == 4
+                and parts[0] == "api"
+                and parts[1] == "memory"
+                and parts[3] in ("approve", "reject", "pin", "unpin")
+            ):
                 mem_id = int(parts[2])
                 if parts[3] == "approve":
                     self.store.memory_set_approved(mem_id, True)
@@ -161,12 +218,14 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send_json({"memory": self.store.memory_list()})
             else:
                 self._error(404, f"No such endpoint: {url.path}")
+        except ConnectionError:  # client gone; nothing to send back
+            pass
         except KeyError as exc:
-            self._error(404, str(exc))
+            self._safe_error(404, str(exc))
         except (ValueError, TypeError) as exc:
-            self._error(400, str(exc))
+            self._safe_error(400, str(exc))
         except Exception as exc:
-            self._error(500, f"{type(exc).__name__}: {exc}")
+            self._safe_error(500, f"{type(exc).__name__}: {exc}")
 
     # -- handlers ------------------------------------------------------------
 
@@ -181,8 +240,13 @@ class _Handler(BaseHTTPRequestHandler):
         if risk not in (0, 1, 2):
             self._error(400, "risk_level must be 0, 1 or 2")
             return
-        task = Task(id=None, title=title, goal=goal,
-                    acceptance_criteria=criteria, risk_level=risk)
+        task = Task(
+            id=None,
+            title=title,
+            goal=goal,
+            acceptance_criteria=criteria,
+            risk_level=risk,
+        )
         self.store.add_task(task)
         self._send_json({"task": self._task_json(task)}, status=201)
 
@@ -196,17 +260,20 @@ class _Handler(BaseHTTPRequestHandler):
         if task is None:
             self._error(404, f"No task {task_id}")
             return
-        self._send_json({
-            "task": self._task_json(task),
-            "metrics": self.store.task_metrics(task_id),
-            "test_runs": self.store.test_runs(task_id),
-            "events": self.store.events(task_id),
-        })
+        self._send_json(
+            {
+                "task": self._task_json(task),
+                "metrics": self.store.task_metrics(task_id),
+                "test_runs": self.store.test_runs(task_id),
+                "events": self.store.events(task_id),
+            }
+        )
 
     def _stream(self, query: dict) -> None:
         """SSE: replay everything after the cursor, then tail the audit log."""
-        cursor = int(self.headers.get("Last-Event-ID")
-                     or (query.get("since") or ["0"])[0])
+        cursor = int(
+            self.headers.get("Last-Event-ID") or (query.get("since") or ["0"])[0]
+        )
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -216,20 +283,26 @@ class _Handler(BaseHTTPRequestHandler):
 
         interval = self.server.config.stream_poll_seconds
         last_beat = time.time()
-        while not self.server._shutdown_flag.is_set():
-            rows = self.store.events_since(cursor)
-            for row in rows:
-                cursor = row["id"]
-                self._emit(row["id"], "event", row)
-            if rows:
-                # State changed; push the rollup so tiles update in step.
-                self._emit(cursor, "metrics", self.store.run_metrics())
-            elif time.time() - last_beat > 15:
-                # Comment frame keeps proxies and idle sockets from timing out.
-                self.wfile.write(b": keep-alive\n\n")
-                self.wfile.flush()
-                last_beat = time.time()
-            time.sleep(interval)
+        try:
+            while not self.server._shutdown_flag.is_set():
+                rows = self.store.events_since(cursor)
+                for row in rows:
+                    cursor = row["id"]
+                    self._emit(row["id"], "event", row)
+                if rows:
+                    # State changed; push the rollup so tiles update in step.
+                    self._emit(cursor, "metrics", self.store.run_metrics())
+                elif time.time() - last_beat > 15:
+                    # Comment frame keeps proxies/idle sockets from timing out.
+                    self.wfile.write(b": keep-alive\n\n")
+                    self.wfile.flush()
+                    last_beat = time.time()
+                time.sleep(interval)
+        except (ConnectionError, OSError):
+            # The browser disconnected (reset/broken pipe). End the stream
+            # quietly — do NOT fall through to the generic 500 handler, which
+            # would try to write to the same dead socket.
+            return
 
     def _emit(self, event_id: int, name: str, data) -> None:
         payload = json.dumps(data, default=str)
@@ -241,16 +314,19 @@ class _Handler(BaseHTTPRequestHandler):
         """Serve the built frontend, falling back to index.html for client
         routes. Paths are resolved and confined to the dist directory."""
         if not _WEB_DIST.is_dir():
-            self._send_json({
-                "error": "Frontend not built.",
-                "hint": "cd web && npm install && npm run build",
-            }, status=503)
+            self._send_json(
+                {
+                    "error": "Frontend not built.",
+                    "hint": "cd web && npm install && npm run build",
+                },
+                status=503,
+            )
             return
 
         rel = path.lstrip("/") or "index.html"
         target = (_WEB_DIST / rel).resolve()
         if not str(target).startswith(str(_WEB_DIST.resolve())):
-            self._error(403, "Forbidden")          # path traversal attempt
+            self._error(403, "Forbidden")  # path traversal attempt
             return
         if not target.is_file():
             target = _WEB_DIST / "index.html"
@@ -269,9 +345,12 @@ class _Handler(BaseHTTPRequestHandler):
     @staticmethod
     def _task_json(task: Task) -> dict:
         return {
-            "id": task.id, "title": task.title, "goal": task.goal,
+            "id": task.id,
+            "title": task.title,
+            "goal": task.goal,
             "acceptance_criteria": task.acceptance_criteria,
-            "status": task.status.value, "risk_level": task.risk_level,
+            "status": task.status.value,
+            "risk_level": task.risk_level,
             "revision_count": task.revision_count,
             "worker_role": task.worker_role,
             "validator_role": task.validator_role,
@@ -281,24 +360,36 @@ class _Handler(BaseHTTPRequestHandler):
         }
 
 
-def serve(store: Store, loop: Loop, registry: Registry, config: LoopConfig,
-          host: str | None = None, port: int | None = None) -> DashboardServer:
+def serve(
+    store: Store,
+    loop: Loop,
+    registry: Registry,
+    config: LoopConfig,
+    host: str | None = None,
+    port: int | None = None,
+) -> DashboardServer:
     """Start the dashboard server. Returns it so callers (and tests) can
     shut it down."""
-    addr = (host or config.server_host, port if port is not None
-            else config.server_port)
+    addr = (
+        host or config.server_host,
+        port if port is not None else config.server_port,
+    )
     return DashboardServer(addr, store, loop, registry, config)
 
 
-def serve_forever(store: Store, loop: Loop, registry: Registry,
-                  config: LoopConfig, host: str | None = None,
-                  port: int | None = None) -> None:
+def serve_forever(
+    store: Store,
+    loop: Loop,
+    registry: Registry,
+    config: LoopConfig,
+    host: str | None = None,
+    port: int | None = None,
+) -> None:
     server = serve(store, loop, registry, config, host, port)
     h, p = server.server_address[0], server.server_address[1]
     print(f"agentloop dashboard on http://{h}:{p}")
     if not _WEB_DIST.is_dir():
-        print("  (frontend not built — run: cd web && npm install "
-              "&& npm run build)")
+        print("  (frontend not built — run: cd web && npm install && npm run build)")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

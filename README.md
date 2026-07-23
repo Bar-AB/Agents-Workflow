@@ -30,7 +30,7 @@ agentloop/
   cli.py       add / run / status / approve / reject / redo / pause / resume /
                abort / events / serve / memory / eval
 web/           Vite + React + TypeScript dashboard
-tests/         91 tests on MockRunner + real subprocesses (no API keys needed)
+tests/         115 tests on MockRunner + real subprocesses (no API keys needed)
 ```
 
 ## Quick start
@@ -78,6 +78,7 @@ Validator returns `VERDICT: <kind> CONFIDENCE: <0-1> TESTS: <pass|fail|na>`:
 | worker replies `ESCALATE:` | needs_human (genuine ambiguity) |
 | budget cap exceeded | needs_human (never burn unbounded) |
 | unparseable verdict | needs_human (never guess-approve) |
+| transient infra failure (runner/executor raises) | retried with backoff, then needs_human (`infra_error`) — not a revise |
 
 **"Tests not failing" means the executed result.** Tests really run in the
 task's workspace between worker and validator; the validator sees the real
@@ -137,10 +138,25 @@ calibration measurement. Results persist to the `eval_runs` table.
 
 ## Sandboxing
 
-The test command is allowlisted in config, never taken from model output. It
-is split into argv and run without a shell, with cwd pinned to the task's own
-workspace under `.agentloop/ws/task-{id}/`, plus a timeout and an output cap.
-A redo wipes the workspace, so "fresh start" means it.
+This runs **arbitrary, AI-generated code** — whatever the worker wrote, invoked
+by the test command. So command hijack is the *lesser* worry; the code the
+command runs is the real exposure. Defenses are layered:
+
+- **Command**: allowlisted in config, never taken from model output; split into
+  argv and run without a shell (`pytest -q; rm -rf /` is literal argv, not
+  operators); cwd pinned to `.agentloop/ws/task-{id}/`; timeout + output cap.
+  A redo wipes the workspace, so "fresh start" means it.
+- **Environment**: the child gets a **scrubbed, allowlisted env** — the parent
+  environment (which holds `ANTHROPIC_API_KEY` and every other secret) is never
+  passed wholesale, so generated code can't read credentials from it. Extra
+  vars a project genuinely needs go in `sandbox_env_allowlist`.
+- **Isolation tier** (`sandbox_isolation`): `env` (default) is env-scrub only.
+  `strict` asks for a container / no-network / read-only-fs tier when a backend
+  is available and **degrades to env-scrub with a warning** when it is not.
+  **Residual risk of the env-scrub tier:** generated code still has this
+  process's filesystem write access (absolute / `..` paths escape the
+  workspace) and network access — only the environment is contained. Run under
+  `strict` with a real backend, or an external sandbox, for untrusted code.
 
 ## Provider seam
 

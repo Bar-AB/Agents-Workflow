@@ -51,8 +51,13 @@ def extract_usage(usage: dict) -> tuple[int, int, int, int]:
 
 
 class ModelRunner(Protocol):
-    def run(self, system_prompt: str, prompt: str, model: str,
-            tools: list[str] | None = None) -> RunResult:
+    def run(
+        self,
+        system_prompt: str,
+        prompt: str,
+        model: str,
+        tools: list[str] | None = None,
+    ) -> RunResult:
         """Execute one agent invocation and return output + token usage.
 
         `tools` is the agent's allowlist from the registry (spec §3): the
@@ -63,17 +68,35 @@ class ModelRunner(Protocol):
 
 class MockRunner:
     """Scripted runner for tests/dry runs. Feed it a list of outputs; each
-    call pops the next one. Records prompts for assertions."""
+    call pops the next one. Records prompts for assertions.
 
-    def __init__(self, outputs: list[str] | None = None):
+    A scripted item that is an exception instance is *raised* instead of
+    returned — this simulates a transient infra failure (API 5xx, network blip)
+    so the loop's retry/escalation path can be tested without a live provider.
+    """
+
+    def __init__(self, outputs: list | None = None):
         self.outputs = list(outputs or [])
         self.calls: list[dict] = []
 
-    def run(self, system_prompt: str, prompt: str, model: str,
-            tools: list[str] | None = None) -> RunResult:
-        self.calls.append({"system": system_prompt, "prompt": prompt,
-                           "model": model, "tools": list(tools or [])})
+    def run(
+        self,
+        system_prompt: str,
+        prompt: str,
+        model: str,
+        tools: list[str] | None = None,
+    ) -> RunResult:
+        self.calls.append(
+            {
+                "system": system_prompt,
+                "prompt": prompt,
+                "model": model,
+                "tools": list(tools or []),
+            }
+        )
         output = self.outputs.pop(0) if self.outputs else "(mock output)"
+        if isinstance(output, BaseException):
+            raise output
         return RunResult(
             output=output,
             tokens_in=len(system_prompt.split()) + len(prompt.split()),
@@ -92,7 +115,7 @@ LOGICAL_TOOL_MAP: dict[str, list[str]] = {
     "search": ["Glob", "Grep"],
     "git": ["Bash"],
     "shell": ["Bash"],
-    "task_state": [],      # served in-process via the store, not an SDK tool
+    "task_state": [],  # served in-process via the store, not an SDK tool
     "web": ["WebFetch", "WebSearch"],
 }
 
@@ -111,15 +134,20 @@ class ClaudeSDKRunner:
     """Claude Agent SDK backend. Requires `pip install agentloop[claude]` and
     Anthropic credentials (ANTHROPIC_API_KEY or Claude Code auth)."""
 
-    def run(self, system_prompt: str, prompt: str, model: str,
-            tools: list[str] | None = None) -> RunResult:
+    def run(
+        self,
+        system_prompt: str,
+        prompt: str,
+        model: str,
+        tools: list[str] | None = None,
+    ) -> RunResult:
         if anyio is None:
             raise RuntimeError(
-                "ClaudeSDKRunner requires `pip install agentloop[claude]`")
+                "ClaudeSDKRunner requires `pip install agentloop[claude]`"
+            )
         return anyio.run(self._run_async, system_prompt, prompt, model, tools)
 
-    def build_options(self, system_prompt: str, model: str,
-                      tools: list[str] | None):
+    def build_options(self, system_prompt: str, model: str, tools: list[str] | None):
         """Construct SDK options. Split out so the tool allowlist is testable
         without credentials or a live call."""
         allowed = resolve_tools(tools)
@@ -130,8 +158,13 @@ class ClaudeSDKRunner:
             allowed_tools=allowed,
         )
 
-    async def _run_async(self, system_prompt: str, prompt: str, model: str,
-                         tools: list[str] | None = None) -> RunResult:
+    async def _run_async(
+        self,
+        system_prompt: str,
+        prompt: str,
+        model: str,
+        tools: list[str] | None = None,
+    ) -> RunResult:
         options = self.build_options(system_prompt, model, tools)
         chunks: list[str] = []
         tokens_in = tokens_out = cache_creation = cache_read = 0
@@ -145,12 +178,17 @@ class ClaudeSDKRunner:
             if _is_result_message(message):
                 usage = getattr(message, "usage", None)
                 if isinstance(usage, dict):
-                    (tokens_in, tokens_out,
-                     cache_creation, cache_read) = extract_usage(usage)
-        return RunResult(output="\n".join(chunks), tokens_in=tokens_in,
-                         tokens_out=tokens_out,
-                         cache_creation_tokens=cache_creation,
-                         cache_read_tokens=cache_read, model=model)
+                    (tokens_in, tokens_out, cache_creation, cache_read) = extract_usage(
+                        usage
+                    )
+        return RunResult(
+            output="\n".join(chunks),
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            cache_creation_tokens=cache_creation,
+            cache_read_tokens=cache_read,
+            model=model,
+        )
 
 
 def get_runner(name: str) -> ModelRunner:
