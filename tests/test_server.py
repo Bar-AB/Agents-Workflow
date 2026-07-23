@@ -29,8 +29,9 @@ def live(tmp_path):
         stream_poll_seconds=0.05,
     )
     loop = Loop(store, MockRunner(), Registry.load(), config)
-    server = serve(store, loop, Registry.load(), config, host="127.0.0.1",
-                   port=0)   # port 0 -> OS picks a free one
+    server = serve(
+        store, loop, Registry.load(), config, host="127.0.0.1", port=0
+    )  # port 0 -> OS picks a free one
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     base = f"http://127.0.0.1:{server.server_address[1]}"
@@ -50,22 +51,29 @@ def get(base: str, path: str):
 
 def post(base: str, path: str, body: dict | None = None):
     req = urllib.request.Request(
-        base + path, method="POST",
+        base + path,
+        method="POST",
         data=json.dumps(body or {}).encode(),
-        headers={"Content-Type": "application/json"})
+        headers={"Content-Type": "application/json"},
+    )
     with urllib.request.urlopen(req, timeout=5) as r:
         return r.status, json.loads(r.read())
 
 
 def seed(store: Store, title: str = "Add slugify util", risk: int = 1) -> Task:
-    task = Task(id=None, title=title, goal="Write slugify(text).",
-                acceptance_criteria="Lowercase, hyphenated, tested.",
-                risk_level=risk)
+    task = Task(
+        id=None,
+        title=title,
+        goal="Write slugify(text).",
+        acceptance_criteria="Lowercase, hyphenated, tested.",
+        risk_level=risk,
+    )
     store.add_task(task)
     return task
 
 
 # -- reads -------------------------------------------------------------------
+
 
 def test_tasks_endpoint_serves_store_contents(live):
     base, store, _, _ = live
@@ -107,7 +115,7 @@ def test_metrics_rollup_reflects_a_completed_run(live):
     loop.run_task(task)
 
     _, body = get(base, "/api/metrics")
-    assert body["attempts"] == 2                  # worker + validator
+    assert body["attempts"] == 2  # worker + validator
     assert body["tokens"] > 0
     assert body["tasks_by_status"]["done"] == 1
     assert any(m["model"] == "mock" for m in body["by_model"])
@@ -122,11 +130,19 @@ def test_config_endpoint_exposes_thresholds(live):
 
 # -- writes ------------------------------------------------------------------
 
+
 def test_create_task_via_api(live):
     base, store, _, _ = live
-    status, body = post(base, "/api/tasks", {
-        "title": "From dashboard", "goal": "do a thing",
-        "acceptance_criteria": "it works", "risk_level": 2})
+    status, body = post(
+        base,
+        "/api/tasks",
+        {
+            "title": "From dashboard",
+            "goal": "do a thing",
+            "acceptance_criteria": "it works",
+            "risk_level": 2,
+        },
+    )
     assert status == 201
     assert body["task"]["risk_level"] == 2
     assert store.get_task(body["task"]["id"]).title == "From dashboard"
@@ -209,13 +225,43 @@ def test_unknown_post_endpoint_is_404(live):
     assert exc.value.code == 404
 
 
+def test_malformed_post_json_returns_400(live):
+    """0d: a malformed JSON body is a client bug -> 400, not a silent {} that
+    masks it (or a 500)."""
+    base, _, _, _ = live
+    req = urllib.request.Request(
+        base + "/api/tasks",
+        method="POST",
+        data=b"{ this is not valid json ",
+        headers={"Content-Type": "application/json"},
+    )
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(req, timeout=5)
+    assert exc.value.code == 400
+
+
+def test_non_object_json_body_returns_400(live):
+    base, _, _, _ = live
+    req = urllib.request.Request(
+        base + "/api/tasks",
+        method="POST",
+        data=b"[1, 2, 3]",
+        headers={"Content-Type": "application/json"},
+    )
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(req, timeout=5)
+    assert exc.value.code == 400
+
+
 # -- SSE ---------------------------------------------------------------------
+
 
 def read_frames(base: str, since: int, count: int, timeout: float = 6.0):
     """Read `count` SSE frames, returning parsed (id, event, data) triples."""
     frames, buf = [], ""
     with urllib.request.urlopen(
-            f"{base}/api/stream?since={since}", timeout=timeout) as resp:
+        f"{base}/api/stream?since={since}", timeout=timeout
+    ) as resp:
         assert resp.headers["Content-Type"] == "text/event-stream"
         while len(frames) < count:
             chunk = resp.read(1)
@@ -224,16 +270,20 @@ def read_frames(base: str, since: int, count: int, timeout: float = 6.0):
             buf += chunk.decode("utf-8", "replace")
             while "\n\n" in buf:
                 raw, buf = buf.split("\n\n", 1)
-                if raw.startswith(":"):        # keep-alive comment
+                if raw.startswith(":"):  # keep-alive comment
                     continue
                 fields = {}
                 for line in raw.splitlines():
                     key, _, value = line.partition(": ")
                     fields[key] = value
                 if "data" in fields:
-                    frames.append((int(fields.get("id", 0)),
-                                   fields.get("event", ""),
-                                   json.loads(fields["data"])))
+                    frames.append(
+                        (
+                            int(fields.get("id", 0)),
+                            fields.get("event", ""),
+                            json.loads(fields["data"]),
+                        )
+                    )
     return frames
 
 
@@ -245,8 +295,7 @@ def test_stream_replays_history_from_the_cursor(live):
     frames = read_frames(base, since=0, count=2)
     kinds = [f[1] for f in frames]
     assert "event" in kinds
-    payload_titles = [f[2]["payload"].get("title") for f in frames
-                      if f[1] == "event"]
+    payload_titles = [f[2]["payload"].get("title") for f in frames if f[1] == "event"]
     assert "first" in payload_titles
 
 
@@ -283,8 +332,8 @@ def test_live_run_streams_to_a_connected_client(live):
 
     result: list = []
     reader = threading.Thread(
-        target=lambda: result.extend(read_frames(base, cursor, 4)),
-        daemon=True)
+        target=lambda: result.extend(read_frames(base, cursor, 4)), daemon=True
+    )
     reader.start()
     loop.run_task(task)
     reader.join(timeout=8)
@@ -296,9 +345,11 @@ def test_live_run_streams_to_a_connected_client(live):
 
 # -- static ------------------------------------------------------------------
 
+
 def test_unbuilt_frontend_gives_a_helpful_hint(live, monkeypatch):
     base, _, _, _ = live
     import agentloop.server as srv
+
     monkeypatch.setattr(srv, "_WEB_DIST", srv._WEB_DIST / "__missing__")
     try:
         get(base, "/")

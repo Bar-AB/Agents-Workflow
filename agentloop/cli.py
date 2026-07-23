@@ -1,15 +1,15 @@
 """CLI — plain structured output, plus the Phase-2 dashboard server.
 
-  agentloop add "Title" --goal "..." --criteria "..." [--risk 0|1|2]
-  agentloop run [--runner claude|mock] [--max-tasks N]
-  agentloop status [TASK_ID]
-  agentloop approve TASK_ID [--note ...]
-  agentloop reject TASK_ID [--note ...]
-  agentloop redo TASK_ID [--note ...]
-  agentloop events TASK_ID
-  agentloop serve [--host H] [--port P]   # live dashboard (spec §8)
-  agentloop memory list|approve|reject|add
-  agentloop init-registry          # write default agents.json for editing
+agentloop add "Title" --goal "..." --criteria "..." [--risk 0|1|2]
+agentloop run [--runner claude|mock] [--max-tasks N]
+agentloop status [TASK_ID]
+agentloop approve TASK_ID [--note ...]
+agentloop reject TASK_ID [--note ...]
+agentloop redo TASK_ID [--note ...]
+agentloop events TASK_ID
+agentloop serve [--host H] [--port P]   # live dashboard (spec §8)
+agentloop memory list|approve|reject|add
+agentloop init-registry          # write default agents.json for editing
 """
 
 from __future__ import annotations
@@ -35,8 +35,10 @@ def _memory_cmd(store: Store, args) -> int:
             print("(no memory yet)")
         for r in rows:
             flag = "approved" if r["approved"] else "PENDING "
-            print(f"[{r['id']:3d}] {flag} {r['tier']:8s} hits={r['hit_count']:<3d}"
-                  f" {r['key']}: {r['value'][:60]}")
+            print(
+                f"[{r['id']:3d}] {flag} {r['tier']:8s} hits={r['hit_count']:<3d}"
+                f" {r['key']}: {r['value'][:60]}"
+            )
     elif args.mem_cmd == "approve":
         store.memory_set_approved(args.memory_id, True)
         print(f"Memory {args.memory_id} approved — agents may now read it.")
@@ -44,8 +46,9 @@ def _memory_cmd(store: Store, args) -> int:
         store.memory_delete(args.memory_id)
         print(f"Memory {args.memory_id} deleted.")
     elif args.mem_cmd == "add":
-        store.memory_write(args.tier, args.key, args.value,
-                           approved=args.approved, pinned=args.pinned)
+        store.memory_write(
+            args.tier, args.key, args.value, approved=args.approved, pinned=args.pinned
+        )
         state = "approved" if args.approved else "pending approval"
         pin = ", pinned" if args.pinned else ""
         print(f"Wrote {args.tier}/{args.key} ({state}{pin}).")
@@ -58,17 +61,24 @@ def _memory_cmd(store: Store, args) -> int:
 def _eval_cmd(store: Store, args) -> int:
     """Run the validator calibration harness (spec: eval)."""
     from . import eval as evalmod
+
     registry = Registry.load(
-        LoopConfig.load(getattr(args, "config", None) or "loopconfig.json")
-        .registry_path)
+        LoopConfig.load(
+            getattr(args, "config", None) or "loopconfig.json"
+        ).registry_path
+    )
     if args.runner == "claude":
         # Opt-in and skipped without credentials — never a hard failure in CI.
         from .runner import anyio as _sdk
+
         if _sdk is None or not os.environ.get("ANTHROPIC_API_KEY"):
-            print("eval --runner claude skipped: set ANTHROPIC_API_KEY and "
-                  "install agentloop[claude] to run a real calibration.")
+            print(
+                "eval --runner claude skipped: set ANTHROPIC_API_KEY and "
+                "install agentloop[claude] to run a real calibration."
+            )
             return 0
         from .runner import ClaudeSDKRunner
+
         runner = ClaudeSDKRunner()
     else:
         runner = evalmod.mock_runner_for(evalmod.FIXTURES)
@@ -133,9 +143,11 @@ def main(argv: list[str] | None = None) -> int:
     ma.add_argument("value")
     ma.add_argument("--tier", default="project", choices=["project", "loop"])
     ma.add_argument("--approved", action="store_true")
-    ma.add_argument("--pinned", action="store_true",
-                    help="Pin: always injected, ahead of the cap (still needs "
-                         "approval to be read)")
+    ma.add_argument(
+        "--pinned",
+        action="store_true",
+        help="Pin: always injected, ahead of the cap (still needs approval to be read)",
+    )
 
     ev = sub.add_parser("eval", help="Validator calibration harness")
     ev.add_argument("--runner", default="mock", choices=["claude", "mock"])
@@ -151,71 +163,97 @@ def main(argv: list[str] | None = None) -> int:
 
     store, loop = _build(args)
     try:
-        if args.cmd == "add":
-            task = Task(id=None, title=args.title, goal=args.goal,
-                        acceptance_criteria=args.criteria,
-                        risk_level=args.risk)
-            tid = store.add_task(task)
-            print(f"Task {tid} defined: {args.title}")
-
-        elif args.cmd == "run":
-            n = loop.run(max_tasks=args.max_tasks)
-            print(f"Processed {n} task(s).")
-            for t in store.list_tasks():
-                print(f"  [{t.id}] {t.status.value:12s} {t.title}"
-                      + (f"  <- {t.escalation_reason}"
-                         if t.escalation_reason else ""))
-
-        elif args.cmd == "status":
-            if args.task_id:
-                t = store.get_task(args.task_id)
-                if not t:
-                    print(f"No task {args.task_id}", file=sys.stderr)
-                    return 1
-                print(f"[{t.id}] {t.title}\n  status: {t.status.value}"
-                      f"\n  revisions: {t.revision_count}"
-                      f"\n  risk: {t.risk_level}")
-                if t.escalation_reason:
-                    print(f"  escalation: {t.escalation_reason}")
-                print("  metrics:",
-                      json.dumps(store.task_metrics(t.id), indent=4))
-                if t.output:
-                    print(f"\n--- output ---\n{t.output}")
-            else:
-                for t in store.list_tasks():
-                    print(f"[{t.id}] {t.status.value:12s} rev={t.revision_count}"
-                          f" risk={t.risk_level}  {t.title}")
-
-        elif args.cmd in ("approve", "reject", "redo"):
-            t = getattr(loop, f"human_{args.cmd}")(args.task_id, args.note)
-            print(f"Task {t.id} -> {t.status.value}")
-
-        elif args.cmd in ("pause", "resume", "abort"):
-            if args.cmd == "resume":
-                t = loop.resume(args.task_id)
-            elif args.cmd == "pause":
-                t = loop.pause(args.task_id)
-            else:
-                t = loop.abort(args.task_id, args.note)
-            print(f"Task {t.id} -> {t.status.value} (control={t.control})")
-
-        elif args.cmd == "events":
-            for ev in store.events(args.task_id):
-                print(f"{ev['ts']:.0f} {ev['kind']:20s} "
-                      f"{json.dumps(ev['payload'])[:120]}")
-
-        elif args.cmd == "serve":
-            config = LoopConfig.load(args.config or "loopconfig.json")
-            serve_forever(store, loop, Registry.load(config.registry_path),
-                          config, args.host, args.port)
-
-        elif args.cmd == "eval":
-            return _eval_cmd(store, args)
-
-        elif args.cmd == "memory":
-            return _memory_cmd(store, args)
+        return _dispatch(args, store, loop)
+    except KeyError as exc:
+        # Bad id (no such task/memory row) and similar expected user-input
+        # errors surface as a clean message, never a raw traceback. KeyError's
+        # str() wraps the message in quotes; unwrap it.
+        msg = exc.args[0] if exc.args else str(exc)
+        print(f"error: {msg}", file=sys.stderr)
+        return 1
     finally:
         store.close()
+
+
+def _dispatch(args, store: Store, loop: Loop) -> int:
+    """Run one subcommand. Raises KeyError for a bad id; main() renders that as
+    a clean error. store is closed by main()'s finally."""
+    if args.cmd == "add":
+        task = Task(
+            id=None,
+            title=args.title,
+            goal=args.goal,
+            acceptance_criteria=args.criteria,
+            risk_level=args.risk,
+        )
+        tid = store.add_task(task)
+        print(f"Task {tid} defined: {args.title}")
+
+    elif args.cmd == "run":
+        n = loop.run(max_tasks=args.max_tasks)
+        print(f"Processed {n} task(s).")
+        for t in store.list_tasks():
+            print(
+                f"  [{t.id}] {t.status.value:12s} {t.title}"
+                + (f"  <- {t.escalation_reason}" if t.escalation_reason else "")
+            )
+
+    elif args.cmd == "status":
+        if args.task_id:
+            t = store.get_task(args.task_id)
+            if not t:
+                print(f"No task {args.task_id}", file=sys.stderr)
+                return 1
+            print(
+                f"[{t.id}] {t.title}\n  status: {t.status.value}"
+                f"\n  revisions: {t.revision_count}"
+                f"\n  risk: {t.risk_level}"
+            )
+            if t.escalation_reason:
+                print(f"  escalation: {t.escalation_reason}")
+            print("  metrics:", json.dumps(store.task_metrics(t.id), indent=4))
+            if t.output:
+                print(f"\n--- output ---\n{t.output}")
+        else:
+            for t in store.list_tasks():
+                print(
+                    f"[{t.id}] {t.status.value:12s} rev={t.revision_count}"
+                    f" risk={t.risk_level}  {t.title}"
+                )
+
+    elif args.cmd in ("approve", "reject", "redo"):
+        t = getattr(loop, f"human_{args.cmd}")(args.task_id, args.note)
+        print(f"Task {t.id} -> {t.status.value}")
+
+    elif args.cmd in ("pause", "resume", "abort"):
+        if args.cmd == "resume":
+            t = loop.resume(args.task_id)
+        elif args.cmd == "pause":
+            t = loop.pause(args.task_id)
+        else:
+            t = loop.abort(args.task_id, args.note)
+        print(f"Task {t.id} -> {t.status.value} (control={t.control})")
+
+    elif args.cmd == "events":
+        for ev in store.events(args.task_id):
+            print(f"{ev['ts']:.0f} {ev['kind']:20s} {json.dumps(ev['payload'])[:120]}")
+
+    elif args.cmd == "serve":
+        config = LoopConfig.load(args.config or "loopconfig.json")
+        serve_forever(
+            store,
+            loop,
+            Registry.load(config.registry_path),
+            config,
+            args.host,
+            args.port,
+        )
+
+    elif args.cmd == "eval":
+        return _eval_cmd(store, args)
+
+    elif args.cmd == "memory":
+        return _memory_cmd(store, args)
     return 0
 
 

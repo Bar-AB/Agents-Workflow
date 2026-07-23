@@ -19,7 +19,7 @@ All values are tunable globally here or via loopconfig.json.
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 
@@ -42,10 +42,27 @@ class LoopConfig:
     test_command: str = "pytest -q"
     test_timeout_s: int = 120
     workspace_root: str = ".agentloop/ws"
+    # The subprocess env is scrubbed to an allowlist so generated code can't
+    # read ANTHROPIC_API_KEY or other secrets. Extra vars a project genuinely
+    # needs go here (base allowlist lives in executor._BASE_ENV_ALLOWLIST).
+    sandbox_env_allowlist: list[str] = field(default_factory=list)
+    # 'env' = env-scrub only (default). 'strict' asks for a container /
+    # no-network / read-only-fs tier when a backend is available and degrades
+    # to env-scrub with a warning when it is not (documented residual risk).
+    sandbox_isolation: str = "env"
 
     # Memory (spec §7): a project fact read this often is promoted to the
     # cross-project loop tier.
     memory_promote_threshold: int = 3
+
+    # Infra resilience: a transient runner/executor failure (API 5xx, network
+    # blip) is retried up to this many times with exponential backoff before
+    # the task escalates to NEEDS_HUMAN with an infra_error reason. This is
+    # distinct from a "revise": infra failure is not a task-quality failure and
+    # is not counted against max_revisions. Default backoff is 0.0 so tests run
+    # instantly; operators raise it in production. Delay = backoff * 2**(n-1).
+    infra_max_retries: int = 2
+    infra_retry_backoff_s: float = 0.0
 
     # Phase 2 dashboard server.
     server_host: str = "127.0.0.1"
@@ -74,8 +91,10 @@ class LoopConfig:
             if unknown:
                 # Surface typos rather than silently ignoring a setting the
                 # user believes is in effect.
-                print(f"warning: ignoring unknown config keys in {path}: "
-                      f"{', '.join(unknown)}")
+                print(
+                    f"warning: ignoring unknown config keys in {path}: "
+                    f"{', '.join(unknown)}"
+                )
             return cls(**{k: v for k, v in data.items() if k in known})
         return cls()
 
@@ -98,9 +117,13 @@ CACHE_WRITE_MULTIPLIER = 1.25
 CACHE_READ_MULTIPLIER = 0.10
 
 
-def estimate_cost_usd(model: str, tokens_in: int, tokens_out: int,
-                      cache_creation_tokens: int = 0,
-                      cache_read_tokens: int = 0) -> float:
+def estimate_cost_usd(
+    model: str,
+    tokens_in: int,
+    tokens_out: int,
+    cache_creation_tokens: int = 0,
+    cache_read_tokens: int = 0,
+) -> float:
     """Cost of one invocation in USD.
 
     Cache arguments default to 0 so existing callers and the zero-priced
@@ -108,6 +131,9 @@ def estimate_cost_usd(model: str, tokens_in: int, tokens_out: int,
     at 1.25x, reads at 0.10x; output is unaffected.
     """
     pin, pout = MODEL_PRICING.get(model, DEFAULT_PRICING)
-    return (tokens_in * pin + tokens_out * pout
-            + cache_creation_tokens * pin * CACHE_WRITE_MULTIPLIER
-            + cache_read_tokens * pin * CACHE_READ_MULTIPLIER) / 1_000_000
+    return (
+        tokens_in * pin
+        + tokens_out * pout
+        + cache_creation_tokens * pin * CACHE_WRITE_MULTIPLIER
+        + cache_read_tokens * pin * CACHE_READ_MULTIPLIER
+    ) / 1_000_000

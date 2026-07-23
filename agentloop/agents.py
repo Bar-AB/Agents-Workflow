@@ -20,27 +20,60 @@ _VERDICT_RE = re.compile(
 )
 
 
-def _invoke(store: Store, runner: ModelRunner, task: Task, kind: str,
-            role: str, model: str, system: str, prompt: str,
-            tools: list[str] | None = None) -> tuple[RunResult, int]:
+def _invoke(
+    store: Store,
+    runner: ModelRunner,
+    task: Task,
+    kind: str,
+    role: str,
+    model: str,
+    system: str,
+    prompt: str,
+    tools: list[str] | None = None,
+) -> tuple[RunResult, int]:
     """Run one agent invocation with full attempt/metrics bookkeeping."""
-    attempt_id = store.start_attempt(task.id, kind, role, model)
-    store.log_event(task.id, f"{kind}_prompt",
-                    {"role": role, "prompt": prompt, "tools": list(tools or [])})
+    # The model call sits deliberately *between* two transactions, never inside
+    # one: the store lock must not be held across a network call. Each paired
+    # write (attempt row + its audit event) is atomic on its own.
+    with store.transaction():
+        attempt_id = store.start_attempt(task.id, kind, role, model)
+        store.log_event(
+            task.id,
+            f"{kind}_prompt",
+            {"role": role, "prompt": prompt, "tools": list(tools or [])},
+        )
     result = runner.run(system, prompt, model, tools)
-    cost = estimate_cost_usd(result.model, result.tokens_in, result.tokens_out,
-                             result.cache_creation_tokens,
-                             result.cache_read_tokens)
-    store.finish_attempt(attempt_id, result.output, result.tokens_in,
-                         result.tokens_out, cost, model=result.model,
-                         cache_creation_tokens=result.cache_creation_tokens,
-                         cache_read_tokens=result.cache_read_tokens)
-    store.log_event(task.id, f"{kind}_output", {
-        "role": role, "output": result.output,
-        "tokens_in": result.tokens_in, "tokens_out": result.tokens_out,
-        "cache_creation_tokens": result.cache_creation_tokens,
-        "cache_read_tokens": result.cache_read_tokens,
-        "cost_usd": cost})
+    cost = estimate_cost_usd(
+        result.model,
+        result.tokens_in,
+        result.tokens_out,
+        result.cache_creation_tokens,
+        result.cache_read_tokens,
+    )
+    with store.transaction():
+        store.finish_attempt(
+            attempt_id,
+            result.output,
+            result.tokens_in,
+            result.tokens_out,
+            cost,
+            model=result.model,
+            cache_creation_tokens=result.cache_creation_tokens,
+            cache_read_tokens=result.cache_read_tokens,
+        )
+        store.log_event(
+            task.id,
+            f"{kind}_output",
+            {
+                "role": role,
+                "output": result.output,
+                "tokens_in": result.tokens_in,
+                "tokens_out": result.tokens_out,
+                "cache_creation_tokens": result.cache_creation_tokens,
+                "cache_read_tokens": result.cache_read_tokens,
+                "cost_usd": cost,
+            },
+        )
     return result, attempt_id
 
 
@@ -65,11 +98,16 @@ def _test_block(result: TestResult | None) -> str:
     )
 
 
-def run_worker(store: Store, runner: ModelRunner, registry: Registry,
-               task: Task, feedback: str = "",
-               memory: MemoryService | None = None,
-               workspace: str | None = None,
-               test_result: TestResult | None = None) -> RunResult:
+def run_worker(
+    store: Store,
+    runner: ModelRunner,
+    registry: Registry,
+    task: Task,
+    feedback: str = "",
+    memory: MemoryService | None = None,
+    workspace: str | None = None,
+    test_result: TestResult | None = None,
+) -> RunResult:
     spec = registry.get(task.worker_role)
     prompt = (
         f"# Task: {task.title}\n\n"
@@ -90,16 +128,29 @@ def run_worker(store: Store, runner: ModelRunner, registry: Registry,
         )
         prompt += _test_block(test_result)
         prompt += "\nRevise your output to address the feedback."
-    result, _ = _invoke(store, runner, task, "worker", spec.role, spec.model,
-                        spec.system_prompt, prompt, spec.tools)
+    result, _ = _invoke(
+        store,
+        runner,
+        task,
+        "worker",
+        spec.role,
+        spec.model,
+        spec.system_prompt,
+        prompt,
+        spec.tools,
+    )
     return result
 
 
-def run_validator(store: Store, runner: ModelRunner, registry: Registry,
-                  task: Task, worker_output: str,
-                  memory: MemoryService | None = None,
-                  test_result: TestResult | None = None
-                  ) -> tuple[Verdict, int]:
+def run_validator(
+    store: Store,
+    runner: ModelRunner,
+    registry: Registry,
+    task: Task,
+    worker_output: str,
+    memory: MemoryService | None = None,
+    test_result: TestResult | None = None,
+) -> tuple[Verdict, int]:
     spec = registry.get(task.validator_role)
     prompt = (
         f"# Task under review: {task.title}\n\n"
@@ -109,9 +160,17 @@ def run_validator(store: Store, runner: ModelRunner, registry: Registry,
     )
     prompt += _memory_block(memory)
     prompt += _test_block(test_result)
-    result, attempt_id = _invoke(store, runner, task, "validator", spec.role,
-                                 spec.model, spec.system_prompt, prompt,
-                                 spec.tools)
+    result, attempt_id = _invoke(
+        store,
+        runner,
+        task,
+        "validator",
+        spec.role,
+        spec.model,
+        spec.system_prompt,
+        prompt,
+        spec.tools,
+    )
     return parse_verdict(result.output), attempt_id
 
 
@@ -120,11 +179,15 @@ def parse_verdict(text: str) -> Verdict:
     itself a failure signal -> escalate at confidence 0 (never guess-approve)."""
     m = _VERDICT_RE.search(text)
     if not m:
-        return Verdict(kind=VerdictKind.ESCALATE, confidence=0.0,
-                       reasoning=f"Unparseable validator output:\n{text}")
+        return Verdict(
+            kind=VerdictKind.ESCALATE,
+            confidence=0.0,
+            reasoning=f"Unparseable validator output:\n{text}",
+        )
     kind = VerdictKind(m.group(1).lower())
     confidence = max(0.0, min(1.0, float(m.group(2))))
     tests = {"pass": True, "fail": False, "na": None}[m.group(3).lower()]
-    reasoning = text[m.end():].strip()
-    return Verdict(kind=kind, confidence=confidence, reasoning=reasoning,
-                   tests_passed=tests)
+    reasoning = text[m.end() :].strip()
+    return Verdict(
+        kind=kind, confidence=confidence, reasoning=reasoning, tests_passed=tests
+    )
