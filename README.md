@@ -30,7 +30,7 @@ agentloop/
   cli.py       add / run / status / approve / reject / redo / pause / resume /
                abort / events / serve / memory / eval
 web/           Vite + React + TypeScript dashboard
-tests/         115 tests on MockRunner + real subprocesses (no API keys needed)
+tests/         117 tests on MockRunner + real subprocesses (no API keys needed)
 ```
 
 ## Quick start
@@ -79,6 +79,7 @@ Validator returns `VERDICT: <kind> CONFIDENCE: <0-1> TESTS: <pass|fail|na>`:
 | budget cap exceeded | needs_human (never burn unbounded) |
 | unparseable verdict | needs_human (never guess-approve) |
 | transient infra failure (runner/executor raises) | retried with backoff, then needs_human (`infra_error`) — not a revise |
+| worker context ≥ handoff ratio of its budget | summarize state + restart worker from the summary (`context_handoff`) — not a revise |
 
 **"Tests not failing" means the executed result.** Tests really run in the
 task's workspace between worker and validator; the validator sees the real
@@ -124,6 +125,25 @@ is written through the store, so it works cross-process and is read fresh at
 each loop boundary (where the budget cap is checked). A paused task survives a
 restart and does not auto-resume; an aborted task is terminal but defensible —
 its output and full audit trail are left intact. Every transition is an event.
+
+## Context-budget handoff
+
+An agent's `context_budget_tokens` (in the registry) used to be unenforced, so a
+long revision chain could silently pile transcript on transcript until the
+context overflowed. Now the loop watches how much context the **worker** has
+accumulated on a task (summed across its attempts, prompt-cache tokens included),
+and once that reaches `context_handoff_ratio` of the worker's budget (default
+`0.70`), it **hands off**: a dedicated `summarizer` agent compacts the working
+state — goal, criteria, work so far, and the latest validator feedback — and the
+worker is restarted from that summary *in place of* the raw transcript, which is
+exactly what would have overflowed.
+
+The check sits at the iteration boundary next to the budget cap, and a handoff is
+**not a revision** — it doesn't consume `max_revisions`. Each handoff logs a
+`context_handoff` event with before/after token counts, and the summarizer runs
+as its own recorded attempt (its cost still counts toward the task budget cap).
+After a handoff the watermark advances, so only newly accumulated context can
+trip the next one.
 
 ## Validator calibration harness
 
@@ -180,7 +200,7 @@ Anthropic credentials.
 - [x] Validator calibration harness (`agentloop eval`)
 - [x] Mid-run human control: pause / resume / abort, cross-process
 - [x] Pinned memory facts that bypass the injection cap
-- [ ] Context-budget handoff (summarize + fresh agent at <70% confidence)
+- [x] Context-budget handoff (summarize + fresh worker at ≥70% of the budget)
 - [ ] RAG store (Chroma/LanceDB) behind the memory tables
 - [ ] Retrieval / tool-call provenance events (with the RAG/MCP work that needs
       them)

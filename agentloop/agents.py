@@ -107,6 +107,7 @@ def run_worker(
     memory: MemoryService | None = None,
     workspace: str | None = None,
     test_result: TestResult | None = None,
+    handoff_summary: str | None = None,
 ) -> RunResult:
     spec = registry.get(task.worker_role)
     prompt = (
@@ -120,7 +121,19 @@ def run_worker(
             f"\n## Workspace\nWrite your files and tests under `{workspace}`. "
             f"They are executed there automatically after you finish.\n"
         )
-    if feedback:
+    if handoff_summary is not None:
+        # Context-budget handoff (slice 1): the prior worker's context grew past
+        # its budget, so a fresh instance continues from a compacted summary in
+        # place of the raw transcript (previous output + feedback), which is
+        # exactly what would have overflowed.
+        prompt += (
+            f"\n## Handoff summary of prior work (context compacted)\n"
+            f"{handoff_summary}\n"
+            f"\nContinue the task from this summary, addressing the feedback it "
+            f"describes. Prior work is summarized above rather than repeated in "
+            f"full."
+        )
+    elif feedback:
         prompt += (
             f"\n## Your previous output\n{task.output}\n"
             f"\n## Validator feedback (revision {task.revision_count})\n"
@@ -133,6 +146,52 @@ def run_worker(
         runner,
         task,
         "worker",
+        spec.role,
+        spec.model,
+        spec.system_prompt,
+        prompt,
+        spec.tools,
+    )
+    return result
+
+
+def run_summarizer(
+    store: Store,
+    runner: ModelRunner,
+    registry: Registry,
+    task: Task,
+    feedback: str = "",
+    test_result: TestResult | None = None,
+) -> RunResult:
+    """Compact a task's working state for a context-budget handoff (slice 1).
+
+    A ModelRunner call (so it works under MockRunner in tests). Recorded as its
+    own attempt (kind='summarizer'), so its cost feeds the task budget cap but
+    is kept separate from the worker's accumulated-context measure."""
+    try:
+        spec = registry.get("summarizer")
+    except KeyError:
+        # A hand-edited agents.json may predate the summarizer role; fall back
+        # to the worker's spec so a handoff degrades rather than crashing.
+        spec = registry.get(task.worker_role)
+    prompt = (
+        f"# Task being handed off: {task.title}\n\n"
+        f"## Goal\n{task.goal}\n\n"
+        f"## Acceptance criteria\n{task.acceptance_criteria}\n\n"
+        f"## Work so far (latest worker output)\n{task.output}\n"
+    )
+    if feedback:
+        prompt += f"\n## Latest validator feedback\n{feedback}\n"
+    prompt += _test_block(test_result)
+    prompt += (
+        "\nSummarize this working state so a fresh worker instance can continue "
+        "with no loss of what matters."
+    )
+    result, _ = _invoke(
+        store,
+        runner,
+        task,
+        "summarizer",
         spec.role,
         spec.model,
         spec.system_prompt,

@@ -55,6 +55,14 @@ class LoopConfig:
     # cross-project loop tier.
     memory_promote_threshold: int = 3
 
+    # Context-budget handoff (roadmap slice 1). When a worker's accumulated
+    # context on a task (summed across its attempts) reaches this fraction of
+    # its AgentSpec.context_budget_tokens, the loop summarizes the working state
+    # and restarts the worker with that summary in place of the raw transcript,
+    # rather than letting context silently overflow. Fraction of the budget, not
+    # a token count; ~0.70 leaves headroom for the next turn's own output.
+    context_handoff_ratio: float = 0.70
+
     # Infra resilience: a transient runner/executor failure (API 5xx, network
     # blip) is retried up to this many times with exponential backoff before
     # the task escalates to NEEDS_HUMAN with an infra_error reason. This is

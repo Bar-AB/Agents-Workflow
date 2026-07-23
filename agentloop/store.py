@@ -484,6 +484,20 @@ class Store:
         ).fetchone()
         return int(row["toks"]), float(row["cost"])
 
+    def attempt_tokens(self, task_id: int, kind: str) -> int:
+        """Total tokens across one kind of attempt ('worker' | 'validator' |
+        'summarizer') for a task. The context-budget handoff uses this to gauge
+        a single role's accumulated context, separately from the whole-task
+        budget cap (`task_spend`), which sums every kind. Includes prompt-cache
+        tokens, so the measure matches the real context a cached run consumes."""
+        row = self._conn.execute(
+            "SELECT COALESCE(SUM(tokens_in+tokens_out+cache_creation_tokens"
+            "+cache_read_tokens),0) AS toks"
+            " FROM attempts WHERE task_id=? AND kind=?",
+            (task_id, kind),
+        ).fetchone()
+        return int(row["toks"])
+
     def task_metrics(self, task_id: int) -> dict:
         toks, cost = self.task_spend(task_id)
         row = self._conn.execute(

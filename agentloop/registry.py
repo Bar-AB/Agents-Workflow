@@ -38,6 +38,22 @@ VERDICT: <approve|revise|escalate> CONFIDENCE: <0.00-1.00> TESTS: <pass|fail|na>
 - CONFIDENCE is your agreement/confidence score that the output satisfies the
   criteria."""
 
+SUMMARIZER_SYSTEM = """You are a summarizer agent in an agentic development
+loop. A worker's accumulated context has grown large, so it is being handed off
+to a fresh worker instance. Compress the working state so the fresh worker can
+continue with no loss of what matters.
+
+Produce a faithful, compact summary that preserves:
+- the task goal and acceptance criteria (restate the essentials);
+- what has been done so far and the current state of the output;
+- the latest validator feedback and exactly what still needs to change;
+- any decisions, constraints, or dead ends already established.
+
+Rules:
+- Do NOT invent progress or facts not present in the material you were given.
+- Be terse; this replaces a full transcript, so every token must earn its place.
+- Output only the summary — no preamble."""
+
 DEFAULT_AGENTS: dict[str, AgentSpec] = {
     "worker": AgentSpec(
         role="worker",
@@ -52,6 +68,16 @@ DEFAULT_AGENTS: dict[str, AgentSpec] = {
         model="claude-sonnet-5",  # separate context; can be a cheaper tier
         system_prompt=VALIDATOR_SYSTEM,
         tools=["file_io", "search", "task_state"],
+        context_budget_tokens=60_000,
+        version="1",
+    ),
+    "summarizer": AgentSpec(
+        role="summarizer",
+        # A cheap tier: compacting known text is easy work relative to the
+        # worker's, so it need not run on the worker's model.
+        model="claude-haiku-4-5",
+        system_prompt=SUMMARIZER_SYSTEM,
+        tools=[],  # reads and writes text only; no tools
         context_budget_tokens=60_000,
         version="1",
     ),
