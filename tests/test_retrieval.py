@@ -117,11 +117,39 @@ def test_pinned_facts_still_bypass_the_cap_under_ranking(store, memory):
     assert block.splitlines()[0].startswith("- (project) *")
 
 
-def test_ranking_still_bumps_hit_counts_and_promotes(store, memory):
+def test_a_fact_relevant_to_three_tasks_is_promoted(store, memory):
     store.memory_write("project", "hot", "deploy rollout", approved=True)
     for _ in range(3):
         memory.facts_for_prompt(query="deploy rollout")
     assert [r["key"] for r in store.memory_list(tier="loop")] == ["hot"]
+
+
+def test_an_irrelevant_fact_riding_along_under_the_cap_is_not_a_hit(store, memory):
+    """Everything approved is injected while the store is under the cap, so
+    counting injections counted 'existed while three tasks ran' and promoted the
+    entire project tier to `loop`. Only a fact the query actually matched is a
+    hit."""
+    store.memory_write("project", "hot", "deploy rollout", approved=True)
+    store.memory_write("project", "cold", "colour of the bikeshed", approved=True)
+
+    for _ in range(3):
+        block, _ = memory.facts_for_prompt(query="deploy rollout")
+        assert "cold" in block  # still injected: ranking decides order, not fit
+
+    counts = {r["key"]: r["hit_count"] for r in store.memory_list(tier="project")}
+    assert counts["cold"] == 0
+    assert [r["key"] for r in store.memory_list(tier="loop")] == ["hot"]
+
+
+def test_an_unranked_injection_counts_no_hits(store):
+    """With no query there is no evidence any fact was relevant to anything —
+    which is exactly the signal hit_count is supposed to carry."""
+    plain = MemoryService(store, promote_threshold=3, backend=None)
+    store.memory_write("project", "k", "v", approved=True)
+    for _ in range(3):
+        plain.facts_for_prompt()
+    assert store.memory_list(tier="project")[0]["hit_count"] == 0
+    assert store.memory_list(tier="loop") == []
 
 
 # -- back-compatibility: no query means no behaviour change --------------------

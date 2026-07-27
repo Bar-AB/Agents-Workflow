@@ -94,7 +94,7 @@ class MemoryService:
         provenance = (
             self._provenance(query, rows, scores, len(approved)) if ranked else None
         )
-        self._record_reads(rows)
+        self._record_reads(rows, scores, ranked)
         return "\n".join(lines), provenance
 
     def _rank(
@@ -189,8 +189,28 @@ class MemoryService:
         )
         return True
 
-    def _record_reads(self, rows: list[dict]) -> None:
+    def _record_reads(
+        self, rows: list[dict], scores: dict[int, float], ranked: bool
+    ) -> None:
+        """Count a hit only where there is evidence the fact was relevant.
+
+        Injection is not evidence: while the store holds fewer facts than the
+        cap, *every* approved fact is injected into *every* prompt, so counting
+        injections made `hit_count` mean "existed while N tasks ran" and promoted
+        the whole project tier to `loop` on schedule. A positive relevance score
+        is the weakest signal that actually distinguishes facts from each other,
+        so it is what counts — an unranked selection counts nothing at all.
+
+        It is still a proxy. What promotion really wants to know is whether the
+        fact changed the agent's output, which needs the `retrieval` events to be
+        joined against attempt outcomes; the provenance now attached to each
+        attempt is what makes that measurable later.
+        """
+        if not ranked:
+            return
         for r in rows:
+            if scores.get(int(r["id"]), 0.0) <= 0.0:
+                continue
             self.store.memory_read(r["tier"], r["key"], approved_only=True)
             self.maybe_promote(r["tier"], r["key"])
 

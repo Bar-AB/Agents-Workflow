@@ -98,8 +98,16 @@ Two tiers, `project` and `loop`. Reads are gated on `approved`: a fact nobody
 vetted never reaches a prompt, because a bad fact entering memory quietly
 poisons every later task. Agent writes land unapproved and surface in the
 dashboard (or `agentloop memory`) for a human to accept or discard. A project
-fact read `memory_promote_threshold` times is promoted to the loop tier —
-re-answering the same question is exactly the wasted spend tiering removes.
+fact that turns up relevant to `memory_promote_threshold` tasks is promoted to
+the loop tier — re-answering the same question is exactly the wasted spend
+tiering removes.
+
+"Relevant" is doing real work there: a hit is an injection the retrieval ranked
+above zero, not merely an injection. While the store holds fewer facts than the
+cap every approved fact is injected into every prompt, so counting injections
+would mean "existed while three tasks ran" and promote the whole project tier on
+schedule. It is still a proxy — what promotion wants to know is whether a fact
+changed the output, which the `retrieval` provenance now makes measurable.
 
 **Pinned facts.** Prompt injection is capped (20 facts) so memory can't crowd
 out the task; past the cap, ordinary facts drop by alphabetical accident. Mark
@@ -135,8 +143,9 @@ Ranking decides *order*; it never widens what may be injected. The candidate
 set is what `approved` already allowed through, so no backend — local, remote,
 or not yet written — can surface an unvetted fact; any future index is a
 derived cache that may only re-rank rows the store just handed it, never
-resurrect a revoked one. The caps, the pinned ceiling and project→loop
-promotion are all unchanged. With no query, or
+resurrect a revoked one. The caps and the pinned ceiling are unchanged, and a
+fact that fits under the cap is never dropped for scoring low — a zero score
+costs it a promotion credit, not its slot. With no query, or
 `memory_retrieval_backend: "none"`, selection falls back to exactly the old
 alphabetical behaviour — there is nothing to rank against, so inventing an
 order would be worse than the plain one.
