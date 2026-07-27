@@ -55,6 +55,22 @@ class LoopConfig:
     # cross-project loop tier.
     memory_promote_threshold: int = 3
 
+    # Memory retrieval (roadmap slice 2). Which RetrievalBackend ranks approved
+    # facts against the task at hand before they are injected:
+    #   'hash'   - the stdlib backend, no optional dependency (the default)
+    #   'chroma' - the vector index; warns and degrades to 'hash' if absent
+    #   'auto'   - Chroma when agentloop[rag] is installed, else 'hash'
+    #   'none'   - no ranking at all: the pre-slice-2 alphabetical selection
+    # The default is 'hash', not 'auto', deliberately: both backends use the
+    # same embedding, so at the fact counts this store holds they return the
+    # same order, and 'auto' would mean an unrelated `pip install` silently
+    # changed a run's behaviour and started writing an index to disk. Opt in to
+    # 'chroma' when the fact count makes brute-force scoring the bottleneck.
+    # Ranking never widens what may be injected — the approval gate and the
+    # injection caps are applied around it, not by it.
+    memory_retrieval_backend: str = "hash"
+    memory_chroma_path: str = ".agentloop/chroma"
+
     # Context-budget handoff (roadmap slice 1). When a worker's accumulated
     # context on a task (summed across its attempts) reaches this fraction of
     # its AgentSpec.context_budget_tokens, the loop summarizes the working state

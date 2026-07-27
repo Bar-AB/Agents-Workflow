@@ -28,6 +28,16 @@ function digest(ev: EventRow): string {
     case 'memory_pinned':
     case 'memory_unpinned':
       return `${p.tier}/${p.key}`
+    case 'retrieval': {
+      // Provenance: which facts memory put in front of the agent, best first.
+      const top = (p.facts ?? [])
+        .slice(0, 3)
+        .map((f: any) => `${f.key} ${Number(f.score).toFixed(2)}`)
+        .join(', ')
+      return `${p.backend}: ${p.n_selected}/${p.n_candidates} facts — ${top}`
+    }
+    case 'tool_call':
+      return `${p.agent_kind} · ${p.tool}`
     case 'eval_run':
       return `${p.runner}: ${p.n_fixtures} fixtures, agreement ${p.agreement}`
     case 'human_abort':

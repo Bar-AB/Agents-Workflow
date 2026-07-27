@@ -11,12 +11,16 @@ The store owns the tables; this owns the policy:
   tier: repeatedly re-answering the same question is exactly the wasted token
   spend the tiering exists to remove.
 
-Retrieval is keyword/key-based for now. A vector store slots in behind
-`facts_for_prompt` without the loop noticing.
+Selection is ranked by relevance to the calling task when a query is supplied,
+through the `retrieval.RetrievalBackend` seam — a vector store slots in behind
+`facts_for_prompt` without the loop noticing. With no query (or no backend) the
+pre-ranking alphabetical selection is used unchanged: there is nothing to rank
+against, and silently inventing an ordering would be worse than the old one.
 """
 
 from __future__ import annotations
 
+from .retrieval import _MAX_QUERY_CHARS, RetrievalBackend
 from .store import Store
 
 # Cap injected context so memory can't crowd out the actual task. Pinned facts
@@ -30,27 +34,52 @@ _MAX_VALUE_CHARS = 400
 
 
 class MemoryService:
-    def __init__(self, store: Store, promote_threshold: int = 3):
+    def __init__(
+        self,
+        store: Store,
+        promote_threshold: int = 3,
+        backend: RetrievalBackend | None = None,
+    ):
         self.store = store
         self.promote_threshold = promote_threshold
+        # None = no relevance ranking; selection stays alphabetical.
+        self.backend = backend
 
     # -- reads ---------------------------------------------------------------
 
     def facts_for_prompt(
-        self, limit: int = _MAX_FACTS_IN_PROMPT, pinned_limit: int = _MAX_PINNED_FACTS
+        self,
+        limit: int = _MAX_FACTS_IN_PROMPT,
+        pinned_limit: int = _MAX_PINNED_FACTS,
+        query: str = "",
+        task_id: int | None = None,
     ) -> str:
         """Approved facts as a prompt block.
 
         Ordering: pinned facts first (they bypass the main cap under their own
-        ceiling), then the rest. Within each group, loop-tier before project,
-        then alphabetical — loop facts are the cross-project ones that earned
-        their place. Without pinning, the alphabetical tail past `limit` drops
-        by accident; pinning is how a must-have fact keeps its slot."""
+        ceiling), then the rest. Within each group, `query` decides — the facts
+        most relevant to the task at hand keep the slots, and loop-tier before
+        project then alphabetical breaks ties the query cannot. Without a query
+        or a backend, that tie-break *is* the whole ordering, i.e. exactly the
+        pre-ranking behaviour.
+
+        The caps and the approval gate are unchanged by ranking: relevance only
+        decides order, so a fact that fits under the cap is never dropped for
+        scoring low, and an unapproved fact is never a candidate however well it
+        matches."""
         approved = list(self.store.memory_list(approved_only=True))
         order = lambda r: (0 if r["tier"] == "loop" else 1, r["key"])
         pinned = sorted((r for r in approved if r["pinned"]), key=order)
         unpinned = sorted((r for r in approved if not r["pinned"]), key=order)
-        rows = pinned[:pinned_limit] + unpinned[:limit]
+
+        scores: dict[int, float] = {}
+        ranked = bool(query.strip()) and self.backend is not None
+        if ranked:
+            pinned = self._rank(query, pinned, pinned_limit, scores)
+            unpinned = self._rank(query, unpinned, limit, scores)
+            rows = pinned + unpinned
+        else:
+            rows = pinned[:pinned_limit] + unpinned[:limit]
         if not rows:
             return ""
         lines = [
@@ -58,8 +87,60 @@ class MemoryService:
             f"{r['value'][:_MAX_VALUE_CHARS]}"
             for r in rows
         ]
+        if ranked:
+            self._log_retrieval(task_id, query, rows, scores, len(approved))
         self._record_reads(rows)
         return "\n".join(lines)
+
+    def _rank(
+        self, query: str, rows: list[dict], top_k: int, scores: dict[int, float]
+    ) -> list[dict]:
+        """Reorder one group by backend relevance, recording the scores."""
+        if not rows:
+            return []
+        by_id = {int(r["id"]): r for r in rows}
+        ordered = []
+        for mem_id, score in self.backend.search(query, rows, top_k):
+            row = by_id.get(int(mem_id))
+            if row is None:
+                continue  # a backend can only ever return fewer, never other
+            scores[int(mem_id)] = float(score)
+            ordered.append(row)
+        return ordered
+
+    def _log_retrieval(
+        self,
+        task_id: int | None,
+        query: str,
+        rows: list[dict],
+        scores: dict[int, float],
+        n_candidates: int,
+    ) -> None:
+        """Provenance for what memory put in front of an agent, and why.
+
+        The audit log already records what entered memory; without this it never
+        recorded what was *read out of* it, so a bad answer could not be traced
+        back to the fact that caused it."""
+        self.store.log_event(
+            task_id,
+            "retrieval",
+            {
+                "query": query[:_MAX_QUERY_CHARS],
+                "backend": getattr(self.backend, "name", type(self.backend).__name__),
+                "n_candidates": n_candidates,
+                "n_selected": len(rows),
+                "facts": [
+                    {
+                        "id": int(r["id"]),
+                        "tier": r["tier"],
+                        "key": r["key"],
+                        "pinned": bool(r["pinned"]),
+                        "score": round(scores.get(int(r["id"]), 0.0), 4),
+                    }
+                    for r in rows
+                ],
+            },
+        )
 
     def read(self, tier: str, key: str) -> str | None:
         value = self.store.memory_read(tier, key, approved_only=True)

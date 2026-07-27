@@ -1,0 +1,251 @@
+"""RetrievalBackend — the memory-relevance seam (roadmap slice 2).
+
+`MemoryService.facts_for_prompt` used to select approved facts by tier and then
+alphabetical key. That ordering has nothing to do with the task at hand: past
+the injection cap, facts drop by alphabetical accident, so the one fact that
+answers the current task can be crowded out by irrelevant ones that happen to
+sort earlier. This module ranks them by relevance to a query instead.
+
+It mirrors `runner.ModelRunner`: the loop and `MemoryService` talk to a
+protocol, never to a vector database. Two backends ship:
+
+- `HashingBackend` (default) — stdlib only. Hashed bag-of-words vectors and
+  cosine similarity, brute-forced over the candidate set. Matches on shared
+  vocabulary, not paraphrase; that is the price of zero dependencies, and it is
+  still far better than alphabetical.
+- `ChromaBackend` — `pip install agentloop[rag]`. Chroma supplies the *index*,
+  never the embeddings: `embed` below is used for both backends, so installing
+  the extra is an index swap rather than a change of meaning, and no model is
+  ever downloaded (retrieval keeps working with no network).
+
+**The approval gate does not live here.** Callers pass in candidates already
+filtered by `approved`, so no backend — present or future, local or remote — can
+surface an unvetted fact. Likewise the Chroma collection is a *derived cache*,
+rebuildable from SQLite at any time: it can only ever re-rank rows the store
+already handed over, never resurrect a revoked one.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import math
+import re
+from typing import Protocol
+
+# Vector width. Small enough that brute-force cosine over a few thousand facts
+# is free, wide enough that unrelated short facts rarely collide.
+_DIMS = 256
+
+_TOKEN_RE = re.compile(r"[a-z0-9_]+")
+
+# Only the words that carry no signal at all. Deliberately tiny: an aggressive
+# stopword list mostly discards vocabulary that would have matched.
+_STOPWORDS = frozenset(
+    "a an and are as at be by for from how in is it of on or that the this to with".split()
+)
+
+_MAX_QUERY_CHARS = 1000
+
+
+def _dim_for(token: str) -> int:
+    """Stable dimension for a token.
+
+    blake2b, *not* builtin `hash()`: the latter is salted per process, so an
+    index written by one process would silently fail to match a query embedded
+    by another — the kind of bug that shows up as quietly worse retrieval
+    rather than as an error.
+    """
+    digest = hashlib.blake2b(token.encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, "big") % _DIMS
+
+
+def embed(text: str) -> list[float]:
+    """Hashed bag-of-words vector, L2-normalized (so cosine is a dot product).
+
+    Empty or all-stopword text yields the zero vector, which scores 0.0 against
+    everything — an empty query ranks nothing rather than ranking arbitrarily.
+    """
+    vec = [0.0] * _DIMS
+    for token in _TOKEN_RE.findall(text.lower()):
+        if token in _STOPWORDS:
+            continue
+        vec[_dim_for(token)] += 1.0
+    norm = math.sqrt(sum(v * v for v in vec))
+    if norm == 0.0:
+        return vec
+    return [v / norm for v in vec]
+
+
+def cosine(a: list[float], b: list[float]) -> float:
+    """Cosine similarity of two `embed` outputs (already normalized)."""
+    return sum(x * y for x, y in zip(a, b))
+
+
+def _fact_text(candidate: dict) -> str:
+    """What a memory row is matched on. The key carries as much signal as the
+    value ('test_command' is the whole question a worker is asking)."""
+    return f"{candidate.get('key', '')} {candidate.get('value', '')}"
+
+
+def rank_exact(
+    query: str, candidates: list[dict], top_k: int
+) -> list[tuple[int, float]]:
+    """Exact cosine ranking, best first, as `(memory id, score)` pairs.
+
+    The sort is stable and keyed only on the negated score, so equally relevant
+    facts keep the order the caller supplied — which is the store's
+    `ORDER BY tier, key`. That is what makes tier the tie-break between facts
+    the query cannot distinguish, deterministically and without this module
+    needing to know the tier policy.
+    """
+    q = embed(query)
+    scored = [(int(c["id"]), cosine(q, embed(_fact_text(c)))) for c in candidates]
+    scored.sort(key=lambda pair: -pair[1])
+    return scored[:top_k]
+
+
+class RetrievalBackend(Protocol):
+    def search(
+        self, query: str, candidates: list[dict], top_k: int
+    ) -> list[tuple[int, float]]:
+        """Rank `candidates` (approved memory rows) against `query`.
+
+        Returns at most `top_k` `(memory id, score)` pairs, best first. Ids not
+        returned are simply not injected.
+        """
+        ...
+
+
+class HashingBackend:
+    """Stdlib backend: brute-force cosine over the candidate set."""
+
+    name = "hash"
+
+    def search(
+        self, query: str, candidates: list[dict], top_k: int
+    ) -> list[tuple[int, float]]:
+        return rank_exact(query, candidates, top_k)
+
+
+def _import_chromadb():
+    """Import chromadb, or None when the optional extra isn't installed.
+
+    Split out so tests can simulate the dependency being absent without
+    uninstalling it.
+    """
+    try:
+        import chromadb  # noqa: PLC0415 - optional extra, imported on demand
+    except ImportError:
+        return None
+    return chromadb
+
+
+class ChromaBackend:
+    """Vector-index backend (`pip install agentloop[rag]`).
+
+    Chroma narrows the candidate set; the exact score and the final ordering are
+    still computed here with `rank_exact`, so ranking is identical to the
+    stdlib backend and stays deterministic down to the tie-break. Chroma is
+    doing the job an index should do — making 'find the best k of many' cheap —
+    and nothing that would make it authoritative.
+    """
+
+    name = "chroma"
+    _COLLECTION = "agentloop_memory"
+
+    def __init__(self, path: str = ".agentloop/chroma"):
+        self.path = path
+        self._client = None
+        self._coll = None
+        # id -> content fingerprint, so an unchanged fact isn't re-upserted.
+        self._synced: dict[int, str] = {}
+
+    def _collection(self):
+        if self._coll is None:
+            chromadb = _import_chromadb()
+            if chromadb is None:  # pragma: no cover - guarded by get_backend
+                raise RuntimeError(
+                    "ChromaBackend requires `pip install agentloop[rag]`"
+                )
+            self._client = chromadb.PersistentClient(path=self.path)
+            self._coll = self._client.get_or_create_collection(name=self._COLLECTION)
+        return self._coll
+
+    def _sync(self, coll, candidates: list[dict]) -> None:
+        """Push changed facts into the index. The index trails the store; it is
+        never read as truth, so a partial sync degrades recall, not correctness.
+        """
+        ids, embeddings, documents = [], [], []
+        for c in candidates:
+            text = _fact_text(c)
+            fingerprint = hashlib.blake2b(
+                text.encode("utf-8"), digest_size=16
+            ).hexdigest()
+            if self._synced.get(int(c["id"])) == fingerprint:
+                continue
+            ids.append(str(c["id"]))
+            embeddings.append(embed(text))
+            documents.append(text)
+            self._synced[int(c["id"])] = fingerprint
+        if ids:
+            coll.upsert(ids=ids, embeddings=embeddings, documents=documents)
+
+    def search(
+        self, query: str, candidates: list[dict], top_k: int
+    ) -> list[tuple[int, float]]:
+        if not candidates or top_k <= 0:
+            return []
+        coll = self._collection()
+        self._sync(coll, candidates)
+        allowed = {int(c["id"]) for c in candidates}
+        try:
+            result = coll.query(
+                query_embeddings=[embed(query)],
+                n_results=min(len(candidates), max(top_k * 3, top_k)),
+            )
+            hits = {int(i) for i in (result.get("ids") or [[]])[0]}
+        except Exception:  # index trouble must not break a prompt
+            hits = set()
+        # Only ids the store just approved survive, and if the index returned
+        # too few we score the authoritative set directly rather than injecting
+        # a thinner prompt because a cache was cold.
+        #
+        # The subset is rebuilt in *candidate* order, never in the order the
+        # index returned: `rank_exact`'s stable sort makes the caller's order
+        # the tie-break between equally relevant facts, so taking Chroma's
+        # ordering here would silently break the tier tie-break that the stdlib
+        # backend applies — the same query would rank differently purely because
+        # an optional package was installed.
+        subset = [c for c in candidates if int(c["id"]) in (hits & allowed)]
+        if len(subset) < min(top_k, len(candidates)):
+            subset = candidates
+        return rank_exact(query, subset, top_k)
+
+
+def get_backend(name: str = "hash", config=None) -> RetrievalBackend | None:
+    """Resolve a `memory_retrieval_backend` setting to a backend.
+
+    `auto` prefers Chroma when the extra is installed and falls back silently;
+    an explicit `chroma` that cannot be honoured warns, because a operator who
+    asked for it should learn that they are not getting it. `none` disables
+    ranking and restores the pre-slice-2 alphabetical selection.
+    """
+    path = getattr(config, "memory_chroma_path", ".agentloop/chroma")
+    if name == "none":
+        return None
+    if name == "hash":
+        return HashingBackend()
+    if name in ("auto", "chroma"):
+        if _import_chromadb() is not None:
+            return ChromaBackend(path=path)
+        if name == "chroma":
+            print(
+                "warning: memory_retrieval_backend='chroma' but chromadb is not "
+                "installed (`pip install agentloop[rag]`); using the stdlib "
+                "hashing backend instead"
+            )
+        return HashingBackend()
+    raise ValueError(
+        f"Unknown memory_retrieval_backend: {name!r} "
+        "(expected 'auto', 'hash', 'chroma' or 'none')"
+    )

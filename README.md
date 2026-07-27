@@ -23,6 +23,7 @@ agentloop/
   agents.py    worker/validator prompt building + verdict parsing
   executor.py  sandboxed test execution in a per-task workspace
   memory.py    two-tier memory policy: gating + auto-promotion
+  retrieval.py RetrievalBackend seam: HashingBackend (stdlib) | ChromaBackend
   loop.py      orchestration state machine + human decisions + mid-run control
   eval.py      validator calibration harness (fixtures + agreement/confusion/
                calibration report)
@@ -30,13 +31,13 @@ agentloop/
   cli.py       add / run / status / approve / reject / redo / pause / resume /
                abort / events / serve / memory / eval
 web/           Vite + React + TypeScript dashboard
-tests/         117 tests on MockRunner + real subprocesses (no API keys needed)
+tests/         148 tests on MockRunner + real subprocesses (no API keys needed)
 ```
 
 ## Quick start
 
 ```bash
-pip install -e ".[dev]"          # + ".[claude]" for the real runner
+pip install -e ".[dev]"          # + ".[claude]" runner, + ".[rag]" vector index
 pytest -q                        # verify the loop
 
 agentloop add "Add slugify util" \
@@ -105,6 +106,55 @@ out the task; past the cap, ordinary facts drop by alphabetical accident. Mark
 a must-have fact `--pinned` (or pin it in the dashboard) and it sorts first and
 bypasses the cap under its own smaller ceiling (10). Pinning does not bypass
 approval — a pinned but unvetted fact still never reaches a prompt.
+
+### Retrieval: the facts about *this* task
+
+Which facts survive that cap used to be decided by alphabetical order, which
+has nothing to do with the work in hand. Facts are now **ranked by relevance to
+the task** — title, goal, criteria, plus the validator feedback (or the output
+under review) that makes a revision retrieve differently from a first attempt.
+
+Ranking sits behind the `RetrievalBackend` seam in `retrieval.py`, the same
+shape as the `ModelRunner` seam:
+
+- **`HashingBackend`** (default, stdlib): hashed bag-of-words vectors and
+  cosine similarity. Matches on shared vocabulary rather than paraphrase —
+  that's the price of zero dependencies, and it still beats the alphabet.
+- **`ChromaBackend`** (`pip install agentloop[rag]`, then
+  `memory_retrieval_backend: "chroma"`): Chroma supplies the *index*, never the
+  embeddings. The same `embed()` runs on both sides, so the extra is an index
+  swap rather than a change of meaning — identical ordering down to the
+  tie-break — no model is ever downloaded, and retrieval keeps working with no
+  network.
+
+Selecting the backend is deliberately explicit rather than "whatever is
+installed": both return the same order at the fact counts this store holds, so
+`auto` would only mean an unrelated `pip install` silently changed a run and
+started writing an index to disk. Reach for `chroma` when brute-force scoring
+over every approved fact becomes the bottleneck.
+
+Ranking decides *order*; it never widens what may be injected. The candidate
+set is what `approved` already allowed through, so no backend — local, remote,
+or not yet written — can surface an unvetted fact, and the Chroma collection is
+a derived cache that can only re-rank rows the store just handed it, never
+resurrect a revoked one. The caps, the pinned ceiling, `hit_count` bumping and
+project→loop promotion are all unchanged. With no query, or
+`memory_retrieval_backend: "none"`, selection falls back to exactly the old
+alphabetical behaviour — there is nothing to rank against, so inventing an
+order would be worse than the plain one.
+
+### Provenance: what memory said, and what agents did
+
+The audit log recorded what *entered* memory but never what was read out of it,
+so a bad answer couldn't be traced to the fact that caused it. Two event kinds
+close that:
+
+- **`retrieval`** — query, backend, candidate count, and every injected fact
+  with its id, tier, pin state and score.
+- **`tool_call`** — one row per tool an agent actually invoked (registry tools
+  already reach the SDK, so this was happening unrecorded), attributed to the
+  attempt that made it. Slice 5's auto-approval policy layers on this record
+  rather than inventing authorization and provenance at once.
 
 ## Token & cost accounting
 
@@ -201,8 +251,8 @@ Anthropic credentials.
 - [x] Mid-run human control: pause / resume / abort, cross-process
 - [x] Pinned memory facts that bypass the injection cap
 - [x] Context-budget handoff (summarize + fresh worker at ≥70% of the budget)
-- [ ] RAG store (Chroma/LanceDB) behind the memory tables
-- [ ] Retrieval / tool-call provenance events (with the RAG/MCP work that needs
+- [x] RAG store (Chroma) behind the memory tables, with a stdlib fallback
+- [x] Retrieval / tool-call provenance events (with the RAG work that needs
       them)
 - [ ] Planner agent + task graph; parallel workers
 - [ ] Second-provider cross-validator

@@ -19,6 +19,10 @@ _VERDICT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# How much of the free-text context (feedback, or the output under review) feeds
+# the memory retrieval query alongside the task definition.
+_MAX_QUERY_EXTRA_CHARS = 2000
+
 
 def _invoke(
     store: Store,
@@ -61,6 +65,21 @@ def _invoke(
             cache_creation_tokens=result.cache_creation_tokens,
             cache_read_tokens=result.cache_read_tokens,
         )
+        # Provenance for what the agent actually did, not just what it said:
+        # one event per tool use, in the same transaction as the attempt it
+        # belongs to. Slice 5's approval policy layers on top of this record.
+        for call in result.tool_calls:
+            store.log_event(
+                task.id,
+                "tool_call",
+                {
+                    "attempt_id": attempt_id,
+                    "agent_kind": kind,
+                    "role": role,
+                    "tool": call.get("tool", "unknown"),
+                    "input": call.get("input"),
+                },
+            )
         store.log_event(
             task.id,
             f"{kind}_output",
@@ -77,12 +96,29 @@ def _invoke(
     return result, attempt_id
 
 
-def _memory_block(memory: MemoryService | None) -> str:
-    """Approved facts only — unvetted memory never reaches a prompt."""
+def _memory_block(
+    memory: MemoryService | None, query: str = "", task_id: int | None = None
+) -> str:
+    """Approved facts only — unvetted memory never reaches a prompt.
+
+    `query` is what the facts are ranked against: the task the agent is about to
+    work on. Passing it is what turns memory injection from "the first 20 facts
+    alphabetically" into "the 20 facts about this task"."""
     if memory is None:
         return ""
-    facts = memory.facts_for_prompt()
+    facts = memory.facts_for_prompt(query=query, task_id=task_id)
     return f"\n## Known project facts\n{facts}\n" if facts else ""
+
+
+def _retrieval_query(task: Task, extra: str = "") -> str:
+    """The text a task's memory is retrieved against.
+
+    Title/goal/criteria are the stable statement of what the task needs;
+    `extra` (validator feedback, or the output under review) is what makes a
+    revision retrieve differently from the first attempt. Bounded, so a huge
+    worker output can't drown the task's own vocabulary."""
+    base = f"{task.title}\n{task.goal}\n{task.acceptance_criteria}"
+    return f"{base}\n{extra[:_MAX_QUERY_EXTRA_CHARS]}" if extra else base
 
 
 def _test_block(result: TestResult | None) -> str:
@@ -115,7 +151,7 @@ def run_worker(
         f"## Goal\n{task.goal}\n\n"
         f"## Acceptance criteria\n{task.acceptance_criteria}\n"
     )
-    prompt += _memory_block(memory)
+    prompt += _memory_block(memory, _retrieval_query(task, feedback), task.id)
     if workspace:
         prompt += (
             f"\n## Workspace\nWrite your files and tests under `{workspace}`. "
@@ -217,7 +253,7 @@ def run_validator(
         f"## Acceptance criteria\n{task.acceptance_criteria}\n\n"
         f"## Worker output\n{worker_output}\n"
     )
-    prompt += _memory_block(memory)
+    prompt += _memory_block(memory, _retrieval_query(task, worker_output), task.id)
     prompt += _test_block(test_result)
     result, attempt_id = _invoke(
         store,
