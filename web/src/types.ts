@@ -126,6 +126,9 @@ export interface MemoryFact {
   approved: number
   pinned: number
   created_at: number
+  // Null until the fact is first read out: hit_count says how often, never how
+  // recently.
+  last_used_at: number | null
 }
 
 export interface TaskDetail {

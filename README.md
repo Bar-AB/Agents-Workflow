@@ -96,7 +96,11 @@ All thresholds live in `LoopConfig` (`loopconfig.json`), agents in
 
 Two tiers, `project` and `loop`. Reads are gated on `approved`: a fact nobody
 vetted never reaches a prompt, because a bad fact entering memory quietly
-poisons every later task. Agent writes land unapproved and surface in the
+poisons every later task. Approval is approval **of a value** — rewriting a key
+with different content returns it to unapproved, so an agent cannot smuggle new
+content past the gate by overwriting a key a human already accepted. A rewrite
+that changes nothing keeps its approval, and writing with `--approved` is
+approving the incoming content. Agent writes land unapproved and surface in the
 dashboard (or `agentloop memory`) for a human to accept or discard. A project
 fact that turns up relevant to `memory_promote_threshold` tasks is promoted to
 the loop tier — re-answering the same question is exactly the wasted spend
