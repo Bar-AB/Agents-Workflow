@@ -13,7 +13,6 @@ import pytest
 from agentloop.config import LoopConfig
 from agentloop.memory import MemoryService, _MAX_FACTS_IN_PROMPT
 from agentloop.retrieval import (
-    ChromaBackend,
     HashingBackend,
     cosine,
     embed,
@@ -184,18 +183,20 @@ def test_provenance_truncates_a_huge_query(store, memory):
     assert len(provenance["query"]) <= 1000
 
 
-# -- backend selection and graceful degradation -------------------------------
+# -- backend selection ---------------------------------------------------------
 
 
-def test_auto_selection_never_raises_and_yields_a_working_backend(tmp_path):
-    backend = get_backend("auto", LoopConfig(memory_chroma_path=str(tmp_path / "c")))
-    assert backend is not None
-    assert backend.search("a", [{"id": 1, "key": "a", "value": "a"}], 1)[0][0] == 1
+def test_the_vector_index_backend_is_gone_and_says_so():
+    """The `RetrievalBackend` seam stays — a real embedder is still a drop-in —
+    but the Chroma implementation was an optional, CI-untested code path that
+    ranked identically to the stdlib one (same `embed()` on both sides). A
+    config that still asks for it must fail loudly, not degrade silently."""
+    for name in ("chroma", "auto"):
+        with pytest.raises(ValueError, match=name):
+            get_backend(name, LoopConfig())
 
 
-def test_the_default_backend_does_not_depend_on_optional_packages():
-    """An unrelated `pip install chromadb` must not silently change how a run
-    selects memory, or start writing an index to disk."""
+def test_the_default_backend_needs_no_dependency():
     assert LoopConfig().memory_retrieval_backend == "hash"
     assert isinstance(
         get_backend(LoopConfig().memory_retrieval_backend), HashingBackend
@@ -206,162 +207,6 @@ def test_none_disables_retrieval_entirely():
     assert get_backend("none", LoopConfig()) is None
 
 
-def test_missing_chroma_degrades_to_the_stdlib_backend(monkeypatch, capsys):
-    """The optional extra must never be load-bearing: asking for a backend that
-    isn't installed warns and degrades rather than crashing the loop."""
-    monkeypatch.setattr("agentloop.retrieval._import_chromadb", lambda: None)
-    backend = get_backend("chroma", LoopConfig())
-    assert isinstance(backend, HashingBackend)
-    assert "chroma" in capsys.readouterr().out.lower()
-
-
 def test_unknown_backend_name_is_rejected():
     with pytest.raises(ValueError):
         get_backend("pinecone", LoopConfig())
-
-
-# -- the optional vector backend: integration logic, exercised offline --------
-
-
-class _FakeCollection:
-    """Enough of a Chroma collection to drive ChromaBackend deterministically.
-
-    Lets the sync/filter/fallback logic be tested with no dependency installed —
-    the real-chromadb tests below still run when the extra is present, but the
-    code path is not shipped unexercised just because CI lacks the package.
-    """
-
-    def __init__(self):
-        self.docs: dict[str, list[float]] = {}
-        self.upserts = 0
-        self.queries: list[int] = []
-        self.raises = False
-
-    def upsert(self, ids, embeddings, documents):
-        self.upserts += 1
-        for i, e in zip(ids, embeddings):
-            self.docs[i] = e
-
-    def query(self, query_embeddings, n_results):
-        if self.raises:
-            raise RuntimeError("index unavailable")
-        self.queries.append(n_results)
-        scored = sorted(
-            self.docs.items(), key=lambda kv: -cosine(query_embeddings[0], kv[1])
-        )
-        return {"ids": [[i for i, _ in scored[:n_results]]]}
-
-
-@pytest.fixture()
-def fake_chroma(monkeypatch):
-    collection = _FakeCollection()
-
-    class _Client:
-        def __init__(self, path):
-            self.path = path
-
-        def get_or_create_collection(self, name):
-            return collection
-
-    monkeypatch.setattr(
-        "agentloop.retrieval._import_chromadb",
-        lambda: type("chromadb", (), {"PersistentClient": _Client}),
-    )
-    return collection
-
-
-CANDIDATES = [
-    {"id": 1, "tier": "loop", "key": "test_cmd", "value": "pytest -q runs the tests"},
-    {"id": 2, "tier": "project", "key": "bikeshed", "value": "colour choices"},
-    {"id": 3, "tier": "project", "key": "deploy_how", "value": "deploy rollout script"},
-]
-
-
-def test_chroma_orders_identically_to_the_stdlib_backend(fake_chroma):
-    """Same embedding function on both sides, so installing the extra swaps the
-    index without changing which facts an agent sees."""
-    backend = ChromaBackend(path="unused")
-    query = "how do I deploy the rollout"
-    assert backend.search(query, CANDIDATES, 3) == HashingBackend().search(
-        query, CANDIDATES, 3
-    )
-
-
-def test_chroma_only_reindexes_facts_whose_content_changed(fake_chroma):
-    backend = ChromaBackend(path="unused")
-    backend.search("deploy", CANDIDATES, 3)
-    backend.search("deploy", CANDIDATES, 3)
-    assert fake_chroma.upserts == 1  # second call had nothing new to push
-
-    changed = [dict(CANDIDATES[0], value="pytest -x now")] + CANDIDATES[1:]
-    backend.search("deploy", changed, 3)
-    assert fake_chroma.upserts == 2
-
-
-def test_a_stale_index_entry_cannot_re_enter_a_prompt(fake_chroma):
-    """The store is the source of truth: an id the index still knows about but
-    the store no longer approves must not come back."""
-    backend = ChromaBackend(path="unused")
-    backend.search("deploy", CANDIDATES, 3)  # id 3 is now in the index
-
-    survivors = [c for c in CANDIDATES if c["id"] != 3]  # approval revoked
-    assert [i for i, _ in backend.search("deploy rollout", survivors, 3)] == [1, 2]
-
-
-def test_an_index_failure_falls_back_to_exact_scoring(fake_chroma):
-    """A broken cache degrades retrieval quality at worst, never a prompt."""
-    backend = ChromaBackend(path="unused")
-    fake_chroma.raises = True
-    query = "how do I deploy the rollout"
-    assert backend.search(query, CANDIDATES, 3) == HashingBackend().search(
-        query, CANDIDATES, 3
-    )
-
-
-def test_chroma_backend_reports_provenance_through_the_service(store, fake_chroma):
-    memory = MemoryService(store, backend=get_backend("chroma", LoopConfig()))
-    store.memory_write("project", "deploy_how", "deploy rollout", approved=True)
-    store.memory_write("project", "bikeshed", "colour choices", approved=True)
-
-    _, provenance = memory.facts_for_prompt(query="how do I deploy")
-
-    assert provenance["backend"] == "chroma"
-    assert {f["key"] for f in provenance["facts"]} == {"deploy_how", "bikeshed"}
-
-
-def test_empty_candidate_set_never_touches_the_index(fake_chroma):
-    assert ChromaBackend(path="unused").search("q", [], 5) == []
-    assert fake_chroma.queries == []
-
-
-# -- the optional vector backend: against the real library --------------------
-
-
-def test_chroma_backend_agrees_with_the_stdlib_backend(tmp_path):
-    """Skipped unless `pip install agentloop[rag]`. Both backends embed with the
-    same function, so Chroma is an index swap — the ordering must not move."""
-    pytest.importorskip("chromadb")
-    candidates = [
-        {"id": 1, "tier": "project", "key": "deploy_how", "value": "deploy rollout"},
-        {"id": 2, "tier": "project", "key": "bikeshed", "value": "colour choices"},
-        {"id": 3, "tier": "loop", "key": "test_cmd", "value": "pytest -q runs tests"},
-    ]
-    chroma = ChromaBackend(path=str(tmp_path / "chroma"))
-    query = "how do I deploy the rollout"
-    # Ordering must match down to the tie-break: facts the query cannot
-    # distinguish fall back to the caller's (tier, key) order in both backends,
-    # so installing the extra never re-ranks anything on its own.
-    assert [i for i, _ in chroma.search(query, candidates, 3)] == [
-        i for i, _ in HashingBackend().search(query, candidates, 3)
-    ]
-
-
-def test_chroma_index_is_a_derived_cache_not_a_source_of_truth(tmp_path):
-    """A fact revoked in SQLite must not resurface from a stale vector index —
-    candidates are filtered upstream, so the index can only ever re-rank rows
-    the store already approved."""
-    pytest.importorskip("chromadb")
-    chroma = ChromaBackend(path=str(tmp_path / "chroma"))
-    candidates = [{"id": 1, "tier": "project", "key": "a", "value": "deploy rollout"}]
-    chroma.search("deploy", candidates, 1)
-    assert chroma.search("deploy", [], 1) == []

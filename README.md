@@ -23,7 +23,7 @@ agentloop/
   agents.py    worker/validator prompt building + verdict parsing
   executor.py  sandboxed test execution in a per-task workspace
   memory.py    two-tier memory policy: gating + auto-promotion
-  retrieval.py RetrievalBackend seam: HashingBackend (stdlib) | ChromaBackend
+  retrieval.py RetrievalBackend seam: HashingBackend (stdlib bag-of-words)
   loop.py      orchestration state machine + human decisions + mid-run control
   eval.py      validator calibration harness (fixtures + agreement/confusion/
                calibration report)
@@ -37,7 +37,7 @@ tests/         148 tests on MockRunner + real subprocesses (no API keys needed)
 ## Quick start
 
 ```bash
-pip install -e ".[dev]"          # + ".[claude]" runner, + ".[rag]" vector index
+pip install -e ".[dev]"          # + ".[claude]" for the real runner
 pytest -q                        # verify the loop
 
 agentloop add "Add slugify util" \
@@ -115,30 +115,28 @@ the task** — title, goal, criteria, plus the validator feedback (or the output
 under review) that makes a revision retrieve differently from a first attempt.
 
 Ranking sits behind the `RetrievalBackend` seam in `retrieval.py`, the same
-shape as the `ModelRunner` seam:
+shape as the `ModelRunner` seam.
 
-- **`HashingBackend`** (default, stdlib): hashed bag-of-words vectors and
-  cosine similarity. Matches on shared vocabulary rather than paraphrase —
-  that's the price of zero dependencies, and it still beats the alphabet.
-- **`ChromaBackend`** (`pip install agentloop[rag]`, then
-  `memory_retrieval_backend: "chroma"`): Chroma supplies the *index*, never the
-  embeddings. The same `embed()` runs on both sides, so the extra is an index
-  swap rather than a change of meaning — identical ordering down to the
-  tie-break — no model is ever downloaded, and retrieval keeps working with no
-  network.
+One backend ships: **`HashingBackend`** (the default, stdlib only) — hashed
+bag-of-words vectors and cosine similarity, brute-forced over the candidates.
+It matches on shared vocabulary rather than paraphrase; that's the price of
+zero dependencies, and it still beats the alphabet.
 
-Selecting the backend is deliberately explicit rather than "whatever is
-installed": both return the same order at the fact counts this store holds, so
-`auto` would only mean an unrelated `pip install` silently changed a run and
-started writing an index to disk. Reach for `chroma` when brute-force scoring
-over every approved fact becomes the bottleneck.
+The seam is the point, not the backend count. A real embedding model is a
+drop-in `search()`, and that is the change to make the day ranking needs to
+understand paraphrase. A Chroma-index backend shipped here briefly and was
+removed: it embedded with the same `embed()` as the stdlib backend, so it
+returned the same order at any fact count this store holds — an optional,
+CI-untested dependency buying nothing. An unknown backend name now raises
+rather than degrading to a working default: which ranking ran is part of how a
+run behaved.
 
 Ranking decides *order*; it never widens what may be injected. The candidate
 set is what `approved` already allowed through, so no backend — local, remote,
-or not yet written — can surface an unvetted fact, and the Chroma collection is
-a derived cache that can only re-rank rows the store just handed it, never
-resurrect a revoked one. The caps, the pinned ceiling, `hit_count` bumping and
-project→loop promotion are all unchanged. With no query, or
+or not yet written — can surface an unvetted fact; any future index is a
+derived cache that may only re-rank rows the store just handed it, never
+resurrect a revoked one. The caps, the pinned ceiling and project→loop
+promotion are all unchanged. With no query, or
 `memory_retrieval_backend: "none"`, selection falls back to exactly the old
 alphabetical behaviour — there is nothing to rank against, so inventing an
 order would be worse than the plain one.
@@ -255,9 +253,9 @@ Anthropic credentials.
 - [x] Mid-run human control: pause / resume / abort, cross-process
 - [x] Pinned memory facts that bypass the injection cap
 - [x] Context-budget handoff (summarize + fresh worker at ≥70% of the budget)
-- [x] RAG store (Chroma) behind the memory tables, with a stdlib fallback
-- [x] Retrieval / tool-call provenance events (with the RAG work that needs
-      them)
+- [x] Relevance retrieval behind the memory tables (stdlib `RetrievalBackend`)
+- [x] Retrieval / tool-call provenance events, attributed to the attempt and
+      agent that used them
 - [ ] Planner agent + task graph; parallel workers
 - [ ] Second-provider cross-validator
 - [ ] Agent-requested tools with an auto-approval policy

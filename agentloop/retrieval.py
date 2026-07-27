@@ -7,22 +7,23 @@ answers the current task can be crowded out by irrelevant ones that happen to
 sort earlier. This module ranks them by relevance to a query instead.
 
 It mirrors `runner.ModelRunner`: the loop and `MemoryService` talk to a
-protocol, never to a vector database. Two backends ship:
+protocol, never to a retrieval engine. One backend ships — `HashingBackend`,
+stdlib only: hashed bag-of-words vectors and cosine similarity, brute-forced
+over the candidate set. It matches on shared vocabulary, not paraphrase; that is
+the price of zero dependencies, and it is still far better than alphabetical.
 
-- `HashingBackend` (default) — stdlib only. Hashed bag-of-words vectors and
-  cosine similarity, brute-forced over the candidate set. Matches on shared
-  vocabulary, not paraphrase; that is the price of zero dependencies, and it is
-  still far better than alphabetical.
-- `ChromaBackend` — `pip install agentloop[rag]`. Chroma supplies the *index*,
-  never the embeddings: `embed` below is used for both backends, so installing
-  the extra is an index swap rather than a change of meaning, and no model is
-  ever downloaded (retrieval keeps working with no network).
+The seam is the point, not the backend count. A real embedding model (or a
+vector index in front of one) is a drop-in `search()`, and the day the ranking
+needs to understand paraphrase, that is the change to make. A Chroma backend
+shipped here briefly and was removed: it embedded with the same `embed()` as the
+stdlib backend, so it returned the same order at any fact count this store
+holds — an optional, CI-untested dependency buying nothing but a tie-break bug.
 
 **The approval gate does not live here.** Callers pass in candidates already
 filtered by `approved`, so no backend — present or future, local or remote — can
-surface an unvetted fact. Likewise the Chroma collection is a *derived cache*,
-rebuildable from SQLite at any time: it can only ever re-rank rows the store
-already handed over, never resurrect a revoked one.
+surface an unvetted fact. A future index must keep that property: it may only
+re-rank rows the store just handed over, never resurrect a revoked one, which is
+what makes any such index a derived cache rather than a second source of truth.
 """
 
 from __future__ import annotations
@@ -127,125 +128,22 @@ class HashingBackend:
         return rank_exact(query, candidates, top_k)
 
 
-def _import_chromadb():
-    """Import chromadb, or None when the optional extra isn't installed.
-
-    Split out so tests can simulate the dependency being absent without
-    uninstalling it.
-    """
-    try:
-        import chromadb  # noqa: PLC0415 - optional extra, imported on demand
-    except ImportError:
-        return None
-    return chromadb
-
-
-class ChromaBackend:
-    """Vector-index backend (`pip install agentloop[rag]`).
-
-    Chroma narrows the candidate set; the exact score and the final ordering are
-    still computed here with `rank_exact`, so ranking is identical to the
-    stdlib backend and stays deterministic down to the tie-break. Chroma is
-    doing the job an index should do — making 'find the best k of many' cheap —
-    and nothing that would make it authoritative.
-    """
-
-    name = "chroma"
-    _COLLECTION = "agentloop_memory"
-
-    def __init__(self, path: str = ".agentloop/chroma"):
-        self.path = path
-        self._client = None
-        self._coll = None
-        # id -> content fingerprint, so an unchanged fact isn't re-upserted.
-        self._synced: dict[int, str] = {}
-
-    def _collection(self):
-        if self._coll is None:
-            chromadb = _import_chromadb()
-            if chromadb is None:  # pragma: no cover - guarded by get_backend
-                raise RuntimeError(
-                    "ChromaBackend requires `pip install agentloop[rag]`"
-                )
-            self._client = chromadb.PersistentClient(path=self.path)
-            self._coll = self._client.get_or_create_collection(name=self._COLLECTION)
-        return self._coll
-
-    def _sync(self, coll, candidates: list[dict]) -> None:
-        """Push changed facts into the index. The index trails the store; it is
-        never read as truth, so a partial sync degrades recall, not correctness.
-        """
-        ids, embeddings, documents = [], [], []
-        for c in candidates:
-            text = _fact_text(c)
-            fingerprint = hashlib.blake2b(
-                text.encode("utf-8"), digest_size=16
-            ).hexdigest()
-            if self._synced.get(int(c["id"])) == fingerprint:
-                continue
-            ids.append(str(c["id"]))
-            embeddings.append(embed(text))
-            documents.append(text)
-            self._synced[int(c["id"])] = fingerprint
-        if ids:
-            coll.upsert(ids=ids, embeddings=embeddings, documents=documents)
-
-    def search(
-        self, query: str, candidates: list[dict], top_k: int
-    ) -> list[tuple[int, float]]:
-        if not candidates or top_k <= 0:
-            return []
-        coll = self._collection()
-        self._sync(coll, candidates)
-        allowed = {int(c["id"]) for c in candidates}
-        try:
-            result = coll.query(
-                query_embeddings=[embed(query)],
-                n_results=min(len(candidates), max(top_k * 3, top_k)),
-            )
-            hits = {int(i) for i in (result.get("ids") or [[]])[0]}
-        except Exception:  # index trouble must not break a prompt
-            hits = set()
-        # Only ids the store just approved survive, and if the index returned
-        # too few we score the authoritative set directly rather than injecting
-        # a thinner prompt because a cache was cold.
-        #
-        # The subset is rebuilt in *candidate* order, never in the order the
-        # index returned: `rank_exact`'s stable sort makes the caller's order
-        # the tie-break between equally relevant facts, so taking Chroma's
-        # ordering here would silently break the tier tie-break that the stdlib
-        # backend applies — the same query would rank differently purely because
-        # an optional package was installed.
-        subset = [c for c in candidates if int(c["id"]) in (hits & allowed)]
-        if len(subset) < min(top_k, len(candidates)):
-            subset = candidates
-        return rank_exact(query, subset, top_k)
-
-
 def get_backend(name: str = "hash", config=None) -> RetrievalBackend | None:
     """Resolve a `memory_retrieval_backend` setting to a backend.
 
-    `auto` prefers Chroma when the extra is installed and falls back silently;
-    an explicit `chroma` that cannot be honoured warns, because a operator who
-    asked for it should learn that they are not getting it. `none` disables
-    ranking and restores the pre-slice-2 alphabetical selection.
+    `hash` is the stdlib ranking; `none` disables ranking entirely and restores
+    the pre-slice-2 alphabetical selection. Anything else raises: a name this
+    build does not implement is a misconfiguration, and silently substituting a
+    different ranking is how a run's behaviour changes without anyone noticing.
+
+    `config` is unused today and kept deliberately — it is where a backend that
+    needs settings (an endpoint, a model name, an index path) reads them, so
+    adding one does not change every call site.
     """
-    path = getattr(config, "memory_chroma_path", ".agentloop/chroma")
     if name == "none":
         return None
     if name == "hash":
         return HashingBackend()
-    if name in ("auto", "chroma"):
-        if _import_chromadb() is not None:
-            return ChromaBackend(path=path)
-        if name == "chroma":
-            print(
-                "warning: memory_retrieval_backend='chroma' but chromadb is not "
-                "installed (`pip install agentloop[rag]`); using the stdlib "
-                "hashing backend instead"
-            )
-        return HashingBackend()
     raise ValueError(
-        f"Unknown memory_retrieval_backend: {name!r} "
-        "(expected 'auto', 'hash', 'chroma' or 'none')"
+        f"Unknown memory_retrieval_backend: {name!r} (expected 'hash' or 'none')"
     )
