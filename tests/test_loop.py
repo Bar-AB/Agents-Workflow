@@ -357,3 +357,89 @@ def test_worker_is_told_where_its_workspace_is(store):
     loop, runner = make_loop(store, ["out", APPROVE])
     loop.run_task(task)
     assert "task-1" in runner.calls[0]["prompt"]
+
+
+# -- context-budget handoff (Slice 1) ----------------------------------------
+
+
+def _small_worker_budget_registry(worker_budget: int) -> Registry:
+    """Registry whose worker has a tiny context budget so a single revision's
+    accumulated spend trips the handoff threshold. Keeps the summarizer role."""
+    from agentloop.models import AgentSpec
+    from agentloop.registry import DEFAULT_AGENTS
+
+    agents = dict(DEFAULT_AGENTS)
+    w = agents["worker"]
+    agents["worker"] = AgentSpec(
+        role=w.role,
+        model=w.model,
+        system_prompt=w.system_prompt,
+        tools=list(w.tools),
+        context_budget_tokens=worker_budget,
+        version=w.version,
+    )
+    return Registry(agents)
+
+
+HANDOFF_SUMMARY = "SUMMARY: prior work compacted for a fresh worker instance."
+
+
+def test_context_budget_handoff_compacts_and_completes(store, tmp_path):
+    """Once the worker's accumulated context passes context_handoff_ratio of its
+    budget, the loop summarizes the state and restarts the worker with the
+    summary in place of the raw transcript, and the task still completes."""
+    task = add_task(store)
+    registry = _small_worker_budget_registry(worker_budget=40)
+    config = LoopConfig(
+        db_path=store.db_path,
+        workspace_root=str(tmp_path / "ws"),
+        allow_test_exec=False,
+    )
+    runner = MockRunner(
+        [
+            "worker1 raw output that must not reappear verbatim",
+            REVISE,
+            HANDOFF_SUMMARY,  # the summarizer's compacted state
+            "worker2 output fixed",
+            APPROVE,
+        ]
+    )
+    loop = Loop(store, runner, registry, config)
+    loop.run_task(task)
+
+    assert task.status == TaskStatus.DONE
+    # A handoff is not a revision: it must not consume the revision budget.
+    assert task.revision_count == 1
+
+    # 1. the handoff event fired, before/after token counts recorded, and the
+    #    compaction actually shrank the context.
+    handoffs = [e for e in store.events(task.id) if e["kind"] == "context_handoff"]
+    assert handoffs, "a context_handoff event must fire once the budget is tripped"
+    payload = handoffs[0]["payload"]
+    assert payload["before_tokens"] > payload["after_tokens"]
+
+    # 2. the summarizer was handed the real prior work + validator feedback.
+    summarizer_prompt = runner.calls[2]["prompt"]
+    assert "worker1 raw output" in summarizer_prompt
+    assert "empty input" in summarizer_prompt  # the REVISE feedback
+
+    # 3. the fresh worker prompt carried the SUMMARY, not the raw transcript.
+    fresh_worker_prompt = runner.calls[3]["prompt"]
+    assert "prior work compacted" in fresh_worker_prompt
+    assert "worker1 raw output" not in fresh_worker_prompt
+
+
+def test_no_handoff_when_context_stays_under_budget(store, tmp_path):
+    """Below the threshold, no summarizer call is made and no handoff event is
+    logged — the feature is inert on ordinary small tasks."""
+    task = add_task(store)
+    # Default worker budget (120k) is far above anything a mock run accumulates.
+    loop, runner = make_loop(store, ["v1", REVISE, "v2 output", APPROVE])
+    loop.run_task(task)
+
+    assert task.status == TaskStatus.DONE
+    assert not [e for e in store.events(task.id) if e["kind"] == "context_handoff"]
+    # Exactly worker, validator, worker, validator — no summarizer slipped in.
+    assert len(runner.calls) == 4
+    # The ordinary revision path still carried the raw feedback, not a summary.
+    assert "empty input" in runner.calls[2]["prompt"]

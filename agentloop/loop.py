@@ -10,6 +10,13 @@ Decision rules per validation round:
 - otherwise                             -> revise, bounded by max_revisions;
                                            exhausted retries -> needs_human
 - budget cap exceeded at any point      -> needs_human (never burn unbounded)
+- worker context >= context_handoff_     -> summarize the working state and
+  ratio of its AgentSpec budget              restart the worker from that summary
+                                             in place of the raw transcript
+                                             (a `context_handoff` event). Checked
+                                             at the boundary like the budget cap;
+                                             NOT a revision and not counted
+                                             against max_revisions.
 - transient infra failure (runner /     -> retried with backoff; if it persists
   executor raises)                         -> needs_human with an infra_error
                                            reason. Distinct from a revise
@@ -29,7 +36,7 @@ from __future__ import annotations
 
 import time
 
-from .agents import run_validator, run_worker
+from .agents import run_summarizer, run_validator, run_worker
 from .config import LoopConfig
 from .executor import TestExecutor, clear_workspace, workspace_for
 from .memory import MemoryService
@@ -99,6 +106,11 @@ class Loop:
     def run_task(self, task: Task) -> Task:
         feedback = ""
         test_result = TestResult()
+        # Worker context consumed as of the last handoff. Measured, not reset in
+        # the store, so it stays an in-loop local: a post-crash restart simply
+        # re-measures from 0 and does one safe handoff at the first boundary if
+        # the accumulated context already exceeds the threshold.
+        handoff_watermark = 0
         while True:
             # Human control is read fresh from the store at each iteration
             # boundary, so a pause/abort set from another process (CLI or
@@ -113,6 +125,17 @@ class Loop:
             # to NEEDS_HUMAN rather than crashing the whole batch. This is not a
             # "revise": infra failure is not a task-quality failure.
             try:
+                # Context-budget handoff (slice 1): when the worker's accumulated
+                # context on this task passes context_handoff_ratio of its
+                # AgentSpec budget, compact the working state and restart the
+                # worker from that summary instead of the raw transcript. Checked
+                # at the boundary alongside the budget cap; not a revision.
+                handoff_summary = self._maybe_handoff(
+                    task, feedback, test_result, handoff_watermark
+                )
+                if handoff_summary is not None:
+                    handoff_watermark = self.store.attempt_tokens(task.id, "worker")
+
                 # Worker self-checks in its own output (spec §4.2–4.3).
                 self.store.set_status(task, TaskStatus.IN_PROGRESS)
                 ws = workspace_for(self.config.workspace_root, task.id, create=True)
@@ -128,6 +151,7 @@ class Loop:
                         memory=self.memory,
                         workspace=str(ws),
                         test_result=test_result,
+                        handoff_summary=handoff_summary,
                     ),
                 )
                 if result.output.strip().upper().startswith("ESCALATE:"):
@@ -367,6 +391,48 @@ class Loop:
                 delay = self.config.infra_retry_backoff_s * (2 ** (attempts - 1))
                 if delay > 0:
                     time.sleep(delay)
+
+    def _maybe_handoff(
+        self, task: Task, feedback: str, test_result: TestResult, watermark: int
+    ) -> str | None:
+        """Context-budget handoff (slice 1). If the worker's accumulated context
+        since the last handoff has reached `context_handoff_ratio` of its
+        AgentSpec budget, summarize the working state and return the summary for
+        the next worker call to use in place of the raw transcript; else None.
+
+        The summarization is a bounded-retried ModelRunner call (so a transient
+        failure escalates like any other infra error, and it works under
+        MockRunner). It is recorded as its own attempt, not counted against
+        max_revisions — a handoff is not a task-quality revision."""
+        spec = self.registry.get(task.worker_role)
+        used = self.store.attempt_tokens(task.id, "worker") - watermark
+        threshold = self.config.context_handoff_ratio * spec.context_budget_tokens
+        if used < threshold:
+            return None
+        summary = self._with_retry(
+            task,
+            "summarizer",
+            lambda: run_summarizer(
+                self.store,
+                self.runner,
+                self.registry,
+                task,
+                feedback,
+                test_result,
+            ),
+        )
+        self.store.log_event(
+            task.id,
+            "context_handoff",
+            {
+                "role": task.worker_role,
+                "before_tokens": used,
+                "after_tokens": summary.tokens_out,
+                "budget_tokens": spec.context_budget_tokens,
+                "ratio": self.config.context_handoff_ratio,
+            },
+        )
+        return summary.output
 
     def _budget_tripped(self, task: Task) -> bool:
         tokens, cost = self.store.task_spend(task.id)

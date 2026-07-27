@@ -38,6 +38,22 @@ VERDICT: <approve|revise|escalate> CONFIDENCE: <0.00-1.00> TESTS: <pass|fail|na>
 - CONFIDENCE is your agreement/confidence score that the output satisfies the
   criteria."""
 
+SUMMARIZER_SYSTEM = """You are a summarizer agent in an agentic development
+loop. A worker's accumulated context has grown large, so it is being handed off
+to a fresh worker instance. Compress the working state so the fresh worker can
+continue with no loss of what matters.
+
+Produce a faithful, compact summary that preserves:
+- the task goal and acceptance criteria (restate the essentials);
+- what has been done so far and the current state of the output;
+- the latest validator feedback and exactly what still needs to change;
+- any decisions, constraints, or dead ends already established.
+
+Rules:
+- Do NOT invent progress or facts not present in the material you were given.
+- Be terse; this replaces a full transcript, so every token must earn its place.
+- Output only the summary — no preamble."""
+
 DEFAULT_AGENTS: dict[str, AgentSpec] = {
     "worker": AgentSpec(
         role="worker",
@@ -55,6 +71,20 @@ DEFAULT_AGENTS: dict[str, AgentSpec] = {
         context_budget_tokens=60_000,
         version="1",
     ),
+    "summarizer": AgentSpec(
+        role="summarizer",
+        # Mid-tier by default. The summary *replaces the raw transcript*, so a
+        # dropped detail (a specific test failure, a subtle validator note) makes
+        # the fresh worker regress or repeat a dead end — and a handoff only fires
+        # on long, budget-heavy tasks, so the cost delta vs. a cheap tier is
+        # negligible against the task total. Drop to a cheaper tier (e.g.
+        # claude-haiku-4-5) in agents.json for simple tasks.
+        model="claude-sonnet-5",
+        system_prompt=SUMMARIZER_SYSTEM,
+        tools=[],  # reads and writes text only; no tools
+        context_budget_tokens=60_000,
+        version="1",
+    ),
 }
 
 
@@ -68,7 +98,7 @@ class Registry:
         return self.agents[role]
 
     @classmethod
-    def load(cls, path: str | Path | None = None) -> "Registry":
+    def load(cls, path: str | Path | None = None) -> Registry:
         if path and Path(path).exists():
             # utf-8-sig: agents.json is hand-edited, often on Windows.
             raw = json.loads(Path(path).read_text(encoding="utf-8-sig"))
