@@ -3,13 +3,16 @@
 The store owns the tables; this owns the policy:
 
 - Reads are gated on `approved`. A fact nobody vetted never reaches a prompt,
-  because a bad fact entering memory quietly poisons every later task.
+  because a bad fact entering memory quietly poisons every later task. The gate
+  is on the *value*: changing the content of an approved key revokes it (see
+  `Store.memory_write`), so a rewrite cannot inherit someone else's approval.
 - Writes from agents land unapproved, and surface in the dashboard for a human
   to accept or drop — memory writes are auditable by construction, since every
   one lands in the append-only events log.
-- A `project` fact read `promote_threshold` times is promoted to the `loop`
-  tier: repeatedly re-answering the same question is exactly the wasted token
-  spend the tiering exists to remove.
+- A `project` fact that is relevant to `promote_threshold` tasks is promoted to
+  the `loop` tier: repeatedly re-answering the same question is exactly the
+  wasted token spend the tiering exists to remove. Relevance, not injection —
+  see `_record_reads`.
 
 Selection is ranked by relevance to the calling task when a query is supplied,
 through the `retrieval.RetrievalBackend` seam — a vector store slots in behind

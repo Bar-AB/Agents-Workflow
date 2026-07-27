@@ -31,7 +31,7 @@ agentloop/
   cli.py       add / run / status / approve / reject / redo / pause / resume /
                abort / events / serve / memory / eval
 web/           Vite + React + TypeScript dashboard
-tests/         148 tests on MockRunner + real subprocesses (no API keys needed)
+tests/         149 tests on MockRunner + real subprocesses (no API keys needed)
 ```
 
 ## Quick start
