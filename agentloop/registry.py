@@ -73,9 +73,13 @@ DEFAULT_AGENTS: dict[str, AgentSpec] = {
     ),
     "summarizer": AgentSpec(
         role="summarizer",
-        # A cheap tier: compacting known text is easy work relative to the
-        # worker's, so it need not run on the worker's model.
-        model="claude-haiku-4-5",
+        # Mid-tier by default. The summary *replaces the raw transcript*, so a
+        # dropped detail (a specific test failure, a subtle validator note) makes
+        # the fresh worker regress or repeat a dead end — and a handoff only fires
+        # on long, budget-heavy tasks, so the cost delta vs. a cheap tier is
+        # negligible against the task total. Drop to a cheaper tier (e.g.
+        # claude-haiku-4-5) in agents.json for simple tasks.
+        model="claude-sonnet-5",
         system_prompt=SUMMARIZER_SYSTEM,
         tools=[],  # reads and writes text only; no tools
         context_budget_tokens=60_000,
@@ -94,7 +98,7 @@ class Registry:
         return self.agents[role]
 
     @classmethod
-    def load(cls, path: str | Path | None = None) -> "Registry":
+    def load(cls, path: str | Path | None = None) -> Registry:
         if path and Path(path).exists():
             # utf-8-sig: agents.json is hand-edited, often on Windows.
             raw = json.loads(Path(path).read_text(encoding="utf-8-sig"))

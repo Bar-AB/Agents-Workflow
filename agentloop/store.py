@@ -154,7 +154,7 @@ class _LockedConnection:
         # state change and its audit event land together or not at all.
         self._txn_depth = 0
 
-    def execute(self, sql: str, params: tuple = ()) -> "_LockedCursor":
+    def execute(self, sql: str, params: tuple = ()) -> _LockedCursor:
         with self._lock:
             cur = self._conn.execute(sql, params)
             # Materialize under the lock: rows read later, off-lock, would

@@ -81,7 +81,7 @@ class LoopConfig:
         return json.dumps(asdict(self), indent=2)
 
     @classmethod
-    def load(cls, path: str | Path | None = None) -> "LoopConfig":
+    def load(cls, path: str | Path | None = None) -> LoopConfig:
         """Load from a JSON file if it exists, else defaults.
 
         Read as utf-8-sig: Windows editors (Notepad, PowerShell's Out-File)
