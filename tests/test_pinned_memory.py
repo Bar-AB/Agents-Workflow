@@ -24,7 +24,7 @@ def test_pinned_fact_survives_past_the_cap_while_unpinned_drops(store):
     store.memory_write("project", "zzz_unpinned", "should drop", approved=True)
     store.memory_write("project", "zzz_pinned", "must stay", approved=True, pinned=True)
 
-    block = MemoryService(store).facts_for_prompt()
+    block, _ = MemoryService(store).facts_for_prompt()
     assert "must stay" in block  # pinned survived
     assert "should drop" not in block  # unpinned past the cap dropped
 
@@ -34,7 +34,7 @@ def test_pinned_facts_come_first(store):
     store.memory_write(
         "project", "zzz", "last-alphabetically", approved=True, pinned=True
     )
-    block = MemoryService(store).facts_for_prompt()
+    block, _ = MemoryService(store).facts_for_prompt()
     lines = block.splitlines()
     # The pinned fact leads despite sorting last alphabetically.
     assert "zzz" in lines[0]
@@ -44,7 +44,7 @@ def test_pinned_facts_come_first(store):
 def test_pinning_still_requires_approval_to_be_read(store):
     # Pinned but NOT approved: gating still holds — it must not reach a prompt.
     store.memory_write("project", "secret", "unvetted", pinned=True)
-    block = MemoryService(store).facts_for_prompt()
+    block, _ = MemoryService(store).facts_for_prompt()
     assert "unvetted" not in block
 
 
@@ -55,7 +55,7 @@ def test_pinned_ceiling_is_bounded(store):
         store.memory_write(
             "loop", f"pin_{i:03d}", f"pinned {i}", approved=True, pinned=True
         )
-    block = MemoryService(store).facts_for_prompt()
+    block, _ = MemoryService(store).facts_for_prompt()
     injected = [ln for ln in block.splitlines() if "*" in ln]
     assert len(injected) == _MAX_PINNED_FACTS
 

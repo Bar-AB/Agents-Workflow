@@ -1,4 +1,4 @@
-import type { EventRow } from '../types'
+import type { EventRow, RetrievalPayload } from '../types'
 
 function clock(ts: number): string {
   return new Date(ts * 1000).toLocaleTimeString(undefined, { hour12: false })
@@ -29,12 +29,15 @@ function digest(ev: EventRow): string {
     case 'memory_unpinned':
       return `${p.tier}/${p.key}`
     case 'retrieval': {
-      // Provenance: which facts memory put in front of the agent, best first.
-      const top = (p.facts ?? [])
+      // Provenance: which facts memory put in front of which agent, best first.
+      // A task retrieves once per agent per round, so the agent is what makes
+      // the rows tellable apart.
+      const r = ev.payload as unknown as RetrievalPayload
+      const top = (r.facts ?? [])
         .slice(0, 3)
-        .map((f: any) => `${f.key} ${Number(f.score).toFixed(2)}`)
+        .map((f) => `${f.key} ${Number(f.score).toFixed(2)}`)
         .join(', ')
-      return `${p.backend}: ${p.n_selected}/${p.n_candidates} facts — ${top}`
+      return `${r.agent_kind} · ${r.backend}: ${r.n_selected}/${r.n_candidates} facts — ${top}`
     }
     case 'tool_call':
       return `${p.agent_kind} · ${p.tool}`

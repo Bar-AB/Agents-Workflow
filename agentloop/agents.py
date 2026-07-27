@@ -34,6 +34,7 @@ def _invoke(
     system: str,
     prompt: str,
     tools: list[str] | None = None,
+    retrieval: dict | None = None,
 ) -> tuple[RunResult, int]:
     """Run one agent invocation with full attempt/metrics bookkeeping."""
     # The model call sits deliberately *between* two transactions, never inside
@@ -41,6 +42,22 @@ def _invoke(
     # write (attempt row + its audit event) is atomic on its own.
     with store.transaction():
         attempt_id = store.start_attempt(task.id, kind, role, model)
+        # Which facts memory put in front of *this* agent on *this* round. It
+        # goes in the opening transaction rather than the closing one because
+        # the retrieval already happened — it built the prompt below — so a
+        # failed model call must not lose the record of what was injected.
+        # `tool_call` is its mirror image: those only exist once the run is over.
+        if retrieval is not None:
+            store.log_event(
+                task.id,
+                "retrieval",
+                {
+                    "attempt_id": attempt_id,
+                    "agent_kind": kind,
+                    "role": role,
+                    **retrieval,
+                },
+            )
         store.log_event(
             task.id,
             f"{kind}_prompt",
@@ -97,17 +114,22 @@ def _invoke(
 
 
 def _memory_block(
-    memory: MemoryService | None, query: str = "", task_id: int | None = None
-) -> str:
+    memory: MemoryService | None, query: str = ""
+) -> tuple[str, dict | None]:
     """Approved facts only — unvetted memory never reaches a prompt.
 
     `query` is what the facts are ranked against: the task the agent is about to
     work on. Passing it is what turns memory injection from "the first 20 facts
-    alphabetically" into "the 20 facts about this task"."""
+    alphabetically" into "the 20 facts about this task".
+
+    Returns the block and its provenance, which the caller hands to `_invoke` so
+    the retrieval is recorded against the attempt it fed. An unranked selection
+    (no query, or ranking disabled) has no provenance and logs nothing."""
     if memory is None:
-        return ""
-    facts = memory.facts_for_prompt(query=query, task_id=task_id)
-    return f"\n## Known project facts\n{facts}\n" if facts else ""
+        return "", None
+    facts, provenance = memory.facts_for_prompt(query=query)
+    block = f"\n## Known project facts\n{facts}\n" if facts else ""
+    return block, provenance
 
 
 def _retrieval_query(task: Task, extra: str = "") -> str:
@@ -151,7 +173,8 @@ def run_worker(
         f"## Goal\n{task.goal}\n\n"
         f"## Acceptance criteria\n{task.acceptance_criteria}\n"
     )
-    prompt += _memory_block(memory, _retrieval_query(task, feedback), task.id)
+    memory_block, retrieval = _memory_block(memory, _retrieval_query(task, feedback))
+    prompt += memory_block
     if workspace:
         prompt += (
             f"\n## Workspace\nWrite your files and tests under `{workspace}`. "
@@ -187,6 +210,7 @@ def run_worker(
         spec.system_prompt,
         prompt,
         spec.tools,
+        retrieval,
     )
     return result
 
@@ -253,7 +277,10 @@ def run_validator(
         f"## Acceptance criteria\n{task.acceptance_criteria}\n\n"
         f"## Worker output\n{worker_output}\n"
     )
-    prompt += _memory_block(memory, _retrieval_query(task, worker_output), task.id)
+    memory_block, retrieval = _memory_block(
+        memory, _retrieval_query(task, worker_output)
+    )
+    prompt += memory_block
     prompt += _test_block(test_result)
     result, attempt_id = _invoke(
         store,
@@ -265,6 +292,7 @@ def run_validator(
         spec.system_prompt,
         prompt,
         spec.tools,
+        retrieval,
     )
     return parse_verdict(result.output), attempt_id
 

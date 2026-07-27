@@ -150,7 +150,11 @@ so a bad answer couldn't be traced to the fact that caused it. Two event kinds
 close that:
 
 - **`retrieval`** — query, backend, candidate count, and every injected fact
-  with its id, tier, pin state and score.
+  with its id, tier, pin state and score, attributed to the attempt that used
+  them (`attempt_id`, `agent_kind`, `role`). A task retrieves once per agent per
+  round and the worker and validator rank against different queries, so without
+  that attribution the rows are indistinguishable — and `events` is append-only,
+  so there is no backfilling the ones already written.
 - **`tool_call`** — one row per tool an agent actually invoked (registry tools
   already reach the SDK, so this was happening unrecorded), attributed to the
   attempt that made it. Slice 5's auto-approval policy layers on this record

@@ -20,19 +20,19 @@ def memory(store):
 
 def test_unapproved_facts_never_reach_a_prompt(store, memory):
     memory.remember("project", "sketchy", "possibly wrong")
-    assert "sketchy" not in memory.facts_for_prompt()
+    assert "sketchy" not in memory.facts_for_prompt()[0]
 
 
 def test_approved_facts_reach_the_prompt(store, memory):
     memory.remember("project", "test_command", "pytest -q", approved=True)
-    block = memory.facts_for_prompt()
+    block, _ = memory.facts_for_prompt()
     assert "test_command" in block and "pytest -q" in block
 
 
 def test_loop_facts_are_listed_before_project_facts(store, memory):
     memory.remember("project", "aaa_local", "local", approved=True)
     memory.remember("loop", "zzz_global", "global", approved=True)
-    block = memory.facts_for_prompt()
+    block, _ = memory.facts_for_prompt()
     assert block.index("zzz_global") < block.index("aaa_local")
 
 
@@ -97,7 +97,7 @@ def test_gating_helpers_drive_the_dashboard(store, memory):
     assert row["approved"] == 0
 
     store.memory_set_approved(row["id"], True)
-    assert "candidate" in memory.facts_for_prompt()
+    assert "candidate" in memory.facts_for_prompt()[0]
 
     store.memory_delete(row["id"])
     assert store.memory_list() == []

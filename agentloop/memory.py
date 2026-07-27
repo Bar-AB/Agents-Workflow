@@ -52,9 +52,8 @@ class MemoryService:
         limit: int = _MAX_FACTS_IN_PROMPT,
         pinned_limit: int = _MAX_PINNED_FACTS,
         query: str = "",
-        task_id: int | None = None,
-    ) -> str:
-        """Approved facts as a prompt block.
+    ) -> tuple[str, dict | None]:
+        """Approved facts as a prompt block, plus the provenance of that block.
 
         Ordering: pinned facts first (they bypass the main cap under their own
         ceiling), then the rest. Within each group, `query` decides — the facts
@@ -66,7 +65,12 @@ class MemoryService:
         The caps and the approval gate are unchanged by ranking: relevance only
         decides order, so a fact that fits under the cap is never dropped for
         scoring low, and an unapproved fact is never a candidate however well it
-        matches."""
+        matches.
+
+        The provenance dict (None when nothing was ranked) is *returned* rather
+        than logged here: a retrieval is only meaningful as part of the agent
+        invocation it fed, and this service does not know which attempt that is.
+        The caller logs it against that attempt — see `agents._invoke`."""
         approved = list(self.store.memory_list(approved_only=True))
         order = lambda r: (0 if r["tier"] == "loop" else 1, r["key"])
         pinned = sorted((r for r in approved if r["pinned"]), key=order)
@@ -81,16 +85,17 @@ class MemoryService:
         else:
             rows = pinned[:pinned_limit] + unpinned[:limit]
         if not rows:
-            return ""
+            return "", None
         lines = [
             f"- ({r['tier']}){' *' if r['pinned'] else ''} {r['key']}: "
             f"{r['value'][:_MAX_VALUE_CHARS]}"
             for r in rows
         ]
-        if ranked:
-            self._log_retrieval(task_id, query, rows, scores, len(approved))
+        provenance = (
+            self._provenance(query, rows, scores, len(approved)) if ranked else None
+        )
         self._record_reads(rows)
-        return "\n".join(lines)
+        return "\n".join(lines), provenance
 
     def _rank(
         self, query: str, rows: list[dict], top_k: int, scores: dict[int, float]
@@ -108,39 +113,34 @@ class MemoryService:
             ordered.append(row)
         return ordered
 
-    def _log_retrieval(
+    def _provenance(
         self,
-        task_id: int | None,
         query: str,
         rows: list[dict],
         scores: dict[int, float],
         n_candidates: int,
-    ) -> None:
-        """Provenance for what memory put in front of an agent, and why.
+    ) -> dict:
+        """What memory put in front of an agent, and why.
 
         The audit log already records what entered memory; without this it never
         recorded what was *read out of* it, so a bad answer could not be traced
         back to the fact that caused it."""
-        self.store.log_event(
-            task_id,
-            "retrieval",
-            {
-                "query": query[:_MAX_QUERY_CHARS],
-                "backend": getattr(self.backend, "name", type(self.backend).__name__),
-                "n_candidates": n_candidates,
-                "n_selected": len(rows),
-                "facts": [
-                    {
-                        "id": int(r["id"]),
-                        "tier": r["tier"],
-                        "key": r["key"],
-                        "pinned": bool(r["pinned"]),
-                        "score": round(scores.get(int(r["id"]), 0.0), 4),
-                    }
-                    for r in rows
-                ],
-            },
-        )
+        return {
+            "query": query[:_MAX_QUERY_CHARS],
+            "backend": getattr(self.backend, "name", type(self.backend).__name__),
+            "n_candidates": n_candidates,
+            "n_selected": len(rows),
+            "facts": [
+                {
+                    "id": int(r["id"]),
+                    "tier": r["tier"],
+                    "key": r["key"],
+                    "pinned": bool(r["pinned"]),
+                    "score": round(scores.get(int(r["id"]), 0.0), 4),
+                }
+                for r in rows
+            ],
+        }
 
     def read(self, tier: str, key: str) -> str | None:
         value = self.store.memory_read(tier, key, approved_only=True)

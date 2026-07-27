@@ -242,6 +242,64 @@ def test_retrieval_can_be_disabled_without_losing_memory_injection(store):
     assert [e for e in store.events(task.id) if e["kind"] == "retrieval"] == []
 
 
+def test_retrieval_is_attributed_to_the_attempt_that_used_the_facts(store):
+    """One task retrieves once per agent per round. Without attempt_id and
+    agent_kind those events are indistinguishable from each other, which is
+    exactly what makes provenance useless — and `events` is append-only, so
+    there is no backfill for the ones already written."""
+    store.memory_write("project", "slugify_rule", "slugify uses hyphens", approved=True)
+    task = add_task(store)
+    loop, _ = make_loop(
+        store,
+        ["first output", REVISE, "second output", APPROVE],
+        memory_retrieval_backend="hash",
+    )
+    loop.run_task(task)
+
+    kinds = {
+        r["id"]: r["kind"]
+        for r in store._conn.execute(
+            "SELECT id, kind FROM attempts WHERE task_id=? ORDER BY id", (task.id,)
+        ).fetchall()
+    }
+    retrievals = [e for e in store.events(task.id) if e["kind"] == "retrieval"]
+    assert [e["payload"]["agent_kind"] for e in retrievals] == [
+        "worker",
+        "validator",
+        "worker",
+        "validator",
+    ]
+    # The attempt_id is a real attempt row, and it is the attempt of that agent.
+    for ev in retrievals:
+        payload = ev["payload"]
+        assert kinds[payload["attempt_id"]] == payload["agent_kind"]
+        assert payload["role"]
+    assert len({e["payload"]["attempt_id"] for e in retrievals}) == 4
+
+
+def test_worker_and_validator_retrieve_against_different_queries(store):
+    """The validator ranks facts against the output under review, the worker
+    against the feedback it must address — a single per-task retrieval record
+    would lose that difference entirely."""
+    store.memory_write("project", "slugify_rule", "slugify uses hyphens", approved=True)
+    task = add_task(store)
+    loop, _ = make_loop(
+        store,
+        ["first output", REVISE, "second output", APPROVE],
+        memory_retrieval_backend="hash",
+    )
+    loop.run_task(task)
+
+    by_kind: dict[str, list[str]] = {"worker": [], "validator": []}
+    for ev in store.events(task.id):
+        if ev["kind"] == "retrieval":
+            by_kind[ev["payload"]["agent_kind"]].append(ev["payload"]["query"])
+
+    assert "first output" in by_kind["validator"][0]  # the output under review
+    assert "first output" not in by_kind["worker"][0]
+    assert "Edge case for empty input" in by_kind["worker"][1]  # the feedback
+
+
 def test_tool_calls_are_recorded_as_provenance(store):
     """Registry tools already reach the SDK, so agents really do call them —
     slice 2 makes that auditable instead of invisible."""
