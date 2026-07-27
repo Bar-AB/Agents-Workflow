@@ -7,7 +7,7 @@ import pytest
 
 from agentloop.config import LoopConfig
 from agentloop.loop import Loop
-from agentloop.models import Task, TaskStatus
+from agentloop.models import RunResult, Task, TaskStatus
 from agentloop.registry import Registry
 from agentloop.runner import MockRunner
 from agentloop.store import Store
@@ -207,6 +207,127 @@ def test_infra_error_is_not_a_revision(store):
 
     assert task.status == TaskStatus.DONE
     assert task.revision_count == 0  # retry != revise
+
+
+def test_relevant_memory_is_retrieved_into_the_worker_prompt(store):
+    """Slice 2: the facts injected are the ones about *this* task, and the
+    retrieval is attributable in the audit log."""
+    store.memory_write("project", "slugify_rule", "slugify uses hyphens", approved=True)
+    store.memory_write("project", "billing_rule", "invoices run monthly", approved=True)
+
+    task = add_task(store)
+    loop, runner = make_loop(
+        store, ["output", APPROVE], memory_retrieval_backend="hash"
+    )
+    loop.run_task(task)
+
+    prompt = runner.calls[0]["prompt"]
+    assert prompt.index("slugify_rule") < prompt.index("billing_rule")
+
+    retrievals = [e for e in store.events(task.id) if e["kind"] == "retrieval"]
+    assert len(retrievals) == 2  # worker and validator each retrieve
+    facts = {f["key"]: f["score"] for f in retrievals[0]["payload"]["facts"]}
+    assert facts["slugify_rule"] > facts["billing_rule"]
+
+
+def test_retrieval_can_be_disabled_without_losing_memory_injection(store):
+    store.memory_write("project", "a_rule", "some fact", approved=True)
+    task = add_task(store)
+    loop, runner = make_loop(
+        store, ["output", APPROVE], memory_retrieval_backend="none"
+    )
+    loop.run_task(task)
+
+    assert "a_rule" in runner.calls[0]["prompt"]
+    assert [e for e in store.events(task.id) if e["kind"] == "retrieval"] == []
+
+
+def test_retrieval_is_attributed_to_the_attempt_that_used_the_facts(store):
+    """One task retrieves once per agent per round. Without attempt_id and
+    agent_kind those events are indistinguishable from each other, which is
+    exactly what makes provenance useless — and `events` is append-only, so
+    there is no backfill for the ones already written."""
+    store.memory_write("project", "slugify_rule", "slugify uses hyphens", approved=True)
+    task = add_task(store)
+    loop, _ = make_loop(
+        store,
+        ["first output", REVISE, "second output", APPROVE],
+        memory_retrieval_backend="hash",
+    )
+    loop.run_task(task)
+
+    kinds = {
+        r["id"]: r["kind"]
+        for r in store._conn.execute(
+            "SELECT id, kind FROM attempts WHERE task_id=? ORDER BY id", (task.id,)
+        ).fetchall()
+    }
+    retrievals = [e for e in store.events(task.id) if e["kind"] == "retrieval"]
+    assert [e["payload"]["agent_kind"] for e in retrievals] == [
+        "worker",
+        "validator",
+        "worker",
+        "validator",
+    ]
+    # The attempt_id is a real attempt row, and it is the attempt of that agent.
+    for ev in retrievals:
+        payload = ev["payload"]
+        assert kinds[payload["attempt_id"]] == payload["agent_kind"]
+        assert payload["role"]
+    assert len({e["payload"]["attempt_id"] for e in retrievals}) == 4
+
+
+def test_worker_and_validator_retrieve_against_different_queries(store):
+    """The validator ranks facts against the output under review, the worker
+    against the feedback it must address — a single per-task retrieval record
+    would lose that difference entirely."""
+    store.memory_write("project", "slugify_rule", "slugify uses hyphens", approved=True)
+    task = add_task(store)
+    loop, _ = make_loop(
+        store,
+        ["first output", REVISE, "second output", APPROVE],
+        memory_retrieval_backend="hash",
+    )
+    loop.run_task(task)
+
+    by_kind: dict[str, list[str]] = {"worker": [], "validator": []}
+    for ev in store.events(task.id):
+        if ev["kind"] == "retrieval":
+            by_kind[ev["payload"]["agent_kind"]].append(ev["payload"]["query"])
+
+    assert "first output" in by_kind["validator"][0]  # the output under review
+    assert "first output" not in by_kind["worker"][0]
+    assert "Edge case for empty input" in by_kind["worker"][1]  # the feedback
+
+
+def test_tool_calls_are_recorded_as_provenance(store):
+    """Registry tools already reach the SDK, so agents really do call them —
+    slice 2 makes that auditable instead of invisible."""
+    worker = RunResult(
+        output="wrote the file",
+        tool_calls=[
+            {"tool": "Write", "input": {"file_path": "slugify.py"}},
+            {"tool": "Bash", "input": {"command": "pytest -q"}},
+        ],
+    )
+    task = add_task(store)
+    loop, _ = make_loop(store, [worker, APPROVE])
+    loop.run_task(task)
+
+    calls = [e for e in store.events(task.id) if e["kind"] == "tool_call"]
+    assert [c["payload"]["tool"] for c in calls] == ["Write", "Bash"]
+    assert calls[0]["payload"]["agent_kind"] == "worker"
+    assert calls[0]["payload"]["input"]["file_path"] == "slugify.py"
+    # Attributable to the attempt that made them.
+    assert calls[0]["payload"]["attempt_id"] == calls[1]["payload"]["attempt_id"]
+    assert task.status == TaskStatus.DONE
+
+
+def test_a_run_without_tool_use_logs_no_tool_call_events(store):
+    task = add_task(store)
+    loop, _ = make_loop(store, ["plain output", APPROVE])
+    loop.run_task(task)
+    assert [e for e in store.events(task.id) if e["kind"] == "tool_call"] == []
 
 
 def test_memory_tiers_and_audit(store):

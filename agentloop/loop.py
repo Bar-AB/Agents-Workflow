@@ -42,6 +42,7 @@ from .executor import TestExecutor, clear_workspace, workspace_for
 from .memory import MemoryService
 from .models import Task, TaskStatus, TestResult, VerdictKind
 from .registry import Registry
+from .retrieval import get_backend
 from .runner import ModelRunner
 from .store import Store
 
@@ -80,7 +81,9 @@ class Loop:
             isolation=config.sandbox_isolation,
         )
         self.memory = memory or MemoryService(
-            store, promote_threshold=config.memory_promote_threshold
+            store,
+            promote_threshold=config.memory_promote_threshold,
+            backend=get_backend(config.memory_retrieval_backend, config),
         )
         # Stable id under which this loop claims tasks. Sequential today, so one
         # id; it must stay constant so a restart resumes its own in-flight tasks

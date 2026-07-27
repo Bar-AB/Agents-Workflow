@@ -50,6 +50,31 @@ def extract_usage(usage: dict) -> tuple[int, int, int, int]:
     )
 
 
+def extract_tool_calls(message) -> list[dict]:
+    """Tool uses reported by one SDK message, as `{"tool", "input"}` dicts.
+
+    Duck-typed on the block's class name for the same reason
+    `_is_result_message` is: provenance is best-effort telemetry, so an SDK
+    version that renames or restructures a block should cost us a record, not a
+    run. Inputs are truncated — this is an index of what happened, not a copy
+    of every file the agent wrote.
+    """
+    calls: list[dict] = []
+    for block in getattr(message, "content", None) or []:
+        if type(block).__name__ != "ToolUseBlock":
+            continue
+        raw = getattr(block, "input", None)
+        calls.append(
+            {
+                "tool": getattr(block, "name", "unknown"),
+                "input": {k: str(v)[:200] for k, v in raw.items()}
+                if isinstance(raw, dict)
+                else str(raw)[:200],
+            }
+        )
+    return calls
+
+
 class ModelRunner(Protocol):
     def run(
         self,
@@ -73,6 +98,8 @@ class MockRunner:
     A scripted item that is an exception instance is *raised* instead of
     returned — this simulates a transient infra failure (API 5xx, network blip)
     so the loop's retry/escalation path can be tested without a live provider.
+    A scripted item that is already a `RunResult` is returned as-is, so a test
+    can script tool calls or specific token counts without the SDK.
     """
 
     def __init__(self, outputs: list | None = None):
@@ -97,6 +124,8 @@ class MockRunner:
         output = self.outputs.pop(0) if self.outputs else "(mock output)"
         if isinstance(output, BaseException):
             raise output
+        if isinstance(output, RunResult):
+            return output
         return RunResult(
             output=output,
             tokens_in=len(system_prompt.split()) + len(prompt.split()),
@@ -167,11 +196,15 @@ class ClaudeSDKRunner:
     ) -> RunResult:
         options = self.build_options(system_prompt, model, tools)
         chunks: list[str] = []
+        tool_calls: list[dict] = []
         tokens_in = tokens_out = cache_creation = cache_read = 0
         async for message in query(prompt=prompt, options=options):
             text = getattr(message, "result", None)
             if isinstance(text, str):
                 chunks.append(text)
+            # Tool uses accumulate across the stream (unlike usage, which is a
+            # running total on the terminal message): each block is one call.
+            tool_calls.extend(extract_tool_calls(message))
             # Usage comes from the terminal ResultMessage ONLY: its `usage` is
             # already the whole-run total, so reading it from every message and
             # summing (the old bug) double-counts. Assign, never accumulate.
@@ -188,6 +221,7 @@ class ClaudeSDKRunner:
             cache_creation_tokens=cache_creation,
             cache_read_tokens=cache_read,
             model=model,
+            tool_calls=tool_calls,
         )
 
 

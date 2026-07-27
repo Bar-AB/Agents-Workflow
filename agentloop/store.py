@@ -104,6 +104,9 @@ CREATE TABLE IF NOT EXISTS memory (
     -- alphabetical tail-off once the injection cap is reached.
     pinned INTEGER NOT NULL DEFAULT 0,
     created_at REAL NOT NULL,
+    -- When this fact was last read out. `hit_count` says how often, never how
+    -- recently; a fact hot a year ago and cold since looks identical without it.
+    last_used_at REAL,
     UNIQUE(tier, key)
 );
 
@@ -242,6 +245,7 @@ class Store:
             ("tasks", "control", "TEXT NOT NULL DEFAULT 'run'"),
             ("tasks", "claimed_by", "TEXT"),
             ("memory", "pinned", "INTEGER NOT NULL DEFAULT 0"),
+            ("memory", "last_used_at", "REAL"),
         ]
         for table, column, decl in additions:
             cols = {
@@ -575,17 +579,23 @@ class Store:
         approved: bool = False,
         pinned: bool = False,
     ) -> None:
-        # Approval and pinning are both sticky: rewriting an already-approved or
-        # pinned fact must not silently revoke it (that would make approved
-        # memory quietly unreadable, or drop a pinned fact from the prompt).
-        # Only an explicit flag can raise them; lowering is via the dedicated
-        # setter methods.
+        # Approval is approval *of a value*, so a rewrite that changes the value
+        # drops back to unapproved: otherwise an agent could rewrite an approved
+        # key and have arbitrary new content inherit the gate the whole memory
+        # design rests on. A rewrite with the same value keeps its approval —
+        # nothing was re-stated, so there is nothing to re-vet — and an explicit
+        # approved=True is approving the incoming content, so it still wins.
+        #
+        # Pinning is sticky regardless: it is a statement about the *key* ("always
+        # tell agents about this"), not about a particular value, and it never
+        # grants a read on its own. Lowering either flag is via the setters.
         with self.transaction():
             self._conn.execute(
                 "INSERT INTO memory (tier, key, value, approved, pinned,"
                 " created_at) VALUES (?,?,?,?,?,?)"
                 " ON CONFLICT(tier, key) DO UPDATE SET value=excluded.value,"
-                " approved=MAX(memory.approved, excluded.approved),"
+                " approved=MAX(excluded.approved, CASE WHEN"
+                " memory.value = excluded.value THEN memory.approved ELSE 0 END),"
                 " pinned=MAX(memory.pinned, excluded.pinned)",
                 (tier, key, value, int(approved), int(pinned), time.time()),
             )
@@ -604,8 +614,9 @@ class Store:
         row = self._conn.execute(q, (tier, key)).fetchone()
         if row:
             self._conn.execute(
-                "UPDATE memory SET hit_count=hit_count+1 WHERE tier=? AND key=?",
-                (tier, key),
+                "UPDATE memory SET hit_count=hit_count+1, last_used_at=?"
+                " WHERE tier=? AND key=?",
+                (time.time(), tier, key),
             )
             self._conn.commit()
         return row["value"] if row else None

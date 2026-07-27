@@ -199,6 +199,8 @@ body {
 .k-test_disagreement { color: var(--failed); font-weight: 600; }
 .k-human_approve, .k-human_redo, .k-human_reject { color: var(--needs-human); }
 .k-memory_promoted, .k-memory_write { color: var(--done); }
+/* Provenance: what memory fed an agent, and what tools it actually used. */
+.k-retrieval, .k-tool_call { color: var(--muted); }
 
 /* ---- detail ---- */
 .detail { margin-top: 16px; }

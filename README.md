@@ -23,6 +23,7 @@ agentloop/
   agents.py    worker/validator prompt building + verdict parsing
   executor.py  sandboxed test execution in a per-task workspace
   memory.py    two-tier memory policy: gating + auto-promotion
+  retrieval.py RetrievalBackend seam: HashingBackend (stdlib bag-of-words)
   loop.py      orchestration state machine + human decisions + mid-run control
   eval.py      validator calibration harness (fixtures + agreement/confusion/
                calibration report)
@@ -30,7 +31,7 @@ agentloop/
   cli.py       add / run / status / approve / reject / redo / pause / resume /
                abort / events / serve / memory / eval
 web/           Vite + React + TypeScript dashboard
-tests/         117 tests on MockRunner + real subprocesses (no API keys needed)
+tests/         149 tests on MockRunner + real subprocesses (no API keys needed)
 ```
 
 ## Quick start
@@ -95,16 +96,80 @@ All thresholds live in `LoopConfig` (`loopconfig.json`), agents in
 
 Two tiers, `project` and `loop`. Reads are gated on `approved`: a fact nobody
 vetted never reaches a prompt, because a bad fact entering memory quietly
-poisons every later task. Agent writes land unapproved and surface in the
+poisons every later task. Approval is approval **of a value** — rewriting a key
+with different content returns it to unapproved, so an agent cannot smuggle new
+content past the gate by overwriting a key a human already accepted. A rewrite
+that changes nothing keeps its approval, and writing with `--approved` is
+approving the incoming content. Agent writes land unapproved and surface in the
 dashboard (or `agentloop memory`) for a human to accept or discard. A project
-fact read `memory_promote_threshold` times is promoted to the loop tier —
-re-answering the same question is exactly the wasted spend tiering removes.
+fact that turns up relevant to `memory_promote_threshold` tasks is promoted to
+the loop tier — re-answering the same question is exactly the wasted spend
+tiering removes.
+
+"Relevant" is doing real work there: a hit is an injection the retrieval ranked
+above zero, not merely an injection. While the store holds fewer facts than the
+cap every approved fact is injected into every prompt, so counting injections
+would mean "existed while three tasks ran" and promote the whole project tier on
+schedule. It is still a proxy — what promotion wants to know is whether a fact
+changed the output, which the `retrieval` provenance now makes measurable.
 
 **Pinned facts.** Prompt injection is capped (20 facts) so memory can't crowd
 out the task; past the cap, ordinary facts drop by alphabetical accident. Mark
 a must-have fact `--pinned` (or pin it in the dashboard) and it sorts first and
 bypasses the cap under its own smaller ceiling (10). Pinning does not bypass
 approval — a pinned but unvetted fact still never reaches a prompt.
+
+### Retrieval: the facts about *this* task
+
+Which facts survive that cap used to be decided by alphabetical order, which
+has nothing to do with the work in hand. Facts are now **ranked by relevance to
+the task** — title, goal, criteria, plus the validator feedback (or the output
+under review) that makes a revision retrieve differently from a first attempt.
+
+Ranking sits behind the `RetrievalBackend` seam in `retrieval.py`, the same
+shape as the `ModelRunner` seam.
+
+One backend ships: **`HashingBackend`** (the default, stdlib only) — hashed
+bag-of-words vectors and cosine similarity, brute-forced over the candidates.
+It matches on shared vocabulary rather than paraphrase; that's the price of
+zero dependencies, and it still beats the alphabet.
+
+The seam is the point, not the backend count. A real embedding model is a
+drop-in `search()`, and that is the change to make the day ranking needs to
+understand paraphrase. A Chroma-index backend shipped here briefly and was
+removed: it embedded with the same `embed()` as the stdlib backend, so it
+returned the same order at any fact count this store holds — an optional,
+CI-untested dependency buying nothing. An unknown backend name now raises
+rather than degrading to a working default: which ranking ran is part of how a
+run behaved.
+
+Ranking decides *order*; it never widens what may be injected. The candidate
+set is what `approved` already allowed through, so no backend — local, remote,
+or not yet written — can surface an unvetted fact; any future index is a
+derived cache that may only re-rank rows the store just handed it, never
+resurrect a revoked one. The caps and the pinned ceiling are unchanged, and a
+fact that fits under the cap is never dropped for scoring low — a zero score
+costs it a promotion credit, not its slot. With no query, or
+`memory_retrieval_backend: "none"`, selection falls back to exactly the old
+alphabetical behaviour — there is nothing to rank against, so inventing an
+order would be worse than the plain one.
+
+### Provenance: what memory said, and what agents did
+
+The audit log recorded what *entered* memory but never what was read out of it,
+so a bad answer couldn't be traced to the fact that caused it. Two event kinds
+close that:
+
+- **`retrieval`** — query, backend, candidate count, and every injected fact
+  with its id, tier, pin state and score, attributed to the attempt that used
+  them (`attempt_id`, `agent_kind`, `role`). A task retrieves once per agent per
+  round and the worker and validator rank against different queries, so without
+  that attribution the rows are indistinguishable — and `events` is append-only,
+  so there is no backfilling the ones already written.
+- **`tool_call`** — one row per tool an agent actually invoked (registry tools
+  already reach the SDK, so this was happening unrecorded), attributed to the
+  attempt that made it. Slice 5's auto-approval policy layers on this record
+  rather than inventing authorization and provenance at once.
 
 ## Token & cost accounting
 
@@ -201,9 +266,9 @@ Anthropic credentials.
 - [x] Mid-run human control: pause / resume / abort, cross-process
 - [x] Pinned memory facts that bypass the injection cap
 - [x] Context-budget handoff (summarize + fresh worker at ≥70% of the budget)
-- [ ] RAG store (Chroma/LanceDB) behind the memory tables
-- [ ] Retrieval / tool-call provenance events (with the RAG/MCP work that needs
-      them)
+- [x] Relevance retrieval behind the memory tables (stdlib `RetrievalBackend`)
+- [x] Retrieval / tool-call provenance events, attributed to the attempt and
+      agent that used them
 - [ ] Planner agent + task graph; parallel workers
 - [ ] Second-provider cross-validator
 - [ ] Agent-requested tools with an auto-approval policy

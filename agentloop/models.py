@@ -66,6 +66,11 @@ class RunResult:
     cache_creation_tokens: int = 0
     cache_read_tokens: int = 0
     model: str = "unknown"
+    # Tools the agent actually invoked during this run, as
+    # {"tool": name, "input": {...}} — provenance for the audit log. Empty for
+    # runners that cannot report them; a backend that stops reporting degrades
+    # to "nothing recorded" rather than to a wrong record.
+    tool_calls: list[dict] = field(default_factory=list)
 
 
 @dataclass

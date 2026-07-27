@@ -55,6 +55,17 @@ class LoopConfig:
     # cross-project loop tier.
     memory_promote_threshold: int = 3
 
+    # Memory retrieval (roadmap slice 2). Which RetrievalBackend ranks approved
+    # facts against the task at hand before they are injected:
+    #   'hash' - the stdlib backend, no dependency at all (the default)
+    #   'none' - no ranking: the pre-slice-2 alphabetical selection
+    # An unknown name raises rather than degrading to a working default: which
+    # ranking ran is part of how a run behaved, so substituting one silently is
+    # exactly the kind of drift the audit log exists to prevent. Ranking never
+    # widens what may be injected — the approval gate and the injection caps are
+    # applied around it, not by it.
+    memory_retrieval_backend: str = "hash"
+
     # Context-budget handoff (roadmap slice 1). When a worker's accumulated
     # context on a task (summed across its attempts) reaches this fraction of
     # its AgentSpec.context_budget_tokens, the loop summarizes the working state

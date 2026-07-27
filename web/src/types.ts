@@ -66,6 +66,27 @@ export interface EventRow {
   payload: Record<string, unknown>
 }
 
+// Payload of a `retrieval` event: what memory put in front of one agent, on one
+// attempt, and why. Mirrors MemoryService._provenance plus the attribution
+// agents._invoke adds — attempt_id/agent_kind/role, exactly as `tool_call`
+// carries, since a task retrieves once per agent per round.
+export interface RetrievalPayload {
+  attempt_id: number
+  agent_kind: string
+  role: string
+  query: string
+  backend: string
+  n_candidates: number
+  n_selected: number
+  facts: {
+    id: number
+    tier: string
+    key: string
+    pinned: boolean
+    score: number
+  }[]
+}
+
 export interface ModelRollup {
   model: string
   attempts: number
@@ -105,6 +126,9 @@ export interface MemoryFact {
   approved: number
   pinned: number
   created_at: number
+  // Null until the fact is first read out: hit_count says how often, never how
+  // recently.
+  last_used_at: number | null
 }
 
 export interface TaskDetail {
