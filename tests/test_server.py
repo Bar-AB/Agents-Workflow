@@ -343,6 +343,40 @@ def test_live_run_streams_to_a_connected_client(live):
     assert store.get_task(task.id).status == TaskStatus.DONE
 
 
+# -- task graph (slice 3) -----------------------------------------------------
+
+
+def test_task_json_carries_the_graph_the_dashboard_needs(live):
+    """web/src/types.ts mirrors this shape; a dashboard that can't see
+    `depends_on` or an unapproved `plan_id` can only report a blocked task as
+    'pending', which looks identical to 'about to run'."""
+    base, store, loop, _ = live
+    from tests.test_planner import PLAN_JSON
+
+    loop.runner = MockRunner([PLAN_JSON])
+    plan = loop.plan("Build a slugify library", "Published, tested, documented")
+
+    _, body = get(base, "/api/tasks")
+    rows = {t["title"]: t for t in body["tasks"]}
+
+    plan_row = rows["Build a slugify library"]
+    assert plan_row["kind"] == "plan"
+    assert plan_row["plan_approved"] is False  # gated, so nothing may run yet
+    assert plan_row["depends_on"] == []
+
+    child = rows["Write the test suite"]
+    assert child["kind"] == "task"
+    assert child["plan_id"] == plan.id
+    assert child["depends_on"] == [rows["Write slugify()"]["id"]]
+    assert child["plan_approved"] is None  # only meaningful on a plan row
+
+    # The dashboard's approve button on a plan row releases it, rather than
+    # marking the goal done while its tasks stay blocked.
+    _, approved = post(base, f"/api/tasks/{plan.id}/approve")
+    assert approved["task"]["plan_approved"] is True
+    assert store.is_plan_approved(plan.id)
+
+
 # -- static ------------------------------------------------------------------
 
 

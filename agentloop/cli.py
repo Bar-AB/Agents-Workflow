@@ -1,6 +1,8 @@
 """CLI — plain structured output, plus the Phase-2 dashboard server.
 
 agentloop add "Title" --goal "..." --criteria "..." [--risk 0|1|2]
+agentloop plan "Goal" --criteria "..." [--runner ...]   # decompose into a graph
+agentloop approve-plan PLAN_ID [--note ...]             # release a plan's tasks
 agentloop run [--runner claude|mock] [--max-tasks N]
 agentloop status [TASK_ID]
 agentloop approve TASK_ID [--note ...]
@@ -21,7 +23,7 @@ import sys
 
 from .config import LoopConfig
 from .loop import Loop
-from .models import Task
+from .models import Task, TaskStatus
 from .registry import DEFAULT_AGENTS, Registry
 from .runner import get_runner
 from .server import serve_forever
@@ -107,6 +109,17 @@ def main(argv: list[str] | None = None) -> int:
     a.add_argument("--criteria", required=True)
     a.add_argument("--risk", type=int, default=1, choices=[0, 1, 2])
 
+    pl = sub.add_parser("plan", help="Decompose a goal into a task graph")
+    pl.add_argument("goal")
+    pl.add_argument("--criteria", required=True)
+    pl.add_argument("--title", default="")
+    pl.add_argument("--risk", type=int, default=1, choices=[0, 1, 2])
+    pl.add_argument("--runner", default="claude", choices=["claude", "mock"])
+
+    ap = sub.add_parser("approve-plan", help="Sign a plan off; its tasks may run")
+    ap.add_argument("task_id", type=int)
+    ap.add_argument("--note", default="")
+
     r = sub.add_parser("run", help="Run the loop over pending tasks")
     r.add_argument("--runner", default="claude", choices=["claude", "mock"])
     r.add_argument("--max-tasks", type=int, default=None)
@@ -164,8 +177,9 @@ def main(argv: list[str] | None = None) -> int:
     store, loop = _build(args)
     try:
         return _dispatch(args, store, loop)
-    except KeyError as exc:
-        # Bad id (no such task/memory row) and similar expected user-input
+    except (KeyError, ValueError) as exc:
+        # Bad id (no such task/memory row), or an id used with the wrong command
+        # (approve-plan on an ordinary task), and similar expected user-input
         # errors surface as a clean message, never a raw traceback. KeyError's
         # str() wraps the message in quotes; unwrap it.
         msg = exc.args[0] if exc.args else str(exc)
@@ -189,12 +203,39 @@ def _dispatch(args, store: Store, loop: Loop) -> int:
         tid = store.add_task(task)
         print(f"Task {tid} defined: {args.title}")
 
+    elif args.cmd == "plan":
+        plan = loop.plan(args.goal, args.criteria, args.title, args.risk)
+        children = store.plan_tasks(plan.id)
+        if not children:
+            # Every plan failure ends here: no tasks exist, and the reason the
+            # planner was rejected is the only useful thing to print.
+            print(f"Plan {plan.id} produced no tasks.", file=sys.stderr)
+            print(f"  {plan.escalation_reason}", file=sys.stderr)
+            return 1
+        print(f"Plan {plan.id} created: {len(children)} task(s)")
+        for c in children:
+            deps = store.dependencies(c.id)
+            dep_note = (
+                f"  (depends on {', '.join(str(d) for d in deps)})" if deps else ""
+            )
+            print(f"  [{c.id}] risk={c.risk_level} {c.title}{dep_note}")
+        if plan.status == TaskStatus.NEEDS_HUMAN:
+            print(f"\nAwaiting sign-off: agentloop approve-plan {plan.id}")
+        else:
+            print("\nPlan auto-approved (plan_requires_approval=false); run to start.")
+
+    elif args.cmd == "approve-plan":
+        plan = loop.approve_plan(args.task_id, args.note)
+        n = len(store.plan_tasks(plan.id))
+        print(f"Plan {plan.id} approved — {n} task(s) released to the loop.")
+
     elif args.cmd == "run":
         n = loop.run(max_tasks=args.max_tasks)
         print(f"Processed {n} task(s).")
         for t in store.list_tasks():
+            tag = "PLAN " if t.kind == "plan" else "     "
             print(
-                f"  [{t.id}] {t.status.value:12s} {t.title}"
+                f"  [{t.id}] {tag}{t.status.value:12s} {t.title}"
                 + (f"  <- {t.escalation_reason}" if t.escalation_reason else "")
             )
 
@@ -209,6 +250,25 @@ def _dispatch(args, store: Store, loop: Loop) -> int:
                 f"\n  revisions: {t.revision_count}"
                 f"\n  risk: {t.risk_level}"
             )
+            if t.kind == "plan":
+                approved = store.is_plan_approved(t.id)
+                kids = store.plan_tasks(t.id)
+                print(f"  plan: {len(kids)} task(s), approved={approved}")
+            else:
+                deps = store.dependencies(t.id)
+                if deps:
+                    # Say which of them is actually holding this task up — "has
+                    # dependencies" doesn't explain why nothing is happening.
+                    unmet = [
+                        d
+                        for d in deps
+                        if (dt := store.get_task(d)) and dt.status != TaskStatus.DONE
+                    ]
+                    print(f"  depends on: {', '.join(str(d) for d in deps)}")
+                    if unmet:
+                        print(f"  blocked by: {', '.join(str(d) for d in unmet)}")
+                if t.plan_id and not store.is_plan_approved(t.plan_id):
+                    print(f"  blocked by: plan {t.plan_id} (awaiting sign-off)")
             if t.escalation_reason:
                 print(f"  escalation: {t.escalation_reason}")
             print("  metrics:", json.dumps(store.task_metrics(t.id), indent=4))
@@ -216,8 +276,9 @@ def _dispatch(args, store: Store, loop: Loop) -> int:
                 print(f"\n--- output ---\n{t.output}")
         else:
             for t in store.list_tasks():
+                tag = "PLAN " if t.kind == "plan" else "     "
                 print(
-                    f"[{t.id}] {t.status.value:12s} rev={t.revision_count}"
+                    f"[{t.id}] {tag}{t.status.value:12s} rev={t.revision_count}"
                     f" risk={t.risk_level}  {t.title}"
                 )
 

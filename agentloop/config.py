@@ -74,6 +74,26 @@ class LoopConfig:
     # a token count; ~0.70 leaves headroom for the next turn's own output.
     context_handoff_ratio: float = 0.70
 
+    # Planner + task graph (roadmap slice 3).
+    # A planner generating tasks *is* task definition, which humans stay in the
+    # loop for, so a plan's children are not claimable until the plan is signed
+    # off. Set False for autonomous batch runs, where the validator on each
+    # child's output remains the gate.
+    plan_requires_approval: bool = True
+    # Hard cap on plan size. A planner that emits hundreds of tasks has
+    # misunderstood the goal; better to escalate the plan than to queue a batch
+    # nobody reviewed. The whole plan is rejected, never truncated — a silently
+    # trimmed plan is missing exactly the parts nobody can see are missing.
+    max_plan_tasks: int = 20
+
+    # How many tasks may run at once. 1 (the default) is the sequential loop
+    # unchanged: one claim id, one thread, identical ordering. Above 1, that
+    # many threads each claim independently, so only tasks with no unfinished
+    # dependency run together. The ceiling is deliberate — it bounds simultaneous
+    # model spend and concurrent sandboxed test subprocesses, which "run
+    # everything ready" would not.
+    max_parallel_workers: int = 1
+
     # Infra resilience: a transient runner/executor failure (API 5xx, network
     # blip) is retried up to this many times with exponential backoff before
     # the task escalates to NEEDS_HUMAN with an infra_error reason. This is
