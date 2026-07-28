@@ -1,5 +1,10 @@
-"""The orchestration loop (spec §4). Sequential for now by design; the store
-schema already supports parallel workers later.
+"""The orchestration loop (spec §4).
+
+A `planner` agent decomposes a goal into a graph of tasks (`Loop.plan`), and the
+loop drains that graph — sequentially by default, or `max_parallel_workers` at a
+time. It holds no schedule in memory: "what may run now" is a predicate the
+store evaluates inside the atomic claim, so dependency order and plan gating
+hold identically for one worker and for many.
 
 Decision rules per validation round:
 - worker replies `ESCALATE:`            -> needs_human (genuine ambiguity)
@@ -25,6 +30,19 @@ Decision rules per validation round:
                                            max_revisions. One flaky call does
                                            not abort the rest of the batch.
 
+Planning rules (`Loop.plan`), all failing the same safe way — the plan row
+escalates to NEEDS_HUMAN and no child tasks are created:
+- planner replies `ESCALATE:`            -> needs_human (genuine ambiguity)
+- unparseable / cyclic / dangling-ref /  -> needs_human ("Unusable plan"). The
+  oversized plan                            whole plan is discarded, never
+                                            partially applied or truncated.
+- plan_requires_approval (default True)  -> the plan's tasks are not claimable
+                                            until `approve_plan`; they wait as
+                                            ordinary `pending` rows.
+- a task is claimable only once every    -> a dependent of an escalated task is
+  dependency is DONE                        skipped, not failed; resolving the
+                                            dependency makes it claimable again.
+
 "Tests not failing" means the *executed* result (spec §5). Tests run in the
 task's workspace between the worker and the validator; the validator sees the
 real output, and the gate consults the real status rather than the validator's
@@ -34,9 +52,17 @@ is recorded as a `test_disagreement` event — the loop measures its validators.
 
 from __future__ import annotations
 
+import threading
 import time
 
-from .agents import run_summarizer, run_validator, run_worker
+from .agents import (
+    PlanError,
+    parse_plan,
+    run_planner,
+    run_summarizer,
+    run_validator,
+    run_worker,
+)
 from .config import LoopConfig
 from .executor import TestExecutor, clear_workspace, workspace_for
 from .memory import MemoryService
@@ -45,6 +71,12 @@ from .registry import Registry
 from .retrieval import get_backend
 from .runner import ModelRunner
 from .store import Store
+
+
+# How long an idle parallel worker parks before re-checking for claimable work.
+# In-process changes notify it directly; this only bounds how late it notices a
+# change made by another process.
+_IDLE_POLL_SECONDS = 0.5
 
 
 class _InfraError(Exception):
@@ -93,18 +125,360 @@ class Loop:
     # -- public API ----------------------------------------------------------
 
     def run(self, max_tasks: int | None = None) -> int:
-        """Process pending tasks sequentially. Returns tasks processed.
-        Safe to call after a crash/restart: state lives in the store."""
+        """Process claimable tasks. Returns tasks processed.
+        Safe to call after a crash/restart: state lives in the store.
+
+        Sequential by default (`max_parallel_workers=1`). Above 1, that many
+        threads each claim independently; the store's atomic claim is what makes
+        that safe, and its blocked-task predicate is what keeps dependency order
+        without the loop tracking a graph in memory."""
+        n = max(1, int(self.config.max_parallel_workers))
+        # Checked for both paths: shrinking the pool *to* one worker is the most
+        # likely way to strand a claim, so the sequential path needs this most.
+        self._warn_stranded_claims(self._worker_ids(n))
+        if n == 1:
+            return self._run_serial(self.worker_id, max_tasks)
+        return self._run_parallel(n, max_tasks)
+
+    def _run_serial(self, worker_id: str, max_tasks: int | None) -> int:
         processed = 0
         while max_tasks is None or processed < max_tasks:
             # Atomic claim (not a bare SELECT): a task is handed to exactly one
-            # worker, so two workers never grab the same row. Sequential today.
-            task = self.store.claim_next_task(self.worker_id)
+            # worker, so two workers never grab the same row.
+            task = self.store.claim_next_task(worker_id)
             if task is None:
                 break
             self.run_task(task)
             processed += 1
         return processed
+
+    def _worker_ids(self, n: int) -> list[str]:
+        """Stable claim ids, so a restart resumes its own in-flight tasks.
+
+        Worker 0 keeps the bare `worker_id` the sequential loop uses, so a run
+        started sequentially and resumed with parallelism on (or the reverse for
+        that worker) still finds its own in-flight task rather than stranding it.
+        """
+        return [self.worker_id] + [f"{self.worker_id}-{i}" for i in range(1, n)]
+
+    def _run_parallel(self, n: int, max_tasks: int | None) -> int:
+        """Run up to `n` tasks concurrently.
+
+        No graph is held in memory and no scheduler decides what is ready: each
+        thread just re-claims, and the store refuses to hand out a task whose
+        dependencies are unfinished.
+
+        A thread that finds nothing claimable **waits rather than exiting**,
+        while any peer is still working. Exiting would be safe (the last thread
+        standing eventually claims whatever it unblocked) but not parallel: a
+        plan usually has a single root, so all but one worker would find nothing
+        to do on the first pass, exit, and leave the entire rest of the graph —
+        including tasks that are independent of each other — to run serially.
+        The wait is over when no peer is busy, because then nothing can become
+        claimable and whatever remains is blocked on work this run won't finish.
+        """
+        cond = threading.Condition()
+        state = {"claimed": 0, "busy": 0}
+        errors: list[BaseException] = []
+        stopping = threading.Event()
+
+        def drain(worker_id: str) -> None:
+            while True:
+                with cond:
+                    if stopping.is_set():
+                        cond.notify_all()
+                        return
+                    if max_tasks is not None and state["claimed"] >= max_tasks:
+                        cond.notify_all()
+                        return
+                    # Counted at claim time, not completion: two threads that
+                    # both finish under the cap must not both claim past it.
+                    task = self.store.claim_next_task(worker_id)
+                    if task is None:
+                        if state["busy"] == 0:
+                            cond.notify_all()
+                            return
+                        # A peer is mid-task and may unblock a dependent of it.
+                        # Every in-process state change notifies under this same
+                        # lock, so no wakeup is lost and the timeout is only a
+                        # backstop — it exists so a change made by *another*
+                        # process (an `approve-plan` mid-run) is noticed too.
+                        # Kept coarse: at 0.05s seven idle workers would fire
+                        # ~140 claim queries a second at the store lock the one
+                        # busy worker is trying to use.
+                        cond.wait(timeout=_IDLE_POLL_SECONDS)
+                        continue
+                    state["claimed"] += 1
+                    state["busy"] += 1
+                try:
+                    self.run_task(task)
+                except BaseException as exc:  # noqa: BLE001 - re-raised below
+                    # A thread that dies silently would leave the task claimed
+                    # and the run reporting success. Surface it like the
+                    # sequential path does, once the other workers wind down.
+                    errors.append(exc)
+                    with cond:
+                        state["busy"] -= 1
+                        cond.notify_all()
+                    return
+                with cond:
+                    # Finishing may have unblocked this task's dependents; wake
+                    # the workers parked above so they can claim them.
+                    state["busy"] -= 1
+                    cond.notify_all()
+
+        worker_ids = self._worker_ids(n)
+        threads = [
+            threading.Thread(target=drain, args=(wid,), name=f"agentloop-{wid}")
+            for wid in worker_ids
+        ]
+        for t in threads:
+            t.start()
+        try:
+            for t in threads:
+                t.join()
+        except KeyboardInterrupt:
+            # Sequential mode exits promptly on Ctrl-C; without this the
+            # parallel mode would not, because joining non-daemon threads waits
+            # for every in-flight model call *and* keeps claiming new tasks
+            # after the interrupt. Stop claiming, let the in-flight round
+            # finish, then re-raise.
+            stopping.set()
+            with cond:
+                cond.notify_all()
+            for t in threads:
+                t.join()
+            raise
+        if errors:
+            raise errors[0]
+        return state["claimed"]
+
+    def _warn_stranded_claims(self, worker_ids: list[str]) -> None:
+        """Surface in-flight tasks held by a claim id no live worker will use.
+
+        Lowering `max_parallel_workers` between runs orphans whatever the
+        retired ids were holding: `claim_next_task` only re-offers in-flight
+        work to its exact owner, so those tasks become invisible to every
+        claimer while `run()` returns a success count that silently excludes
+        them. They are *not* reclaimed here — with the default worker id, a
+        second `agentloop run` process would look identical to a retired
+        worker, and stealing its live task is worse than leaving one stranded.
+        Reporting it turns silent loss into something an operator can act on
+        (`agentloop redo <id>`)."""
+        stranded = self.store.stranded_claims(self.worker_id, worker_ids)
+        for task in stranded:
+            self.store.log_event(
+                task.id,
+                "claim_stranded",
+                {
+                    "claimed_by": task.claimed_by,
+                    "status": task.status.value,
+                    "active_workers": worker_ids,
+                },
+            )
+
+    # -- planning (roadmap slice 3) -------------------------------------------
+
+    def plan(
+        self,
+        goal: str,
+        acceptance_criteria: str,
+        title: str = "",
+        risk_level: int = 1,
+    ) -> Task:
+        """Decompose a goal into a task graph. Returns the plan row.
+
+        The plan itself is a task row of `kind='plan'`: it owns the planner's
+        attempt and audit trail, and carries the approval that gates its
+        children — but it is never claimed by the loop, because a goal statement
+        is not work.
+
+        Every failure mode ends the same way: the plan row escalates to
+        NEEDS_HUMAN and **no child tasks exist**. A partially applied plan is
+        worse than none — the missing half is invisible, while the half that
+        landed looks like a complete plan somebody approved.
+        """
+        # Guard before the row exists: an empty goal would make the derived
+        # title raise IndexError, and a failure *before* the plan row is
+        # created is the one failure that cannot escalate a plan row.
+        if not goal.strip():
+            raise ValueError("A plan needs a goal to decompose (goal was empty).")
+        if not acceptance_criteria.strip():
+            raise ValueError(
+                "A plan needs acceptance criteria; they are what each child "
+                "task's criteria are derived from."
+            )
+        plan_task = Task(
+            id=None,
+            title=title or goal.strip().splitlines()[0][:120],
+            goal=goal,
+            acceptance_criteria=acceptance_criteria,
+            risk_level=risk_level,
+            kind="plan",
+        )
+        self.store.add_task(plan_task)
+
+        # Checked before the retry loop: a hand-edited agents.json predating the
+        # planner role is a configuration error, not a transient one, so
+        # retrying it with backoff would only burn the clock to reach the same
+        # conclusion — and reporting it as `infra_error` would point the human
+        # at the network instead of at their registry. Unlike the summarizer,
+        # there is no sane fallback: planning as a worker would decompose the
+        # goal with a prompt that never asked for a graph.
+        try:
+            self.registry.get("planner")
+        except KeyError:
+            self.store.set_status(
+                plan_task,
+                TaskStatus.NEEDS_HUMAN,
+                reason=(
+                    "No 'planner' agent is registered; add one to agents.json "
+                    "(or delete it to fall back to the built-in defaults)."
+                ),
+            )
+            return plan_task
+
+        try:
+            result = self._with_retry(
+                plan_task,
+                "planner",
+                lambda: run_planner(
+                    self.store, self.runner, self.registry, plan_task, self.memory
+                ),
+            )
+        except _InfraError as exc:
+            self.store.set_status(
+                plan_task,
+                TaskStatus.NEEDS_HUMAN,
+                reason=(
+                    f"infra_error after {exc.attempts} attempt(s) at "
+                    f"'{exc.stage}': {type(exc.original).__name__}: {exc.original}"
+                ),
+            )
+            return plan_task
+
+        # Same rule the worker has: an agent that hits genuine ambiguity asks
+        # instead of guessing, and guessing here would fabricate a whole graph.
+        if result.output.strip().upper().startswith("ESCALATE:"):
+            self.store.set_status(
+                plan_task,
+                TaskStatus.NEEDS_HUMAN,
+                reason=f"Planner ambiguity: {result.output.strip()[9:].strip()}",
+            )
+            return plan_task
+
+        try:
+            planned = parse_plan(result.output, max_tasks=self.config.max_plan_tasks)
+        except PlanError as exc:
+            self.store.set_status(
+                plan_task, TaskStatus.NEEDS_HUMAN, reason=f"Unusable plan: {exc}"
+            )
+            return plan_task
+
+        # One transaction: the tasks, their edges and the audit event land
+        # together, so a crash mid-write can't leave a graph missing the edges
+        # that are the only thing keeping its tasks in order.
+        #
+        # The except is not decoration. `parse_plan` already rejects cycles, so
+        # `add_dependency`'s own refusal should be unreachable — but "should be
+        # unreachable" is not the same as "cannot happen", and without this an
+        # unexpected failure here would roll the graph back correctly and then
+        # propagate, leaving a plan row parked at `pending` with no reason on
+        # it. That is the one shape this method promises never to produce.
+        try:
+            with self.store.transaction():
+                ids: dict[str, int] = {}
+                for node in planned:
+                    child = Task(
+                        id=None,
+                        title=node.title,
+                        goal=node.goal,
+                        acceptance_criteria=node.acceptance_criteria,
+                        risk_level=node.risk_level,
+                        kind="task",
+                        plan_id=plan_task.id,
+                    )
+                    ids[node.ref] = self.store.add_task(child)
+                edges = 0
+                for node in planned:
+                    for dep in node.depends_on:
+                        self.store.add_dependency(ids[node.ref], ids[dep])
+                        edges += 1
+                self.store.log_event(
+                    plan_task.id,
+                    "plan_created",
+                    {
+                        "n_tasks": len(planned),
+                        "n_edges": edges,
+                        "tasks": [
+                            {
+                                "id": ids[n.ref],
+                                "ref": n.ref,
+                                "title": n.title,
+                                "depends_on": [ids[d] for d in n.depends_on],
+                            }
+                            for n in planned
+                        ],
+                    },
+                )
+        except Exception as exc:
+            self.store.set_status(
+                plan_task,
+                TaskStatus.NEEDS_HUMAN,
+                reason=f"Plan could not be persisted: {type(exc).__name__}: {exc}",
+            )
+            return plan_task
+
+        if self.config.plan_requires_approval:
+            self.store.set_status(
+                plan_task,
+                TaskStatus.NEEDS_HUMAN,
+                reason=(
+                    f"Plan ready: {len(planned)} task(s) awaiting human sign-off "
+                    f"(agentloop approve-plan {plan_task.id})."
+                ),
+            )
+        else:
+            self.store.set_plan_approved(plan_task.id, True)
+            self.store.set_status(plan_task, TaskStatus.DONE)
+        return plan_task
+
+    def approve_plan(self, plan_id: int, note: str = "") -> Task:
+        """Sign a plan off: its tasks become claimable.
+
+        The plan row goes DONE because *planning* is what finished — the work it
+        described is tracked by the child tasks, each with its own validator
+        round. Idempotent, so approving twice is harmless.
+        """
+        task = self._require(plan_id)
+        if task.kind != "plan":
+            raise ValueError(
+                f"Task {plan_id} is not a plan (kind={task.kind!r}); "
+                f"use approve/reject for ordinary tasks."
+            )
+        # A plan that produced no tasks is a *failed* plan (unparseable, cyclic,
+        # planner escalation). Approving it would turn an escalation into a
+        # green DONE goal with nothing under it, and would blank the diagnosis
+        # off the row. The decision rules fail safe toward NEEDS_HUMAN; this is
+        # the one place a human click could push the other way.
+        if not self.store.plan_tasks(plan_id):
+            raise ValueError(
+                f"Plan {plan_id} produced no tasks and cannot be approved "
+                f"({task.escalation_reason or 'planning did not complete'}). "
+                f"Re-plan the goal instead."
+            )
+        # One transaction: the audit event, the approval flag and the status
+        # are one decision. Committed separately, a crash between them leaves
+        # the log claiming an approval that never released the children, or
+        # children released under a plan row still reading needs_human.
+        with self.store.transaction():
+            self.store.log_event(plan_id, "human_approve_plan", {"note": note})
+            self.store.set_plan_approved(plan_id, True)
+            # Clear the "awaiting sign-off" reason: it is answered, and leaving
+            # it on a released plan reads as though it were still blocked.
+            task.escalation_reason = ""
+            self.store.set_status(task, TaskStatus.DONE)
+        return self._require(plan_id)
 
     def run_task(self, task: Task) -> Task:
         feedback = ""
@@ -337,6 +711,24 @@ class Loop:
 
     def human_approve(self, task_id: int, note: str = "") -> Task:
         task = self._require(task_id)
+        # Approving a plan means "run what it proposed", not "this goal is
+        # finished". Without this, the dashboard's approve button and
+        # `agentloop approve <plan-id>` would mark the plan DONE while leaving
+        # its children blocked on an approval that never happened.
+        if task.kind == "plan":
+            return self.approve_plan(task_id, note)
+        # Approval is a human signing off on work that was *done and reviewed*.
+        # A PENDING task has produced nothing: no worker attempt, no validator
+        # verdict, no output. Marking it DONE would not just mis-record it —
+        # with a task graph, DONE is what satisfies a dependency, so approving
+        # an unrun task releases its dependents to run against upstream output
+        # that does not exist. Fail safe: refuse rather than complete.
+        if task.status == TaskStatus.PENDING:
+            raise ValueError(
+                f"Task {task_id} has not run yet (status=pending); there is "
+                f"nothing to approve. Use `run` to execute it, or `reject` to "
+                f"drop it."
+            )
         self.store.log_event(task_id, "human_approve", {"note": note})
         self.store.set_status(task, TaskStatus.DONE)
         return task

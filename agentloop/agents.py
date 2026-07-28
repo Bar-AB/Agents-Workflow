@@ -3,11 +3,20 @@ record attempts/metrics in the store, parse validator verdicts."""
 
 from __future__ import annotations
 
+import json
 import re
 
 from .config import estimate_cost_usd
 from .memory import MemoryService
-from .models import RunResult, Task, TestResult, Verdict, VerdictKind
+from .models import (
+    PlannedTask,
+    RunResult,
+    Task,
+    TaskStatus,
+    TestResult,
+    Verdict,
+    VerdictKind,
+)
 from .registry import Registry
 from .runner import ModelRunner
 from .store import Store
@@ -22,6 +31,18 @@ _VERDICT_RE = re.compile(
 # How much of the free-text context (feedback, or the output under review) feeds
 # the memory retrieval query alongside the task definition.
 _MAX_QUERY_EXTRA_CHARS = 2000
+
+# How much of each completed dependency's output is handed to a dependent
+# worker. Bounded because a task can wait on several others and their combined
+# transcripts would otherwise be the largest thing in the prompt.
+_MAX_UPSTREAM_CHARS = 2000
+
+_JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(.+?)```", re.DOTALL | re.IGNORECASE)
+
+# Largest planner reply worth attempting to parse. A real plan is a few KB; far
+# past that the reply is runaway or hostile, and parsing it is the expensive
+# part, so the check belongs before `json.loads`, not after.
+_MAX_PLAN_REPLY_CHARS = 200_000
 
 
 def _invoke(
@@ -143,6 +164,37 @@ def _retrieval_query(task: Task, extra: str = "") -> str:
     return f"{base}\n{extra[:_MAX_QUERY_EXTRA_CHARS]}" if extra else base
 
 
+def _upstream_block(store: Store, task: Task) -> str:
+    """What the tasks this one waited for actually produced.
+
+    A dependency edge that only delays a task is a schedule, not a plan: the
+    reason "write the tests" waits for "write slugify()" is that it needs to see
+    slugify(). Bounded per upstream task so a fan-in node's prompt stays mostly
+    about its own work.
+
+    Only DONE dependencies contribute, and that is checked here rather than
+    assumed from the claim gate. The gate holds at *claim* time, but this block
+    is rebuilt on every revision round — so an upstream task rejected or redone
+    mid-round would otherwise be fed downstream as "what this task waited for"
+    when it is no longer a finished result at all.
+    """
+    if task.id is None:
+        return ""
+    outputs = []
+    for dep_id in store.dependencies(task.id):
+        dep = store.get_task(dep_id)
+        if dep is None or dep.status != TaskStatus.DONE or not dep.output.strip():
+            continue
+        outputs.append(f"### {dep.title}\n{dep.output[:_MAX_UPSTREAM_CHARS]}")
+    if not outputs:
+        return ""
+    return (
+        "\n## Upstream results (output of the tasks this one depends on)\n"
+        + "\n\n".join(outputs)
+        + "\n"
+    )
+
+
 def _test_block(result: TestResult | None) -> str:
     """Real executed results, so the validator judges reality rather than the
     worker's account of it."""
@@ -175,6 +227,7 @@ def run_worker(
     )
     memory_block, retrieval = _memory_block(memory, _retrieval_query(task, feedback))
     prompt += memory_block
+    prompt += _upstream_block(store, task)
     if workspace:
         prompt += (
             f"\n## Workspace\nWrite your files and tests under `{workspace}`. "
@@ -259,6 +312,179 @@ def run_summarizer(
         spec.tools,
     )
     return result
+
+
+class PlanError(ValueError):
+    """A planner reply that cannot become a task graph.
+
+    Raised for anything unusable — unparseable JSON, a missing field, a
+    dangling `depends_on` ref, a cycle, an oversized plan. The caller discards
+    the *whole* plan and escalates: a half-applied decomposition is worse than
+    none, because the missing half is invisible while the present half looks
+    like a complete plan someone approved.
+    """
+
+
+def run_planner(
+    store: Store,
+    runner: ModelRunner,
+    registry: Registry,
+    plan_task: Task,
+    memory: MemoryService | None = None,
+) -> RunResult:
+    """Decompose a goal into a task graph (roadmap slice 3).
+
+    Recorded as its own attempt (kind='planner') against the plan row, so the
+    decomposition is auditable and its cost is attributed like any other agent
+    invocation. Returns the raw reply; `parse_plan` turns it into nodes.
+    """
+    spec = registry.get("planner")
+    prompt = (
+        f"# Goal to decompose\n{plan_task.goal}\n\n"
+        f"## Acceptance criteria for the goal as a whole\n"
+        f"{plan_task.acceptance_criteria}\n"
+    )
+    memory_block, retrieval = _memory_block(memory, _retrieval_query(plan_task))
+    prompt += memory_block
+    prompt += (
+        "\nDecompose this into independently executable tasks and their "
+        "dependencies, in the JSON format your instructions specify."
+    )
+    result, _ = _invoke(
+        store,
+        runner,
+        plan_task,
+        "planner",
+        spec.role,
+        spec.model,
+        spec.system_prompt,
+        prompt,
+        spec.tools,
+        retrieval,
+    )
+    return result
+
+
+def parse_plan(text: str, max_tasks: int) -> list[PlannedTask]:
+    """Parse a planner reply into graph nodes, or raise `PlanError`.
+
+    Validation is deliberately all-or-nothing and happens *before* anything is
+    written: refs must be unique, every `depends_on` must name a task in the
+    same plan, and the edges must form a DAG. A plan that fails any of these is
+    not repaired or partially applied — it escalates to a human, the same way an
+    unparseable verdict escalates rather than being guessed at.
+    """
+    # Bound the input before parsing it. `max_tasks` is a cap on the *parsed*
+    # plan, which is too late: a runaway or hostile reply costs the CPU and
+    # memory of parsing it first, and deep nesting raises RecursionError, which
+    # is not a JSONDecodeError and would escape as a traceback rather than an
+    # escalation. Model replies that are legitimately plans are far under this.
+    if len(text) > _MAX_PLAN_REPLY_CHARS:
+        raise PlanError(
+            f"planner reply is {len(text)} chars, over the "
+            f"{_MAX_PLAN_REPLY_CHARS} limit; refusing to parse it"
+        )
+    fenced = _JSON_FENCE_RE.search(text)
+    raw = fenced.group(1) if fenced else text
+    try:
+        data = json.loads(raw.strip())
+    except RecursionError as exc:
+        raise PlanError("planner reply is nested too deeply to parse") from exc
+    except ValueError as exc:  # JSONDecodeError is a ValueError
+        raise PlanError(f"planner reply is not valid JSON: {exc}") from exc
+
+    # Accept the documented {"tasks": [...]} shape, and a bare array, which is
+    # the one deviation a model reliably makes and which is unambiguous anyway.
+    if isinstance(data, dict):
+        items = data.get("tasks")
+    elif isinstance(data, list):
+        items = data
+    else:
+        items = None
+    if not isinstance(items, list):
+        raise PlanError("planner reply has no 'tasks' array")
+    if not items:
+        raise PlanError("planner returned an empty plan (no tasks)")
+    if len(items) > max_tasks:
+        raise PlanError(
+            f"plan has {len(items)} tasks, more than the {max_tasks} allowed "
+            f"(max_plan_tasks)"
+        )
+
+    planned: list[PlannedTask] = []
+    for i, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise PlanError(f"task #{i + 1} is not an object")
+        ref = str(item.get("ref") or "").strip() or f"task-{i + 1}"
+        missing = [f for f in ("title", "goal") if not str(item.get(f) or "").strip()]
+        if missing:
+            raise PlanError(f"task {ref!r} is missing: {', '.join(missing)}")
+        criteria = str(item.get("acceptance_criteria") or "").strip()
+        if not criteria:
+            # The validator judges strictly against acceptance criteria, so a
+            # task without any is a task no validator can ever approve.
+            raise PlanError(f"task {ref!r} is missing: acceptance_criteria")
+        try:
+            risk = int(item.get("risk_level", 1))
+        except (TypeError, ValueError):
+            raise PlanError(f"task {ref!r} has a non-numeric risk_level") from None
+        if risk not in (0, 1, 2):
+            raise PlanError(f"task {ref!r} has risk_level {risk} (expected 0, 1 or 2)")
+        deps = item.get("depends_on") or []
+        if not isinstance(deps, list):
+            raise PlanError(f"task {ref!r} has a non-list depends_on")
+        # De-duplicate: the edge table is keyed on (task, depends_on), so a
+        # repeated ref inserts one row. Counting it twice would make the
+        # `plan_created` event and the `task_dependency` events disagree with
+        # the graph they claim to describe.
+        deps = list(dict.fromkeys(str(d).strip() for d in deps))
+        planned.append(
+            PlannedTask(
+                ref=ref,
+                title=str(item["title"]).strip(),
+                goal=str(item["goal"]).strip(),
+                acceptance_criteria=criteria,
+                risk_level=risk,
+                depends_on=deps,
+            )
+        )
+
+    refs = [p.ref for p in planned]
+    if len(set(refs)) != len(refs):
+        raise PlanError("plan reuses a task ref; refs must be unique")
+    known = set(refs)
+    for p in planned:
+        for dep in p.depends_on:
+            if dep not in known:
+                raise PlanError(
+                    f"task {p.ref!r} depends on {dep!r}, which is not in this plan"
+                )
+            if dep == p.ref:
+                raise PlanError(f"task {p.ref!r} depends on itself (cycle)")
+    _reject_cycles(planned)
+    return planned
+
+
+def _reject_cycles(planned: list[PlannedTask]) -> None:
+    """Raise if the plan's edges are not a DAG.
+
+    Kahn's algorithm: repeatedly remove nodes with no unmet dependency. Whatever
+    remains is exactly the set of nodes trapped in (or downstream of) a cycle.
+    """
+    remaining = {p.ref: set(p.depends_on) for p in planned}
+    while True:
+        ready = [ref for ref, deps in remaining.items() if not deps]
+        if not ready:
+            break
+        for ref in ready:
+            del remaining[ref]
+        for deps in remaining.values():
+            deps.difference_update(ready)
+    if remaining:
+        raise PlanError(
+            "plan dependencies contain a cycle involving: "
+            + ", ".join(sorted(remaining))
+        )
 
 
 def run_validator(

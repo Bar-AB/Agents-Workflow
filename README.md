@@ -15,23 +15,25 @@ loop writes to.
 ```
 agentloop/
   config.py    thresholds, budget caps, model pricing, sandbox + server knobs
-  models.py    Task, Verdict, TestResult, AgentSpec, statuses
-  store.py     SQLite source of truth: tasks, attempts (metrics), verdicts,
-               test_runs, events (immutable audit log), two-tier memory
+  models.py    Task, PlannedTask, Verdict, TestResult, AgentSpec, statuses
+  store.py     SQLite source of truth: tasks, task_deps (the task graph),
+               attempts (metrics), verdicts, test_runs, events (immutable
+               audit log), two-tier memory
   registry.py  agent registry: role, model, prompt, tools, budget, version
   runner.py    ModelRunner seam: ClaudeSDKRunner | MockRunner
-  agents.py    worker/validator prompt building + verdict parsing
+  agents.py    worker/validator/planner prompt building, verdict + plan parsing
   executor.py  sandboxed test execution in a per-task workspace
   memory.py    two-tier memory policy: gating + auto-promotion
   retrieval.py RetrievalBackend seam: HashingBackend (stdlib bag-of-words)
-  loop.py      orchestration state machine + human decisions + mid-run control
+  loop.py      orchestration state machine + planning + human decisions +
+               mid-run control + parallel workers
   eval.py      validator calibration harness (fixtures + agreement/confusion/
                calibration report)
   server.py    REST + SSE dashboard backend (stdlib only)
-  cli.py       add / run / status / approve / reject / redo / pause / resume /
-               abort / events / serve / memory / eval
+  cli.py       add / plan / approve-plan / run / status / approve / reject /
+               redo / pause / resume / abort / events / serve / memory / eval
 web/           Vite + React + TypeScript dashboard
-tests/         149 tests on MockRunner + real subprocesses (no API keys needed)
+tests/         186 tests on MockRunner + real subprocesses (no API keys needed)
 ```
 
 ## Quick start
@@ -44,6 +46,11 @@ agentloop add "Add slugify util" \
   --goal "Write slugify(text) in utils.py" \
   --criteria "Lowercase, hyphen-separated, handles unicode, has tests" \
   --risk 1
+
+# ...or let a planner decompose a whole goal into a task graph
+agentloop plan "Build a slugify library" \
+  --criteria "Published, tested, documented"
+agentloop approve-plan 1         # sign the plan off; its tasks may now run
 
 agentloop run --runner claude    # or --runner mock for a dry run
 agentloop status 1               # metrics: tokens, cost, wall time, verdicts
@@ -81,6 +88,11 @@ Validator returns `VERDICT: <kind> CONFIDENCE: <0-1> TESTS: <pass|fail|na>`:
 | unparseable verdict | needs_human (never guess-approve) |
 | transient infra failure (runner/executor raises) | retried with backoff, then needs_human (`infra_error`) — not a revise |
 | worker context ≥ handoff ratio of its budget | summarize state + restart worker from the summary (`context_handoff`) — not a revise |
+| planner replies `ESCALATE:` | needs_human (genuine ambiguity), no tasks created |
+| plan unparseable / cyclic / dangling ref / oversized | needs_human ("Unusable plan"), no tasks created — never partially applied |
+| task has an unfinished dependency, or an unapproved plan | not claimable; it waits as `pending` rather than failing |
+| human approves a task that never ran (`pending`) | refused — approval signs off reviewed work, and `done` is what releases dependents |
+| human approves a plan that produced no tasks | refused — a failed plan stays escalated with its diagnosis intact |
 
 **"Tests not failing" means the executed result.** Tests really run in the
 task's workspace between worker and validator; the validator sees the real
@@ -210,6 +222,94 @@ as its own recorded attempt (its cost still counts toward the task budget cap).
 After a handoff the watermark advances, so only newly accumulated context can
 trip the next one.
 
+## Planner, task graph, and parallel workers
+
+A goal bigger than one task used to have to be split by hand. `agentloop plan`
+hands it to a **`planner` agent**, which returns a small graph: independently
+executable tasks plus the dependencies between them. The plan itself is a task
+row of `kind='plan'` — it owns the planner's attempt and audit trail, and it is
+never claimed by the loop, because a goal statement is not work.
+
+**A bad plan never becomes tasks.** An unparseable reply, a cycle, a
+`depends_on` naming a task that isn't in the plan, or a plan over
+`max_plan_tasks` all end the same way: the plan row escalates to `needs_human`
+and **zero** child tasks exist. Nothing is repaired, truncated, or partially
+applied — a half-applied decomposition is worse than none, because the missing
+half is invisible while the half that landed looks like a complete plan somebody
+approved. A planner that hits genuine ambiguity replies `ESCALATE:` and asks,
+exactly as a worker does.
+
+**Plans are gated by default.** A planner generating tasks *is* task definition,
+which humans stay in the loop for, so `plan_requires_approval` (default `true`)
+holds a plan's tasks until `agentloop approve-plan <id>` — or the dashboard's
+approve button on the plan row, which routes to the same place rather than
+marking the goal "done" while its tasks stay blocked forever. Set it `false` for
+autonomous batch runs; each child's validator round is still the gate on output.
+
+### Blocked is a predicate, not a status
+
+A task waiting on an unfinished dependency, or on an unapproved plan, stays an
+ordinary `pending` row. Claimability is decided inside the store's atomic claim:
+a task is handed out only when every edge points at a `done` task and its plan
+is signed off. That has three consequences worth stating:
+
+- **Nothing has to be un-set when a blocker clears.** Approve the plan, or
+  resolve the dependency, and the next run claims what it unblocked.
+- **A dependent of an escalated task is skipped, not failed.** The batch
+  finishes everything else and returns; the dependent is still there, unspent.
+- **One worker and many behave identically**, because neither holds a schedule
+  in memory — they ask the same question of the same committed state.
+
+Cycles are refused at the edge (`Store.add_dependency`), not just by the plan
+parser. A cycle isn't a slow graph, it's a permanent deadlock: every task in it
+waits on another, so none is ever claimable and the loop drains to a silent
+stall. Keeping the check in the store makes "the graph is a DAG" an invariant
+rather than a hope about the planner.
+
+Dependency edges also carry data, not just order: a dependent's worker prompt
+includes an **`## Upstream results`** block with the output of the tasks it
+waited for (bounded per upstream task). The reason "write the tests" waits for
+"write slugify()" is that it needs to see slugify(); an edge that only delays a
+task is a schedule, not a plan.
+
+### Parallel workers
+
+`max_parallel_workers` (default **1**) is how many tasks may run at once. At 1
+the loop is the sequential loop unchanged — one claim id, one thread, identical
+ordering. Above 1, that many threads each claim independently, so only tasks
+with no unfinished dependency ever run together, and the atomic claim means two
+workers can never hold the same row.
+
+A worker that finds nothing claimable **waits while any peer is still busy**
+rather than exiting. Exiting would still be correct — the last thread standing
+eventually claims whatever it unblocked — but it would not be parallel: a plan
+usually has a single root, so every other worker would find nothing on the first
+pass, exit, and leave the whole rest of the graph to run serially. The wait ends
+when no peer is busy, since then nothing can become claimable.
+
+The cap is deliberate rather than "run everything ready": it bounds simultaneous
+model spend and concurrent sandboxed test subprocesses. Per-task audit isolation
+is unaffected — each task still gets its own claim, attempts, verdicts and
+events. Note that with parallelism on, per-task wall times no longer sum to the
+run's wall time, and audit events from different tasks interleave in the log
+(they remain totally ordered by id, and each carries its `task_id`).
+
+The claim is a **compare-and-swap** (`WHERE status='pending' AND claimed_by IS
+NULL`), not just a lock-protected update. Within one process the connection lock
+would suffice, but two `agentloop run` processes hold separate connections and
+separate locks, and Python's sqlite3 does not open a write transaction for a
+`SELECT` — so both could read the same pending row. The guard makes the loser's
+update match zero rows and it moves on to the next candidate.
+
+**Shrinking the pool strands claims.** `claim_next_task` only re-offers in-flight
+work to its exact owner, so retiring a claim id (going from 4 workers back to 1)
+hides whatever those ids held from every claimer. That is reported rather than
+repaired: each orphan logs a `claim_stranded` event, and `agentloop redo <id>`
+recovers it. It is deliberately not auto-reclaimed — with the default worker id,
+a second `agentloop run` process is indistinguishable from a retired worker, and
+stealing its live task is worse than leaving one stranded. A real lease with an
+expiry is the proper fix and belongs with the durability slice.
+
 ## Validator calibration harness
 
 The decision rules lean on the validator's `CONFIDENCE` number, so `agentloop
@@ -269,7 +369,7 @@ Anthropic credentials.
 - [x] Relevance retrieval behind the memory tables (stdlib `RetrievalBackend`)
 - [x] Retrieval / tool-call provenance events, attributed to the attempt and
       agent that used them
-- [ ] Planner agent + task graph; parallel workers
+- [x] Planner agent + task graph; parallel workers
 - [ ] Second-provider cross-validator
 - [ ] Agent-requested tools with an auto-approval policy
 - [ ] git-commit-per-task rollback; infra retry/backoff; batch evaluation

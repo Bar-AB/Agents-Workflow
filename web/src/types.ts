@@ -18,6 +18,10 @@ export type TaskControl = 'run' | 'pause' | 'abort'
 export type VerdictKind = 'approve' | 'revise' | 'escalate'
 export type TestStatus = 'pass' | 'fail' | 'na' | 'error'
 
+// 'task' = work a worker executes. 'plan' = the container row a planner run
+// decomposed; it is never claimed by the loop and carries the plan's approval.
+export type TaskKind = 'task' | 'plan'
+
 export interface Task {
   id: number
   title: string
@@ -31,6 +35,15 @@ export interface Task {
   output: string
   escalation_reason: string
   control: TaskControl
+  kind: TaskKind
+  // Which plan produced this task; null for hand-defined ones.
+  plan_id: number | null
+  // Task ids this one waits on. A pending task with an unfinished dependency is
+  // not stuck — it is simply not claimable yet.
+  depends_on: number[]
+  // Only meaningful on a plan row (null elsewhere): until a human signs the plan
+  // off, none of its tasks are claimable.
+  plan_approved: boolean | null
 }
 
 export interface VerdictRow {

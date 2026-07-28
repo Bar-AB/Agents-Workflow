@@ -54,6 +54,40 @@ Rules:
 - Be terse; this replaces a full transcript, so every token must earn its place.
 - Output only the summary — no preamble."""
 
+PLANNER_SYSTEM = """You are a planner agent in an agentic development loop.
+You receive one goal and its acceptance criteria, and decompose it into a small
+graph of independently executable tasks that together satisfy the goal.
+
+Rules:
+- If the goal is genuinely ambiguous or underspecified, do NOT guess. Reply with
+  exactly `ESCALATE:` followed by what you need clarified.
+- Each task must be worth a separate worker run: self-contained, with its own
+  acceptance criteria that another agent can check without re-reading the goal.
+- Declare a dependency only when a task genuinely cannot start until another has
+  finished. Every unnecessary edge serializes work that could run in parallel.
+- Dependencies must form a DAG. A cycle is rejected and the whole plan discarded.
+- Prefer few, meaningful tasks over many trivial ones.
+
+Reply with a single fenced ```json block and nothing that must be parsed outside
+it. The exact shape:
+
+```json
+{"tasks": [
+  {"ref": "short-local-name",
+   "title": "Imperative one-line title",
+   "goal": "What this task must accomplish",
+   "acceptance_criteria": "How a validator decides this task is done",
+   "risk_level": 1,
+   "depends_on": ["ref-of-a-task-above"]}
+]}
+```
+
+- `ref` is your own local name for the task, used only to express `depends_on`;
+  it never leaves the plan.
+- `risk_level` is 0 (low), 1 (normal) or 2 (high — requires human sign-off even
+  after the validator approves). Use 2 for destructive or security-sensitive work.
+- `depends_on` lists refs from this same plan; omit or use [] for none."""
+
 DEFAULT_AGENTS: dict[str, AgentSpec] = {
     "worker": AgentSpec(
         role="worker",
@@ -69,6 +103,21 @@ DEFAULT_AGENTS: dict[str, AgentSpec] = {
         system_prompt=VALIDATOR_SYSTEM,
         tools=["file_io", "search", "task_state"],
         context_budget_tokens=60_000,
+        version="1",
+    ),
+    "planner": AgentSpec(
+        role="planner",
+        # Decomposition is the highest-leverage call in a run: every child task
+        # inherits its judgment about what the units of work are and what may
+        # run in parallel, and a bad split is only discovered attempts later.
+        # One planner run per goal, so the cost is negligible against the batch.
+        model="claude-sonnet-5",
+        system_prompt=PLANNER_SYSTEM,
+        # Read-only by construction (`file_read`, not `file_io`): a planner
+        # proposes work, it does not do the work. Writes belong to the workers
+        # whose output a validator actually reviews.
+        tools=["file_read", "search", "task_state"],
+        context_budget_tokens=120_000,
         version="1",
     ),
     "summarizer": AgentSpec(

@@ -169,27 +169,34 @@ class MemoryService:
     # -- promotion -----------------------------------------------------------
 
     def maybe_promote(self, tier: str, key: str) -> bool:
-        """Promote a hot project fact to loop memory. Returns True if promoted."""
+        """Promote a hot project fact to loop memory. Returns True if promoted.
+
+        The read of `hit_count` and the write it justifies happen in one
+        transaction: with parallel workers two threads can otherwise both read
+        the same threshold-crossing count and both promote, writing two
+        `memory_promoted` events for one promotion and making the audit log
+        disagree with what actually happened."""
         if tier != "project":
             return False
-        row = self._find(tier, key)
-        if row is None or row["hit_count"] < self.promote_threshold:
-            return False
-        # Carry approval across: a fact already vetted for this project does
-        # not need re-vetting to be reused, and it stays visible in the log.
-        self.store.memory_write(
-            "loop", key, row["value"], approved=bool(row["approved"])
-        )
-        self.store.log_event(
-            None,
-            "memory_promoted",
-            {
-                "key": key,
-                "from": "project",
-                "to": "loop",
-                "hit_count": row["hit_count"],
-            },
-        )
+        with self.store.transaction():
+            row = self._find(tier, key)
+            if row is None or row["hit_count"] < self.promote_threshold:
+                return False
+            # Carry approval across: a fact already vetted for this project does
+            # not need re-vetting to be reused, and it stays visible in the log.
+            self.store.memory_write(
+                "loop", key, row["value"], approved=bool(row["approved"])
+            )
+            self.store.log_event(
+                None,
+                "memory_promoted",
+                {
+                    "key": key,
+                    "from": "project",
+                    "to": "loop",
+                    "hit_count": row["hit_count"],
+                },
+            )
         return True
 
     def _record_reads(

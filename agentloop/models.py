@@ -47,6 +47,31 @@ class Task:
     # Which worker claimed this task (None = unclaimed). Set atomically by the
     # store's claim; a worker only resumes in-flight tasks it owns.
     claimed_by: str | None = None
+    # 'task' = work a worker executes. 'plan' = a planner-owned container row
+    # holding the goal that was decomposed; it carries the planner's attempts
+    # and the plan's approval, and is never claimed by the loop — handing a
+    # goal statement to a worker as though it were a task is exactly the bug.
+    kind: str = "task"
+    # Which plan produced this task (None for hand-defined tasks). Provenance,
+    # and the handle the plan's approval gate is applied through.
+    plan_id: int | None = None
+
+
+@dataclass
+class PlannedTask:
+    """One node of a planner-proposed task graph, before it becomes a row.
+
+    `ref` is the planner's own local name for the node: it has to express edges
+    in a single reply, before any database id exists. Refs are resolved to task
+    ids when the graph is persisted and are not stored.
+    """
+
+    ref: str
+    title: str
+    goal: str
+    acceptance_criteria: str
+    risk_level: int = 1
+    depends_on: list[str] = field(default_factory=list)
 
 
 @dataclass

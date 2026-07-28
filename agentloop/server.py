@@ -342,8 +342,10 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    @staticmethod
-    def _task_json(task: Task) -> dict:
+    def _task_json(self, task: Task) -> dict:
+        # `depends_on` is served with the task rather than as its own endpoint:
+        # the dashboard needs it to explain why a pending task isn't moving, and
+        # a separate round trip per row would defeat that.
         return {
             "id": task.id,
             "title": task.title,
@@ -357,6 +359,14 @@ class _Handler(BaseHTTPRequestHandler):
             "output": task.output,
             "escalation_reason": task.escalation_reason,
             "control": task.control,
+            "kind": task.kind,
+            "plan_id": task.plan_id,
+            "depends_on": self.store.dependencies(task.id) if task.id else [],
+            "plan_approved": (
+                self.store.is_plan_approved(task.id)
+                if task.kind == "plan" and task.id
+                else None
+            ),
         }
 
 

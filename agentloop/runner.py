@@ -100,6 +100,13 @@ class MockRunner:
     so the loop's retry/escalation path can be tested without a live provider.
     A scripted item that is already a `RunResult` is returned as-is, so a test
     can script tool calls or specific token counts without the SDK.
+
+    **Single-threaded only.** The script is positional, so with
+    `max_parallel_workers > 1` whichever thread calls first gets whatever output
+    is next, and a test would end up asserting an ordering it created itself.
+    For concurrent tests route on prompt *content* instead (see `GraphRunner` in
+    tests/test_planner.py); `agentloop run --runner mock` with parallelism on is
+    likewise nondeterministic by construction.
     """
 
     def __init__(self, outputs: list | None = None):
@@ -141,6 +148,10 @@ class MockRunner:
 # one missing a tool it asked for.
 LOGICAL_TOOL_MAP: dict[str, list[str]] = {
     "file_io": ["Read", "Write", "Edit"],
+    # Read without write, for roles that survey a codebase but must not change
+    # it (the planner proposes work; only workers produce output a validator
+    # reviews). `file_io` would hand those roles Write and Edit as well.
+    "file_read": ["Read"],
     "search": ["Glob", "Grep"],
     "git": ["Bash"],
     "shell": ["Bash"],

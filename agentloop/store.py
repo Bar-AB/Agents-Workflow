@@ -16,6 +16,11 @@ Every agent and (later) the Phase-2 UI reads and writes here. Design notes:
 - `claim_next_task` hands a task to exactly one worker (atomic select+claim via
   a `claimed_by` lease column), the prerequisite for parallel workers; the
   sequential loop uses one stable worker id and is behaviorally unchanged.
+- `task_deps` holds the planner's task graph. Being blocked is a *predicate*
+  evaluated inside the claim (`_UNBLOCKED`), not a status: a task waiting on an
+  unfinished dependency, or on an unapproved plan, stays ordinary `pending` and
+  is simply never handed out. Nothing has to be un-set when the blocker clears,
+  and a human can never mistake waiting work for finished work.
 """
 
 from __future__ import annotations
@@ -28,6 +33,11 @@ import time
 from pathlib import Path
 
 from .models import Task, TaskStatus, TestResult, Verdict
+
+# How many candidates a claim will try before giving up. Each retry means
+# another process won that row, so this only bounds a pathological live-lock;
+# in practice the loser's next look finds a different task or nothing.
+_CLAIM_ATTEMPTS = 100
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
@@ -50,8 +60,30 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- claim_next_task so exactly one worker runs a task (parallel-worker
     -- prerequisite); a worker only resumes in-flight tasks it owns.
     claimed_by TEXT,
+    -- 'task' | 'plan'. A 'plan' row is the container a planner run decomposed:
+    -- it owns the planner's attempts and the plan's approval flag, and is
+    -- excluded from claiming so a goal statement is never executed as work.
+    kind TEXT NOT NULL DEFAULT 'task',
+    -- The plan that produced this task; NULL for hand-defined tasks.
+    plan_id INTEGER REFERENCES tasks(id),
+    -- Meaningful on 'plan' rows only: has a human signed this plan off? A
+    -- planner generating tasks *is* task definition, which humans stay in the
+    -- loop for, so children of an unapproved plan are not claimable.
+    plan_approved INTEGER NOT NULL DEFAULT 0,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
+);
+
+-- Task graph edges (spec: planner). One row per "task_id waits on
+-- depends_on_id". A separate table rather than a column because a task can
+-- have many dependencies; the primary key makes re-adding an edge idempotent.
+-- Acyclicity is enforced in `add_dependency`, not by the schema: a cycle is a
+-- permanent deadlock, so the graph must never be able to hold one.
+CREATE TABLE IF NOT EXISTS task_deps (
+    task_id INTEGER NOT NULL REFERENCES tasks(id),
+    depends_on_id INTEGER NOT NULL REFERENCES tasks(id),
+    created_at REAL NOT NULL,
+    PRIMARY KEY (task_id, depends_on_id)
 );
 
 CREATE TABLE IF NOT EXISTS attempts (
@@ -163,7 +195,23 @@ class _LockedConnection:
             # Materialize under the lock: rows read later, off-lock, would
             # race another thread's use of the same connection.
             rows = cur.fetchall() if cur.description else []
-            return _LockedCursor(cur.lastrowid, rows)
+            return _LockedCursor(cur.lastrowid, rows, cur.rowcount)
+
+    def write(self, sql: str, params: tuple = ()) -> _LockedCursor:
+        """A write that commits, with the lock held across both steps.
+
+        `execute()` then `commit()` as two calls takes the lock *twice*, and in
+        the gap between them another thread can enter `transaction()`, fail, and
+        `rollback()` — on this same shared connection, destroying the
+        uncommitted row the first thread just wrote while its `execute()`
+        returned perfectly normally. That is silent data loss (a worker's output,
+        an attempt's token counts) and it becomes reachable the moment more than
+        one worker runs. Every unbatched write goes through here so the window
+        does not exist; inside a `transaction()` this joins it and defers the
+        commit as before.
+        """
+        with self.transaction():
+            return self.execute(sql, params)
 
     def executescript(self, sql: str) -> None:
         with self._lock:
@@ -209,8 +257,14 @@ class _LockedConnection:
 class _LockedCursor:
     """Cursor view over rows already fetched under the connection lock."""
 
-    def __init__(self, lastrowid: int | None, rows: list[sqlite3.Row]):
+    def __init__(
+        self, lastrowid: int | None, rows: list[sqlite3.Row], rowcount: int = -1
+    ):
         self.lastrowid = lastrowid
+        # How many rows the statement actually changed — the signal a
+        # conditional UPDATE uses to tell "I won this race" from "someone else
+        # already did".
+        self.rowcount = rowcount
         self._rows = rows
 
     def fetchone(self) -> sqlite3.Row | None:
@@ -244,6 +298,14 @@ class Store:
             ("attempts", "cache_read_tokens", "INTEGER NOT NULL DEFAULT 0"),
             ("tasks", "control", "TEXT NOT NULL DEFAULT 'run'"),
             ("tasks", "claimed_by", "TEXT"),
+            ("tasks", "kind", "TEXT NOT NULL DEFAULT 'task'"),
+            # No REFERENCES on the added column: SQLite's ALTER TABLE ADD COLUMN
+            # rejects a foreign key with a non-NULL default and cannot add one
+            # retroactively. The constraint is in _SCHEMA for fresh dbs; older
+            # dbs get the column, and plan_id is only ever written from a task
+            # id this store just inserted.
+            ("tasks", "plan_id", "INTEGER"),
+            ("tasks", "plan_approved", "INTEGER NOT NULL DEFAULT 0"),
             ("memory", "pinned", "INTEGER NOT NULL DEFAULT 0"),
             ("memory", "last_used_at", "REAL"),
         ]
@@ -272,8 +334,8 @@ class Store:
         with self.transaction():
             cur = self._conn.execute(
                 "INSERT INTO tasks (title, goal, acceptance_criteria, status,"
-                " risk_level, worker_role, validator_role, created_at,"
-                " updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                " risk_level, worker_role, validator_role, kind, plan_id,"
+                " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     task.title,
                     task.goal,
@@ -282,6 +344,8 @@ class Store:
                     task.risk_level,
                     task.worker_role,
                     task.validator_role,
+                    task.kind,
+                    task.plan_id,
                     now,
                     now,
                 ),
@@ -295,6 +359,8 @@ class Store:
                     "goal": task.goal,
                     "acceptance_criteria": task.acceptance_criteria,
                     "risk_level": task.risk_level,
+                    "kind": task.kind,
+                    "plan_id": task.plan_id,
                 },
             )
         return task.id
@@ -305,14 +371,37 @@ class Store:
         ).fetchone()
         return self._row_to_task(row) if row else None
 
+    # Why a task may not be worked yet, as SQL. Two blockers, both *predicates*
+    # rather than statuses: a blocked task is ordinary `pending` that simply
+    # isn't claimable, so nothing has to be un-set when the blocker clears and a
+    # human can never mistake waiting work for finished work.
+    #
+    #   1. an unfinished dependency — every edge must point at a DONE task;
+    #   2. an unapproved plan — a planner generating tasks is task definition,
+    #      which humans stay in the loop for.
+    _UNBLOCKED = (
+        " AND t.kind='task'"
+        " AND NOT EXISTS (SELECT 1 FROM task_deps d JOIN tasks dep"
+        "   ON dep.id = d.depends_on_id"
+        "   WHERE d.task_id = t.id AND dep.status <> 'done')"
+        " AND (t.plan_id IS NULL OR EXISTS (SELECT 1 FROM tasks p"
+        "   WHERE p.id = t.plan_id AND p.plan_approved = 1))"
+    )
+    # In-flight before untouched, then by id: a crashed run resumes what it was
+    # already doing before starting anything new.
+    _ACTIONABLE_ORDER = " ORDER BY CASE t.status WHEN 'pending' THEN 1 ELSE 0 END, t.id"
+
     def next_pending_task(self) -> Task | None:
-        """Next actionable task (sequential loop). Resumable: in-flight
-        statuses are picked up before untouched pending ones."""
+        """Next actionable task (read-only peek; the loop uses the claiming
+        form). Resumable: in-flight statuses are picked up before untouched
+        pending ones, and blocked tasks are skipped exactly as they are for a
+        claim, so this never reports work the loop would refuse to start."""
         row = self._conn.execute(
-            "SELECT * FROM tasks WHERE status IN"
+            "SELECT * FROM tasks t WHERE t.status IN"
             " ('in_progress','testing','validating','revising','pending')"
-            " ORDER BY CASE status WHEN 'pending' THEN 1 ELSE 0 END, id"
-            " LIMIT 1"
+            + self._UNBLOCKED
+            + self._ACTIONABLE_ORDER
+            + " LIMIT 1"
         ).fetchone()
         return self._row_to_task(row) if row else None
 
@@ -325,30 +414,75 @@ class Store:
         in-flight task is resumable only by the worker that already owns it, so
         a crashed run resumes without another worker stealing it. With a single
         stable `worker_id` this reproduces `next_pending_task`'s ordering
-        (in-flight before pending), so the sequential loop is unchanged."""
-        with self.transaction():
-            row = self._conn.execute(
-                "SELECT * FROM tasks WHERE"
-                " status='pending'"
-                " OR (status IN ('in_progress','testing','validating',"
-                "'revising') AND claimed_by=?)"
-                " ORDER BY CASE status WHEN 'pending' THEN 1 ELSE 0 END, id"
-                " LIMIT 1",
-                (worker_id,),
-            ).fetchone()
-            if row is None:
-                return None
-            task = self._row_to_task(row)
-            if task.status == TaskStatus.PENDING:
-                self._conn.execute(
+        (in-flight before pending), so the sequential loop is unchanged.
+
+        Blocked tasks are invisible to the claim (see `_UNBLOCKED`): a task
+        whose dependencies are unfinished, or whose plan is unapproved, is never
+        handed out. Because the check runs inside the claiming transaction it is
+        evaluated against committed state, so two workers finishing two
+        dependencies at once cannot both conclude a shared dependent is still
+        blocked — the later claim sees the earlier commit.
+
+        The claim is a **compare-and-swap**, not a plain UPDATE. Within one
+        process the connection lock alone would be enough, but two `agentloop
+        run` processes on the same database each hold their own connection and
+        their own lock: Python's sqlite3 does not open a write transaction for a
+        `SELECT`, so both could read the same pending row and both claim it. The
+        `WHERE status='pending' AND claimed_by IS NULL` guard makes the loser's
+        UPDATE match zero rows, and it retries on the next candidate instead.
+        """
+        for _ in range(_CLAIM_ATTEMPTS):
+            with self.transaction():
+                row = self._conn.execute(
+                    "SELECT * FROM tasks t WHERE ("
+                    " t.status='pending'"
+                    " OR (t.status IN ('in_progress','testing','validating',"
+                    "'revising') AND t.claimed_by=?))"
+                    + self._UNBLOCKED
+                    + self._ACTIONABLE_ORDER
+                    + " LIMIT 1",
+                    (worker_id,),
+                ).fetchone()
+                if row is None:
+                    return None
+                task = self._row_to_task(row)
+                if task.status != TaskStatus.PENDING:
+                    return task  # resuming in-flight work this worker owns
+                cur = self._conn.execute(
                     "UPDATE tasks SET status='in_progress', claimed_by=?,"
-                    " updated_at=? WHERE id=?",
+                    " updated_at=? WHERE id=? AND status='pending'"
+                    " AND claimed_by IS NULL",
                     (worker_id, time.time(), task.id),
                 )
-                task.status = TaskStatus.IN_PROGRESS
-                task.claimed_by = worker_id
-                self.log_event(task.id, "task_claimed", {"worker": worker_id})
-            return task
+                if cur.rowcount == 1:
+                    task.status = TaskStatus.IN_PROGRESS
+                    task.claimed_by = worker_id
+                    self.log_event(task.id, "task_claimed", {"worker": worker_id})
+                    return task
+                # Lost the race to another process; fall through and look again.
+        return None
+
+    def stranded_claims(self, prefix: str, active_worker_ids: list[str]) -> list[Task]:
+        """In-flight tasks held by a claim id in this loop's id-space that no
+        currently-active worker owns.
+
+        Shrinking a worker pool retires claim ids, and `claim_next_task` only
+        re-offers in-flight work to its exact owner — so those tasks stop being
+        visible to anybody. This finds them; deciding what to do about it is the
+        caller's, because a retired id is indistinguishable from a live second
+        process using the same id-space."""
+        rows = self._conn.execute(
+            "SELECT * FROM tasks WHERE claimed_by IS NOT NULL"
+            " AND status IN ('in_progress','testing','validating','revising')"
+            " AND (claimed_by = ? OR claimed_by LIKE ?) ORDER BY id",
+            (prefix, f"{prefix}-%"),
+        ).fetchall()
+        active = set(active_worker_ids)
+        return [
+            t
+            for t in (self._row_to_task(r) for r in rows)
+            if t.claimed_by not in active
+        ]
 
     def list_tasks(self) -> list[Task]:
         rows = self._conn.execute("SELECT * FROM tasks ORDER BY id").fetchall()
@@ -359,7 +493,7 @@ class Store:
         # task object loaded at the start of the run, and writing its stale
         # `control` here would clobber a pause/abort a human set concurrently
         # from another process. `set_control` is the sole writer of control.
-        self._conn.execute(
+        self._conn.write(
             "UPDATE tasks SET status=?, revision_count=?, output=?,"
             " escalation_reason=?, updated_at=? WHERE id=?",
             (
@@ -371,7 +505,6 @@ class Store:
                 task.id,
             ),
         )
-        self._conn.commit()
 
     def set_control(self, task_id: int, control: str) -> None:
         """Write the mid-run control signal (run/pause/abort). The sole writer
@@ -418,17 +551,111 @@ class Store:
             escalation_reason=row["escalation_reason"],
             control=row["control"],
             claimed_by=row["claimed_by"],
+            kind=row["kind"],
+            plan_id=row["plan_id"],
         )
+
+    # -- task graph (spec: planner) -------------------------------------------
+
+    def add_dependency(self, task_id: int, depends_on_id: int) -> None:
+        """Record that `task_id` waits on `depends_on_id`.
+
+        Rejects any edge that would close a cycle, including a self-edge. A
+        cycle is not a slow graph, it is a permanent deadlock: every task in it
+        waits on another, so none is ever claimable and the loop drains to a
+        silent stall. Refusing the edge keeps "the graph the loop drains is a
+        DAG" an invariant of the store rather than a hope about the planner.
+        """
+        if task_id == depends_on_id:
+            raise ValueError(f"Task {task_id} cannot depend on itself (cycle)")
+        with self.transaction():
+            # The new edge closes a cycle iff `task_id` is already reachable
+            # from `depends_on_id` by following existing edges.
+            if self._reaches(depends_on_id, task_id):
+                raise ValueError(
+                    f"Dependency {task_id} -> {depends_on_id} would create a cycle"
+                )
+            # ON CONFLICT DO NOTHING rather than INSERT OR IGNORE: identical
+            # semantics, but it is the standard form Postgres also understands,
+            # and the store already uses this idiom in `memory_write`.
+            self._conn.execute(
+                "INSERT INTO task_deps (task_id, depends_on_id, created_at)"
+                " VALUES (?,?,?) ON CONFLICT DO NOTHING",
+                (task_id, depends_on_id, time.time()),
+            )
+            self.log_event(task_id, "task_dependency", {"depends_on": depends_on_id})
+
+    def _reaches(self, start: int, target: int) -> bool:
+        """Is `target` reachable from `start` along dependency edges? Iterative
+        so a deep graph can't blow the Python stack, and `seen` makes it
+        terminate even if a cycle somehow already exists in an older db."""
+        seen: set[int] = set()
+        frontier = [start]
+        while frontier:
+            node = frontier.pop()
+            if node == target:
+                return True
+            if node in seen:
+                continue
+            seen.add(node)
+            frontier.extend(self.dependencies(node))
+        return False
+
+    def dependencies(self, task_id: int) -> list[int]:
+        """Task ids this task waits on."""
+        return [
+            int(r["depends_on_id"])
+            for r in self._conn.execute(
+                "SELECT depends_on_id FROM task_deps WHERE task_id=?"
+                " ORDER BY depends_on_id",
+                (task_id,),
+            ).fetchall()
+        ]
+
+    def dependents(self, task_id: int) -> list[int]:
+        """Task ids waiting on this task."""
+        return [
+            int(r["task_id"])
+            for r in self._conn.execute(
+                "SELECT task_id FROM task_deps WHERE depends_on_id=? ORDER BY task_id",
+                (task_id,),
+            ).fetchall()
+        ]
+
+    def plan_tasks(self, plan_id: int) -> list[Task]:
+        """The tasks one plan produced, in creation order."""
+        rows = self._conn.execute(
+            "SELECT * FROM tasks WHERE plan_id=? ORDER BY id", (plan_id,)
+        ).fetchall()
+        return [self._row_to_task(r) for r in rows]
+
+    def set_plan_approved(self, plan_id: int, approved: bool) -> None:
+        """Sign a plan off (or withdraw it). The children are ordinary pending
+        rows; this flag is what makes them claimable, so approval is one write
+        rather than a status sweep that could half-apply."""
+        with self.transaction():
+            self._conn.execute(
+                "UPDATE tasks SET plan_approved=?, updated_at=? WHERE id=?",
+                (int(approved), time.time(), plan_id),
+            )
+            self.log_event(
+                plan_id, "plan_approved" if approved else "plan_unapproved", {}
+            )
+
+    def is_plan_approved(self, plan_id: int) -> bool:
+        row = self._conn.execute(
+            "SELECT plan_approved FROM tasks WHERE id=?", (plan_id,)
+        ).fetchone()
+        return bool(row["plan_approved"]) if row else False
 
     # -- attempts / metrics --------------------------------------------------
 
     def start_attempt(self, task_id: int, kind: str, role: str, model: str) -> int:
-        cur = self._conn.execute(
+        cur = self._conn.write(
             "INSERT INTO attempts (task_id, kind, agent_role, model, started_at)"
             " VALUES (?,?,?,?,?)",
             (task_id, kind, role, model, time.time()),
         )
-        self._conn.commit()
         return cur.lastrowid
 
     def finish_attempt(
@@ -470,8 +697,7 @@ class Store:
             vals.append(model)
         base += " WHERE id=?"
         vals.append(attempt_id)
-        self._conn.execute(base, tuple(vals))
-        self._conn.commit()
+        self._conn.write(base, tuple(vals))
 
     def task_spend(self, task_id: int) -> tuple[int, float]:
         """Total (tokens, cost_usd) across all attempts — for budget caps.
@@ -554,11 +780,10 @@ class Store:
     # -- audit log -----------------------------------------------------------
 
     def log_event(self, task_id: int | None, kind: str, payload: dict) -> None:
-        self._conn.execute(
+        self._conn.write(
             "INSERT INTO events (task_id, ts, kind, payload) VALUES (?,?,?,?)",
             (task_id, time.time(), kind, json.dumps(payload)),
         )
-        self._conn.commit()
 
     def events(self, task_id: int | None = None) -> list[dict]:
         if task_id is None:
@@ -613,12 +838,11 @@ class Store:
             q += " AND approved=1"
         row = self._conn.execute(q, (tier, key)).fetchone()
         if row:
-            self._conn.execute(
+            self._conn.write(
                 "UPDATE memory SET hit_count=hit_count+1, last_used_at=?"
                 " WHERE tier=? AND key=?",
                 (time.time(), tier, key),
             )
-            self._conn.commit()
         return row["value"] if row else None
 
     def memory_list(
