@@ -8,7 +8,6 @@ import pytest
 from agentloop.loop import Loop
 from agentloop.models import TaskStatus
 from agentloop.registry import Registry
-from agentloop.runner import MockRunner
 from agentloop.store import Store
 from tests.test_loop import APPROVE, REVISE, add_task, make_loop
 

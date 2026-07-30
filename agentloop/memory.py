@@ -81,7 +81,10 @@ class MemoryService:
         three prompts inside a single task — so one ordinary task promoted a
         fact on its own at the default threshold of three."""
         approved = list(self.store.memory_list(approved_only=True))
-        order = lambda r: (0 if r["tier"] == "loop" else 1, r["key"])
+
+        def order(r):
+            return (0 if r["tier"] == "loop" else 1, r["key"])
+
         pinned = sorted((r for r in approved if r["pinned"]), key=order)
         unpinned = sorted((r for r in approved if not r["pinned"]), key=order)
 
