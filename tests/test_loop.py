@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from agentloop.agents import _MAX_TOOL_INPUT_CHARS
 from agentloop.config import LoopConfig
 from agentloop.loop import Loop
 from agentloop.models import RunResult, Task, TaskStatus
@@ -317,7 +318,9 @@ def test_tool_calls_are_recorded_as_provenance(store):
     calls = [e for e in store.events(task.id) if e["kind"] == "tool_call"]
     assert [c["payload"]["tool"] for c in calls] == ["Write", "Bash"]
     assert calls[0]["payload"]["agent_kind"] == "worker"
-    assert calls[0]["payload"]["input"]["file_path"] == "slugify.py"
+    # Recorded as a bounded string: the log says what a tool was called with,
+    # and can never itself be the thing that fails the attempt.
+    assert calls[0]["payload"]["input"] == '{"file_path": "slugify.py"}'
     # Attributable to the attempt that made them.
     assert calls[0]["payload"]["attempt_id"] == calls[1]["payload"]["attempt_id"]
     assert task.status == TaskStatus.DONE
@@ -564,3 +567,142 @@ def test_no_handoff_when_context_stays_under_budget(store, tmp_path):
     assert len(runner.calls) == 4
     # The ordinary revision path still carried the raw feedback, not a summary.
     assert "empty input" in runner.calls[2]["prompt"]
+
+
+def test_a_non_serialisable_tool_input_still_finishes_the_attempt(store):
+    """Telemetry must never fail an attempt. A tool input `json.dumps` cannot
+    encode used to raise inside `_invoke`'s closing transaction, rolling back
+    `finish_attempt` — the output, tokens and cost of a model call already paid
+    for — after which `_with_retry` ran the same call again. `ClaudeSDKRunner`
+    sanitises, but the ModelRunner seam does not require it and slice 4 adds a
+    second runner."""
+    worker = RunResult(
+        output="wrote the file",
+        tool_calls=[{"tool": "Write", "input": {"handle": object()}}],
+        tokens_in=11,
+        tokens_out=7,
+    )
+    task = add_task(store)
+    loop, runner = make_loop(store, [worker, APPROVE])
+    loop.run_task(task)
+
+    assert task.status == TaskStatus.DONE
+    assert len(runner.calls) == 2  # worker + validator: nothing was re-run
+    # The attempt finished: its tokens were counted, so its row was committed
+    # rather than rolled back by the telemetry that follows it.
+    assert store.attempt_tokens(task.id, "worker") == 18
+    assert task.output == "wrote the file"
+
+    call = [e for e in store.events(task.id) if e["kind"] == "tool_call"][0]
+    assert call["payload"]["tool"] == "Write"
+    assert "object object at" in call["payload"]["input"]
+
+
+class _Unrepresentable:
+    """A tool argument that defeats both `json.dumps` and `repr`."""
+
+    def __repr__(self):
+        raise RuntimeError("no repr for you")
+
+
+def test_a_tool_input_whose_repr_raises_still_finishes_the_attempt(store):
+    """`repr` is the fallback, not a guarantee: a `__repr__` that raises would
+    land back inside the very transaction the coercion exists to protect."""
+    worker = RunResult(
+        output="done", tool_calls=[{"tool": "X", "input": _Unrepresentable()}]
+    )
+    task = add_task(store)
+    loop, runner = make_loop(store, [worker, APPROVE])
+    loop.run_task(task)
+
+    assert task.status == TaskStatus.DONE
+    assert len(runner.calls) == 2  # nothing re-run
+    call = [e for e in store.events(task.id) if e["kind"] == "tool_call"][0]
+    assert call["payload"]["input"] == "<unrepresentable _Unrepresentable>"
+
+
+def test_an_oversized_tool_input_is_truncated(store):
+    """The audit log records what a tool was called with, not a copy of its
+    payload — a megabyte of file content in an event row buys nothing."""
+    worker = RunResult(
+        output="done",
+        tool_calls=[{"tool": "Write", "input": {"content": "x" * 10_000}}],
+    )
+    task = add_task(store)
+    loop, _ = make_loop(store, [worker, APPROVE])
+    loop.run_task(task)
+
+    call = [e for e in store.events(task.id) if e["kind"] == "tool_call"][0]
+    assert len(call["payload"]["input"]) <= _MAX_TOOL_INPUT_CHARS
+
+
+def test_a_non_serialisable_tool_name_still_finishes_the_attempt(store):
+    """The same hazard as the tool *input*, and it was missed the first time.
+    Both fields go into the one `json.dumps` in `log_event`, so coercing only
+    the input still let a non-string name roll back an already-paid
+    `finish_attempt` and hand the call back to `_with_retry`. Duck-typed
+    `ToolUseBlock`s make the name exactly as untrustworthy as the arguments."""
+    worker = RunResult(
+        output="wrote the file",
+        tool_calls=[{"tool": object(), "input": {"path": "a.py"}}],
+        tokens_in=11,
+        tokens_out=7,
+    )
+    task = add_task(store)
+    loop, runner = make_loop(store, [worker, APPROVE])
+    loop.run_task(task)
+
+    assert task.status == TaskStatus.DONE
+    assert len(runner.calls) == 2  # worker + validator: nothing was re-run
+    assert store.attempt_tokens(task.id, "worker") == 18
+    assert task.output == "wrote the file"
+    assert not [e for e in store.events(task.id) if e["kind"] == "infra_error"]
+
+    call = [e for e in store.events(task.id) if e["kind"] == "tool_call"][0]
+    assert "object object at" in call["payload"]["tool"]
+
+
+def test_a_tool_name_whose_str_raises_still_finishes_the_attempt(store):
+    """`str` is the fallback, not a guarantee — same reasoning as `repr` on the
+    input side."""
+
+    class _Unnameable:
+        def __str__(self):
+            raise RuntimeError("no name for you")
+
+    worker = RunResult(
+        output="done", tool_calls=[{"tool": _Unnameable(), "input": {"a": 1}}]
+    )
+    task = add_task(store)
+    loop, runner = make_loop(store, [worker, APPROVE])
+    loop.run_task(task)
+
+    assert task.status == TaskStatus.DONE
+    assert len(runner.calls) == 2  # nothing re-run
+    call = [e for e in store.events(task.id) if e["kind"] == "tool_call"][0]
+    assert call["payload"]["tool"] == "<unrepresentable _Unnameable>"
+
+
+def test_a_plain_tool_name_is_recorded_unquoted(store):
+    """The name is rendered as a name by the dashboard and read as one by
+    slice 5's policy, so the coercion must not JSON-quote `Read` into `"Read"`
+    the way the input side does."""
+    worker = RunResult(output="done", tool_calls=[{"tool": "Read", "input": {}}])
+    task = add_task(store)
+    loop, _ = make_loop(store, [worker, APPROVE])
+    loop.run_task(task)
+
+    call = [e for e in store.events(task.id) if e["kind"] == "tool_call"][0]
+    assert call["payload"]["tool"] == "Read"
+
+
+def test_a_missing_tool_name_is_recorded_as_unknown(store):
+    """A duck-typed block that carries no name at all is a record, not a
+    crash."""
+    worker = RunResult(output="done", tool_calls=[{"input": {"a": 1}}])
+    task = add_task(store)
+    loop, _ = make_loop(store, [worker, APPROVE])
+    loop.run_task(task)
+
+    call = [e for e in store.events(task.id) if e["kind"] == "tool_call"][0]
+    assert call["payload"]["tool"] == "unknown"

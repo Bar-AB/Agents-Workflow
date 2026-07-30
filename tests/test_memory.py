@@ -3,6 +3,7 @@
 import pytest
 
 from agentloop.memory import MemoryService
+from agentloop.models import Task
 from agentloop.store import Store
 
 
@@ -102,10 +103,16 @@ def test_explicit_approval_can_still_be_revoked(store):
     assert store.memory_read("project", "k") is None
 
 
+def a_task(store, title="T") -> int:
+    task = Task(id=None, title=title, goal="g", acceptance_criteria="c")
+    store.add_task(task)
+    return task.id
+
+
 def test_hot_project_fact_is_promoted_to_loop(store, memory):
     memory.remember("project", "test_command", "pytest -q", approved=True)
-    for _ in range(3):
-        memory.read("project", "test_command")
+    for i in range(3):
+        memory.read("project", "test_command", task_id=a_task(store, f"T{i}"))
 
     loop_keys = [r["key"] for r in store.memory_list(tier="loop")]
     assert "test_command" in loop_keys
@@ -113,14 +120,14 @@ def test_hot_project_fact_is_promoted_to_loop(store, memory):
 
 def test_cold_fact_is_not_promoted(store, memory):
     memory.remember("project", "rare", "seldom used", approved=True)
-    memory.read("project", "rare")
+    memory.read("project", "rare", task_id=a_task(store))
     assert store.memory_list(tier="loop") == []
 
 
 def test_promotion_is_recorded_in_the_audit_log(store, memory):
     memory.remember("project", "k", "v", approved=True)
-    for _ in range(3):
-        memory.read("project", "k")
+    for i in range(3):
+        memory.read("project", "k", task_id=a_task(store, f"T{i}"))
 
     promotions = [e for e in store.events() if e["kind"] == "memory_promoted"]
     assert promotions and promotions[0]["payload"]["key"] == "k"
@@ -128,8 +135,8 @@ def test_promotion_is_recorded_in_the_audit_log(store, memory):
 
 def test_loop_tier_facts_are_not_re_promoted(store, memory):
     memory.remember("loop", "k", "v", approved=True)
-    for _ in range(5):
-        memory.read("loop", "k")
+    for i in range(5):
+        memory.read("loop", "k", task_id=a_task(store, f"T{i}"))
     assert memory.maybe_promote("loop", "k") is False
 
 

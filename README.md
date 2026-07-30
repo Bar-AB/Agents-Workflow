@@ -33,7 +33,7 @@ agentloop/
   cli.py       add / plan / approve-plan / run / status / approve / reject /
                redo / pause / resume / abort / events / serve / memory / eval
 web/           Vite + React + TypeScript dashboard
-tests/         186 tests on MockRunner + real subprocesses (no API keys needed)
+tests/         229 tests on MockRunner + real subprocesses (no API keys needed)
 ```
 
 ## Quick start
@@ -118,12 +118,52 @@ fact that turns up relevant to `memory_promote_threshold` tasks is promoted to
 the loop tier — re-answering the same question is exactly the wasted spend
 tiering removes.
 
-"Relevant" is doing real work there: a hit is an injection the retrieval ranked
-above zero, not merely an injection. While the store holds fewer facts than the
-cap every approved fact is injected into every prompt, so counting injections
-would mean "existed while three tasks ran" and promote the whole project tier on
-schedule. It is still a proxy — what promotion wants to know is whether a fact
-changed the output, which the `retrieval` provenance now makes measurable.
+Both words in "relevant to N tasks" are load-bearing.
+
+**Relevant**, not merely injected: a hit is an injection the retrieval ranked
+above zero. While the store holds fewer facts than the cap every approved fact
+is injected into every prompt, so counting injections would mean "existed while
+three tasks ran" and promote the whole project tier on schedule.
+
+**Tasks**, not prompts: a worker round, a validator round and one revision are
+three injections of the same fact inside a *single* task, so counting prompts
+promoted a fact on the strength of one ordinary task. Hits are recorded per task
+in `memory_hits`, and `hit_count` is the size of that set — which also makes
+"which tasks did this fact serve?" answerable, so a promotion can be checked
+rather than trusted. A read with no task behind it (`agentloop memory`, `eval`)
+records recency but no hit.
+
+It is still a proxy — what promotion wants to know is whether a fact changed the
+output, which the `retrieval` provenance now makes measurable.
+
+**Promotion is a transition, not a copy.** The row *moves* to the `loop` tier,
+keeping its id, approval, pin and hit history. Nothing is duplicated, so there
+is no second row to inject alongside the first, none to re-promote forever, and
+none left approved after the original is revoked.
+
+Where a `loop` row already holds the key, only that row's *id* survives: the
+promoted value replaces its contents and the two facts' hits are merged. That is
+a winner being picked, so the displaced value is written into the
+`memory_promoted` event — nothing else in the audit log records a memory value,
+and it must stay recoverable. Approval then follows the approval-of-value rule,
+applied to *whichever value survived*: it stays approved only if a human
+approved that exact text. Two approved rows with different values are a genuine
+conflict, so that case drops to unapproved for a human to resolve. Any drop from
+approved logs `memory_revoked`, whichever row held the approval — a fact that
+stops being injected says so in the feed rather than leaving a bare
+`memory_write` to infer it from.
+
+Opening an older database merges the duplicate rows the old copy-promotion left
+behind, and resets `hit_count` — the old counter counted prompts, and carrying
+those numbers into a threshold that now means tasks would promote most of the
+project tier on the first prompt after the upgrade. That merge differs from the
+live one in two ways, because it repairs an existing database rather than
+recording a fact that won on merit: an **approved** loop value outranks an
+unapproved project value (otherwise opening the database would overwrite vetted
+content with the rewrite that un-approved it), and it logs
+`memory_duplicates_merged` rather than `memory_promoted` — nothing was promoted
+here, and reusing the event would make anyone counting promotions in the feed
+count database opens instead.
 
 **Pinned facts.** Prompt injection is capped (20 facts) so memory can't crowd
 out the task; past the cap, ordinary facts drop by alphabetical accident. Mark
@@ -161,7 +201,10 @@ or not yet written — can surface an unvetted fact; any future index is a
 derived cache that may only re-rank rows the store just handed it, never
 resurrect a revoked one. The caps and the pinned ceiling are unchanged, and a
 fact that fits under the cap is never dropped for scoring low — a zero score
-costs it a promotion credit, not its slot. With no query, or
+costs it a promotion credit, not its slot. That holds even for a backend that
+returns fewer candidates than it was given, which is the normal shape of a real
+index: whatever it ignores is appended behind what it ranked, in the store's own
+order, so a group of N always yields min(N, cap). With no query, or
 `memory_retrieval_backend: "none"`, selection falls back to exactly the old
 alphabetical behaviour — there is nothing to rank against, so inventing an
 order would be worse than the plain one.
@@ -181,7 +224,11 @@ close that:
 - **`tool_call`** — one row per tool an agent actually invoked (registry tools
   already reach the SDK, so this was happening unrecorded), attributed to the
   attempt that made it. Slice 5's auto-approval policy layers on this record
-  rather than inventing authorization and provenance at once.
+  rather than inventing authorization and provenance at once. The tool's
+  arguments are recorded as a coerced, truncated string: telemetry must never be
+  the thing that fails an attempt, and a value the JSON encoder chokes on used
+  to roll back the finished attempt — output, tokens and cost — of a model call
+  that had already been paid for.
 
 ## Token & cost accounting
 

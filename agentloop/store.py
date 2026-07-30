@@ -142,6 +142,18 @@ CREATE TABLE IF NOT EXISTS memory (
     UNIQUE(tier, key)
 );
 
+-- Which tasks a memory fact was actually relevant to. `hit_count` is the
+-- denormalized size of this set, and promotion's claim -- "relevant to N
+-- *tasks*" -- is only true because the set is keyed on the task. Counting
+-- injections instead counted worker + validator + one revision as three, so a
+-- single task promoted a fact on its own at the default threshold.
+CREATE TABLE IF NOT EXISTS memory_hits (
+    memory_id INTEGER NOT NULL REFERENCES memory(id) ON DELETE CASCADE,
+    task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    ts REAL NOT NULL,
+    UNIQUE(memory_id, task_id)
+);
+
 -- Real, executed test results (spec §5). Authoritative over the validator's
 -- self-reported TESTS: field.
 CREATE TABLE IF NOT EXISTS test_runs (
@@ -171,6 +183,17 @@ CREATE TABLE IF NOT EXISTS eval_runs (
 """
 
 
+# How much of a displaced memory value a merge event keeps. Enough to recognise
+# and recover what was overwritten; not a second copy of the store.
+_MAX_EVENT_VALUE_CHARS = 400
+
+
+class TransactionAborted(RuntimeError):
+    """A transaction was rolled back because an inner one failed, and that
+    failure never reached the caller. Raised at the outermost boundary so a
+    swallowed inner error cannot be mistaken for a group that committed."""
+
+
 class _LockedConnection:
     """Serializes access to one sqlite3 connection.
 
@@ -188,6 +211,10 @@ class _LockedConnection:
         # are deferred to the outermost transaction's single commit, so a
         # state change and its audit event land together or not at all.
         self._txn_depth = 0
+        # Set when any transaction in the current nest fails. The rollback and
+        # the decision not to commit both belong to the *outermost* boundary:
+        # see `transaction`.
+        self._txn_aborted = False
 
     def execute(self, sql: str, params: tuple = ()) -> _LockedCursor:
         with self._lock:
@@ -232,22 +259,46 @@ class _LockedConnection:
         append-only `events` log never diverges from the row it describes.
 
         Reentrant: a helper that opens its own transaction while inside one
-        joins the outer transaction rather than committing early."""
+        joins the outer transaction rather than committing early.
+
+        A failure anywhere in the nest aborts the whole nest, but the rollback
+        itself happens once, at the outermost boundary. Zeroing the depth on the
+        error path instead of decrementing it meant an enclosing block that
+        *caught* an inner transaction's error went on to decrement to -1, after
+        which every `commit()` saw a non-zero depth and silently stopped
+        committing: writes that returned normally and never landed. So the
+        depth is decremented on both paths, and a swallowed inner failure is
+        raised as `TransactionAborted` at the outermost exit rather than
+        committing the surviving half of a group — the half that landed would
+        otherwise look like a complete group nobody questioned."""
         with self._lock:
             self._txn_depth += 1
             try:
                 yield
             except BaseException:
-                # Abort the entire (possibly nested) transaction. Rollback only
-                # discards uncommitted writes; it never touches committed
-                # `events` rows, so the append-only rule holds.
-                self._conn.rollback()
-                self._txn_depth = 0
+                self._txn_aborted = True
                 raise
-            else:
+            finally:
                 self._txn_depth -= 1
-                if self._txn_depth == 0:
-                    self._conn.commit()
+                outermost = self._txn_depth == 0
+                aborted = self._txn_aborted
+                if outermost:
+                    self._txn_aborted = False
+                    if aborted:
+                        # Rollback only discards uncommitted writes; it never
+                        # touches committed `events` rows, so the append-only
+                        # rule holds.
+                        self._conn.rollback()
+                    else:
+                        self._conn.commit()
+            # Only reached when this block exited normally: an inner failure was
+            # caught by the code between here and there. The writes are gone, so
+            # say so rather than returning as if they landed.
+            if outermost and aborted:
+                raise TransactionAborted(
+                    "an inner transaction failed and its error was swallowed; "
+                    "the whole transaction was rolled back"
+                )
 
     def close(self) -> None:
         with self._lock:
@@ -282,17 +333,35 @@ class Store:
         self._conn = _LockedConnection(raw)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
+        # Which tables predate this open, captured *before* the schema script
+        # creates the missing ones: a table that is new here was written by an
+        # older build of agentloop, and `_migrate` sometimes has to reconcile
+        # what that build left behind, not just add a column.
+        existing = self._tables()
         self._conn.executescript(_SCHEMA)
-        self._migrate()
+        self._migrate(existing)
         self._conn.commit()
 
-    def _migrate(self) -> None:
-        """Add columns introduced after a database was first created.
+    def _tables(self) -> set[str]:
+        return {
+            r["name"]
+            for r in self._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+
+    def _migrate(self, existing: set[str] | None = None) -> None:
+        """Bring a database written by an older build up to date.
 
         `CREATE TABLE IF NOT EXISTS` never alters an existing table, so a store
         opened against an older db is missing the newer columns. Add them
         idempotently; SQLite ignores the change once the column exists.
+
+        `existing` is the set of tables that were present before this open, used
+        by `_reconcile_memory_hits` to recognise a database written before hits
+        were counted per task.
         """
+        existing = self._tables() if existing is None else existing
         additions = [
             ("attempts", "cache_creation_tokens", "INTEGER NOT NULL DEFAULT 0"),
             ("attempts", "cache_read_tokens", "INTEGER NOT NULL DEFAULT 0"),
@@ -316,6 +385,59 @@ class Store:
             }
             if column not in cols:
                 self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+        if "memory" in existing and "memory_hits" not in existing:
+            self._reconcile_memory_hits()
+
+    def _reconcile_memory_hits(self) -> None:
+        """Repair what the pre-`memory_hits` build of agentloop left behind.
+
+        Two things, both one-shot, both only for a database that already had a
+        `memory` table before `memory_hits` existed.
+
+        **The old `hit_count` is a different unit.** It counted *prompts*, so
+        every project fact sitting at or above the threshold would promote on
+        its first relevant read after the upgrade — precisely the "one ordinary
+        task promoted the whole project tier" failure this build exists to
+        remove, preserved intact for every existing database. There is nothing
+        to backfill from (the per-task evidence was never recorded), so the
+        counters restart at zero against the table that now defines them. That
+        is also what keeps `hit_count` equal to the size of a fact's
+        `memory_hits` set, which is the invariant the rest of the code reads it
+        as.
+
+        **Duplicate keys.** The old promotion copied rather than moved, so a
+        database can hold both `project/k` and `loop/k`. Both are injected, so
+        one real fact is evicted from a cap that is not full, and revoking one
+        leaves the other approved. They are merged here rather than being left
+        to clear themselves the next time each fact happens to get hot again.
+
+        The merge runs with `origin='migration'`, which differs from the live
+        promotion in two ways, both because this is a repair of somebody's
+        existing database rather than a fact winning on merit: an **approved**
+        loop value outranks an unapproved project value (otherwise opening the
+        database would replace vetted content with the rewrite that un-approved
+        it), and the audit event is `memory_duplicates_merged` rather than
+        `memory_promoted` (nothing was promoted here — the old build did that
+        already, and reusing the event would make the feed report a promotion
+        every time a database is opened).
+        """
+        with self.transaction():
+            reset = self._conn.execute(
+                "UPDATE memory SET hit_count=0 WHERE hit_count<>0"
+            )
+            if reset.rowcount:
+                self.log_event(
+                    None, "memory_hit_counts_reset", {"rows": int(reset.rowcount)}
+                )
+            dupes = self._conn.execute(
+                "SELECT p.id AS project_id, l.id AS loop_id FROM memory p"
+                " JOIN memory l ON l.key = p.key AND l.tier='loop'"
+                " WHERE p.tier='project'"
+            ).fetchall()
+            for row in dupes:
+                self._merge_into_loop(
+                    int(row["project_id"]), int(row["loop_id"]), origin="migration"
+                )
 
     def close(self) -> None:
         self._conn.close()
@@ -831,19 +953,238 @@ class Store:
             )
 
     def memory_read(
-        self, tier: str, key: str, approved_only: bool = True
+        self,
+        tier: str,
+        key: str,
+        approved_only: bool = True,
+        task_id: int | None = None,
     ) -> str | None:
-        q = "SELECT value FROM memory WHERE tier=? AND key=?"
-        if approved_only:
-            q += " AND approved=1"
-        row = self._conn.execute(q, (tier, key)).fetchone()
-        if row:
-            self._conn.write(
-                "UPDATE memory SET hit_count=hit_count+1, last_used_at=?"
-                " WHERE tier=? AND key=?",
-                (time.time(), tier, key),
+        """Read one fact, recording the read against the task that caused it.
+
+        The lookup and the bumps it justifies are one transaction. As two
+        separate lock acquisitions, a rewrite landing in the gap had its
+        now-unapproved value credited with the hit, and `AND approved=1` on both
+        UPDATEs says so in SQL as well — the lock is enough within one process,
+        the predicate is what holds if a second one ever shares the database.
+
+        `task_id` is what makes `hit_count` mean "distinct tasks this fact was
+        relevant to", which is what promotion claims. A read with no task
+        (`agentloop memory`, eval, a direct call) still records recency but no
+        hit: promotion is a claim about tasks, and there isn't one.
+        """
+        gate = " AND approved=1" if approved_only else ""
+        with self.transaction():
+            row = self._conn.execute(
+                f"SELECT id, value FROM memory WHERE tier=? AND key=?{gate}",
+                (tier, key),
+            ).fetchone()
+            if row is None:
+                return None
+            mem_id = int(row["id"])
+            now = time.time()
+            touched = self._conn.execute(
+                f"UPDATE memory SET last_used_at=? WHERE id=?{gate}", (now, mem_id)
             )
-        return row["value"] if row else None
+            # The gated UPDATE matching nothing means the row stopped being
+            # readable between the SELECT and here. Recording the hit anyway
+            # would put a row in `memory_hits` that `hit_count` never counted,
+            # and OR IGNORE means the same task can never make it up later — the
+            # evidence and the counter would disagree permanently.
+            if task_id is not None and touched.rowcount == 1:
+                # OR IGNORE plus the rowcount check is the whole "distinct
+                # tasks" rule: the second prompt of the same task inserts
+                # nothing, so it bumps nothing.
+                inserted = self._conn.execute(
+                    "INSERT OR IGNORE INTO memory_hits (memory_id, task_id, ts)"
+                    " VALUES (?,?,?)",
+                    (mem_id, task_id, now),
+                )
+                if inserted.rowcount == 1:
+                    self._conn.execute(
+                        f"UPDATE memory SET hit_count=hit_count+1 WHERE id=?{gate}",
+                        (mem_id,),
+                    )
+            return row["value"]
+
+    def memory_hits(self, mem_id: int) -> list[int]:
+        """The tasks a fact has been relevant to — the evidence behind
+        `hit_count`, so a promotion can be checked rather than trusted."""
+        return [
+            int(r["task_id"])
+            for r in self._conn.execute(
+                "SELECT task_id FROM memory_hits WHERE memory_id=? ORDER BY ts",
+                (mem_id,),
+            ).fetchall()
+        ]
+
+    def memory_promote(self, mem_id: int) -> None:
+        """Move a project fact to the loop tier. One row, not two.
+
+        Promotion used to *copy* the row and leave the project one in place,
+        still approved and still counting: both were injected (a real fact
+        evicted from a cap that was never full), `memory_promoted` re-fired on
+        every later read, and revoking the project fact left the copy approved —
+        the value-approval rule bypassed by memory's own promotion path.
+
+        Moving the row keeps its `id`, so `approved`, `pinned`, `hit_count`,
+        `last_used_at` and every `memory_hits` row follow it without being
+        copied, as does the memory id already recorded in past `retrieval`
+        events. Nothing is duplicated, so nothing can diverge.
+
+        A `loop` row already holding the key is the one case the move cannot
+        take; see `_merge_into_loop`.
+        """
+        with self.transaction():
+            row = self._conn.execute(
+                "SELECT * FROM memory WHERE id=?", (mem_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"No memory row {mem_id}")
+            if row["tier"] != "project":
+                raise ValueError(f"Only project facts promote (got {row['tier']!r})")
+            key = row["key"]
+            collision = self._conn.execute(
+                "SELECT id FROM memory WHERE tier='loop' AND key=?", (key,)
+            ).fetchone()
+            if collision is None:
+                self._conn.execute(
+                    "UPDATE memory SET tier='loop' WHERE id=?", (mem_id,)
+                )
+                self.log_event(
+                    None,
+                    "memory_promoted",
+                    {
+                        "key": key,
+                        "from": "project",
+                        "to": "loop",
+                        "hit_count": row["hit_count"],
+                        "merged": False,
+                    },
+                )
+            else:
+                self._merge_into_loop(mem_id, int(collision["id"]))
+
+    def _merge_into_loop(
+        self, project_id: int, loop_id: int, origin: str = "promotion"
+    ) -> None:
+        """Collapse a `project`/`loop` pair of the same key onto the loop row.
+
+        `UNIQUE(tier, key)` blocks the plain move whenever a `loop` row already
+        holds the key — the state every database written by the old
+        copy-promotion is in, which is why the migration reuses this too.
+
+        **A winner is picked and the loser is written into the event.** Only the
+        row *id* survives; its content is replaced. No other event payload
+        records a memory value, so without this the displaced text would be gone
+        for good.
+
+        Which value wins depends on `origin`, because the two callers are not
+        the same situation:
+
+        - `'promotion'` — the live path. The promoted project value wins: it is
+          the fact that just proved itself over `memory_promote_threshold`
+          distinct tasks, and the loop row is the stale one.
+        - `'migration'` — the one-shot repair of a database the old
+          copy-promotion wrote (`_reconcile_memory_hits`). Here an **approved**
+          loop value beats an unapproved project value. Those pairs are usually
+          a vetted copy next to a project row that was rewritten afterwards (the
+          approval-of-value rule un-approved it at that point), so "the promoted
+          value wins" would overwrite vetted content with the unvetted rewrite
+          on nothing more than opening the database, leaving the human-approved
+          text recoverable only from a truncated event payload.
+
+        Approval then follows the approval-of-value rule against *whichever
+        value survived*: it stays approved only if a human approved that exact
+        text. Two approved rows with different values are a genuine conflict, so
+        that case drops to unapproved for a human to resolve — but a merge that
+        does not displace any approved value must not quietly un-approve one,
+        which is why the check is against the surviving value rather than
+        against whichever row happened to be the loop row.
+
+        Any drop from approved logs `memory_revoked`, no matter which row held
+        the approval. Conditioning that on the loop row alone missed the case
+        where the *project* row was the approved one: the fact stopped being
+        injected and nothing in the feed said so.
+
+        The hits move too. Deleting the project row cascades its `memory_hits`
+        away, so they are copied over first and the survivor's `hit_count` is
+        recounted from the merged set — the counter is the size of the evidence
+        on both promotion paths, and the move path needs no recount only because
+        it never changes either.
+        """
+        if origin not in ("promotion", "migration"):
+            raise ValueError(f"Unknown merge origin {origin!r}")
+        project = self._conn.execute(
+            "SELECT * FROM memory WHERE id=?", (project_id,)
+        ).fetchone()
+        loop = self._conn.execute(
+            "SELECT * FROM memory WHERE id=?", (loop_id,)
+        ).fetchone()
+        if project is None or loop is None:
+            raise KeyError(f"No memory rows {project_id}/{loop_id} to merge")
+        key = project["key"]
+        p_approved, l_approved = bool(project["approved"]), bool(loop["approved"])
+        same_value = loop["value"] == project["value"]
+        # The migration protects vetted content; the live path prefers the fact
+        # that just got hot. See the docstring.
+        keep_loop_value = origin == "migration" and l_approved and not p_approved
+        value = loop["value"] if keep_loop_value else project["value"]
+        displaced = project["value"] if keep_loop_value else loop["value"]
+        # Approval of the *surviving* value, not of a particular row.
+        approved_for_value = (p_approved and value == project["value"]) or (
+            l_approved and value == loop["value"]
+        )
+        conflict = p_approved and l_approved and not same_value
+        survivor_approved = approved_for_value and not conflict
+        with self.transaction():
+            self.memory_write(
+                "loop",
+                key,
+                value,
+                approved=survivor_approved,
+                pinned=bool(project["pinned"]),
+            )
+            self._conn.execute(
+                "INSERT OR IGNORE INTO memory_hits (memory_id, task_id, ts)"
+                " SELECT ?, task_id, ts FROM memory_hits WHERE memory_id=?",
+                (loop_id, project_id),
+            )
+            self._conn.execute("DELETE FROM memory WHERE id=?", (project_id,))
+            self._conn.execute(
+                "UPDATE memory SET hit_count="
+                "(SELECT COUNT(*) FROM memory_hits WHERE memory_id=?)"
+                " WHERE id=?",
+                (loop_id, loop_id),
+            )
+            # `memory_promoted` is the record of a promotion, so the migration
+            # does not borrow it: these rows were promoted by the old build,
+            # long before this database was opened, and counting them as
+            # promotions would make the feed report a promotion per upgrade.
+            self.log_event(
+                None,
+                (
+                    "memory_promoted"
+                    if origin == "promotion"
+                    else "memory_duplicates_merged"
+                ),
+                {
+                    "key": key,
+                    "from": "project",
+                    "to": "loop",
+                    "hit_count": project["hit_count"],
+                    "merged": True,
+                    "displaced_value": displaced[:_MAX_EVENT_VALUE_CHARS],
+                    "displaced_approved": (
+                        p_approved if keep_loop_value else l_approved
+                    ),
+                },
+            )
+            if (p_approved or l_approved) and not survivor_approved:
+                self.log_event(
+                    None,
+                    "memory_revoked",
+                    {"tier": "loop", "key": key, "reason": "value replaced by merge"},
+                )
 
     def memory_list(
         self, tier: str | None = None, approved_only: bool = False

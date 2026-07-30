@@ -135,12 +135,14 @@ export interface MemoryFact {
   tier: 'project' | 'loop'
   key: string
   value: string
+  // Distinct *tasks* this fact was ranked into a prompt for, not prompts: one
+  // task's worker, validator and revision are three injections and one hit.
   hit_count: number
   approved: number
   pinned: number
   created_at: number
-  // Null until the fact is first read out: hit_count says how often, never how
-  // recently.
+  // Null until the fact is first read out: hit_count says how many tasks, never
+  // how recently.
   last_used_at: number | null
 }
 

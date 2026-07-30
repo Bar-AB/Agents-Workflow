@@ -55,6 +55,7 @@ class MemoryService:
         limit: int = _MAX_FACTS_IN_PROMPT,
         pinned_limit: int = _MAX_PINNED_FACTS,
         query: str = "",
+        task_id: int | None = None,
     ) -> tuple[str, dict | None]:
         """Approved facts as a prompt block, plus the provenance of that block.
 
@@ -73,7 +74,12 @@ class MemoryService:
         The provenance dict (None when nothing was ranked) is *returned* rather
         than logged here: a retrieval is only meaningful as part of the agent
         invocation it fed, and this service does not know which attempt that is.
-        The caller logs it against that attempt — see `agents._invoke`."""
+        The caller logs it against that attempt — see `agents._invoke`.
+
+        `task_id` is what a hit is counted against. Without it a fact's
+        `hit_count` counted prompts, and worker + validator + one revision is
+        three prompts inside a single task — so one ordinary task promoted a
+        fact on its own at the default threshold of three."""
         approved = list(self.store.memory_list(approved_only=True))
         order = lambda r: (0 if r["tier"] == "loop" else 1, r["key"])
         pinned = sorted((r for r in approved if r["pinned"]), key=order)
@@ -97,24 +103,35 @@ class MemoryService:
         provenance = (
             self._provenance(query, rows, scores, len(approved)) if ranked else None
         )
-        self._record_reads(rows, scores, ranked)
+        self._record_reads(rows, scores, ranked, task_id)
         return "\n".join(lines), provenance
 
     def _rank(
         self, query: str, rows: list[dict], top_k: int, scores: dict[int, float]
     ) -> list[dict]:
-        """Reorder one group by backend relevance, recording the scores."""
+        """Reorder one group by backend relevance, recording the scores.
+
+        Ranking decides order, never membership. A backend may return fewer than
+        `top_k` — a real index returns its own hits, not the caller's set — so
+        candidates it ignored are appended behind the ranked ones in the order
+        the store supplied (`ORDER BY tier, key`), and the group is truncated to
+        `top_k` here rather than wherever the backend felt like stopping. A
+        group of N therefore always yields min(N, top_k), and an ignored fact
+        scores 0.0: it loses a promotion credit, not its slot, which is the rule
+        a low-scoring fact already lived under."""
         if not rows:
             return []
         by_id = {int(r["id"]): r for r in rows}
         ordered = []
         for mem_id, score in self.backend.search(query, rows, top_k):
-            row = by_id.get(int(mem_id))
+            row = by_id.pop(int(mem_id), None)
             if row is None:
                 continue  # a backend can only ever return fewer, never other
             scores[int(mem_id)] = float(score)
             ordered.append(row)
-        return ordered
+        # Whatever the backend did not rank, in candidate order, behind it.
+        ordered.extend(r for r in rows if int(r["id"]) in by_id)
+        return ordered[:top_k]
 
     def _provenance(
         self,
@@ -145,8 +162,8 @@ class MemoryService:
             ],
         }
 
-    def read(self, tier: str, key: str) -> str | None:
-        value = self.store.memory_read(tier, key, approved_only=True)
+    def read(self, tier: str, key: str, task_id: int | None = None) -> str | None:
+        value = self.store.memory_read(tier, key, approved_only=True, task_id=task_id)
         if value is not None:
             self.maybe_promote(tier, key)
         return value
@@ -171,36 +188,30 @@ class MemoryService:
     def maybe_promote(self, tier: str, key: str) -> bool:
         """Promote a hot project fact to loop memory. Returns True if promoted.
 
-        The read of `hit_count` and the write it justifies happen in one
+        The read of `hit_count` and the move it justifies happen in one
         transaction: with parallel workers two threads can otherwise both read
         the same threshold-crossing count and both promote, writing two
         `memory_promoted` events for one promotion and making the audit log
-        disagree with what actually happened."""
+        disagree with what actually happened.
+
+        Promotion is a *transition* — `Store.memory_promote` moves the row
+        rather than copying it, so this cannot fire twice for one fact: the row
+        is no longer `project`, and nothing else is."""
         if tier != "project":
             return False
         with self.store.transaction():
             row = self._find(tier, key)
             if row is None or row["hit_count"] < self.promote_threshold:
                 return False
-            # Carry approval across: a fact already vetted for this project does
-            # not need re-vetting to be reused, and it stays visible in the log.
-            self.store.memory_write(
-                "loop", key, row["value"], approved=bool(row["approved"])
-            )
-            self.store.log_event(
-                None,
-                "memory_promoted",
-                {
-                    "key": key,
-                    "from": "project",
-                    "to": "loop",
-                    "hit_count": row["hit_count"],
-                },
-            )
+            self.store.memory_promote(int(row["id"]))
         return True
 
     def _record_reads(
-        self, rows: list[dict], scores: dict[int, float], ranked: bool
+        self,
+        rows: list[dict],
+        scores: dict[int, float],
+        ranked: bool,
+        task_id: int | None = None,
     ) -> None:
         """Count a hit only where there is evidence the fact was relevant.
 
@@ -210,6 +221,12 @@ class MemoryService:
         the whole project tier to `loop` on schedule. A positive relevance score
         is the weakest signal that actually distinguishes facts from each other,
         so it is what counts — an unranked selection counts nothing at all.
+
+        A hit is counted per *task*, not per prompt: worker, validator and each
+        revision retrieve separately, so counting prompts made one ordinary task
+        promote a fact on its own at the default threshold of three. The store
+        keys the hit on `task_id` and only bumps `hit_count` the first time a
+        task turns up, which is what makes "relevant to three tasks" true.
 
         It is still a proxy. What promotion really wants to know is whether the
         fact changed the agent's output, which needs the `retrieval` events to be
@@ -221,7 +238,9 @@ class MemoryService:
         for r in rows:
             if scores.get(int(r["id"]), 0.0) <= 0.0:
                 continue
-            self.store.memory_read(r["tier"], r["key"], approved_only=True)
+            self.store.memory_read(
+                r["tier"], r["key"], approved_only=True, task_id=task_id
+            )
             self.maybe_promote(r["tier"], r["key"])
 
     def _find(self, tier: str, key: str) -> dict | None:
