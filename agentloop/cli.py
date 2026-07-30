@@ -38,7 +38,7 @@ def _memory_cmd(store: Store, args) -> int:
         for r in rows:
             flag = "approved" if r["approved"] else "PENDING "
             print(
-                f"[{r['id']:3d}] {flag} {r['tier']:8s} hits={r['hit_count']:<3d}"
+                f"[{r['id']:3d}] {flag} {r['tier']:8s} tasks={r['hit_count']:<3d}"
                 f" {r['key']}: {r['value'][:60]}"
             )
     elif args.mem_cmd == "approve":

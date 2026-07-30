@@ -7,7 +7,7 @@ import threading
 import pytest
 
 from agentloop.models import Task, TaskStatus
-from agentloop.store import Store
+from agentloop.store import Store, TransactionAborted
 
 
 @pytest.fixture()
@@ -121,3 +121,53 @@ def test_claim_logs_an_event(store):
     claimed = store.claim_next_task("w1")
     kinds = [e["kind"] for e in store.events(claimed.id)]
     assert "task_claimed" in kinds
+
+
+# -- nested transactions: depth bookkeeping ----------------------------------
+
+
+def test_a_swallowed_inner_failure_does_not_wedge_later_writes(store):
+    """`transaction()` used to zero the depth on error instead of decrementing
+    it. An enclosing block that caught an inner transaction's error then
+    decremented to -1, and every later `commit()` saw a non-zero depth and
+    silently stopped committing — a write that returned normally and never
+    landed. Unreachable while nothing nests; slices 5-6 add nesting."""
+    with pytest.raises(TransactionAborted):
+        with store.transaction():
+            store.log_event(None, "outer", {})
+            try:
+                with store.transaction():
+                    raise RuntimeError("inner")
+            except RuntimeError:
+                pass  # the enclosing block swallows it
+
+    assert store._conn._txn_depth == 0
+
+    # The connection still commits, rather than accumulating writes forever.
+    store.add_task(a_task("after the abort"))
+    assert [t.title for t in store.list_tasks()] == ["after the abort"]
+
+
+def test_a_swallowed_inner_failure_rolls_the_whole_group_back(store):
+    """All-or-nothing survives the swallow: the outer block's writes cannot
+    commit around a rolled-back inner one, because the half that landed would
+    look like a complete group nobody questioned."""
+    with pytest.raises(TransactionAborted):
+        with store.transaction():
+            store.add_task(a_task("outer work"))
+            try:
+                with store.transaction():
+                    raise RuntimeError("inner")
+            except RuntimeError:
+                pass
+
+    assert store.list_tasks() == []
+
+
+def test_nested_transactions_still_commit_once_on_success(store):
+    with store.transaction():
+        store.add_task(a_task("nested"))
+        with store.transaction():
+            store.log_event(None, "inner", {})
+    assert [t.title for t in store.list_tasks()] == ["nested"]
+    assert store._conn._txn_depth == 0

@@ -37,6 +37,11 @@ _MAX_QUERY_EXTRA_CHARS = 2000
 # transcripts would otherwise be the largest thing in the prompt.
 _MAX_UPSTREAM_CHARS = 2000
 
+# How much of a tool's arguments the audit log keeps. The record answers "what
+# was this tool called with", not "what did it write".
+_MAX_TOOL_INPUT_CHARS = 2000
+_MAX_TOOL_NAME_CHARS = 200
+
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(.+?)```", re.DOTALL | re.IGNORECASE)
 
 # Largest planner reply worth attempting to parse. A real plan is a few KB; far
@@ -114,8 +119,8 @@ def _invoke(
                     "attempt_id": attempt_id,
                     "agent_kind": kind,
                     "role": role,
-                    "tool": call.get("tool", "unknown"),
-                    "input": call.get("input"),
+                    "tool": _tool_name_repr(call.get("tool")),
+                    "input": _tool_input_repr(call.get("input")),
                 },
             )
         store.log_event(
@@ -134,8 +139,62 @@ def _invoke(
     return result, attempt_id
 
 
+def _tool_name_repr(value) -> str:
+    """A tool's name as a bounded string, for the audit log only.
+
+    Same hazard as `_tool_input_repr`, same transaction, and it was missed the
+    first time: `tool` and `input` are encoded by the *one* `json.dumps` in
+    `log_event`, so coercing only the input still let a non-string name roll
+    back an already-paid `finish_attempt` and hand the call back to
+    `_with_retry`. Duck-typed `ToolUseBlock`s make the name exactly as
+    untrustworthy as the arguments.
+
+    Not routed through `_tool_input_repr`: this field is rendered as a name by
+    the dashboard and read as one by slice 5's policy, and `json.dumps` would
+    turn `Read` into `"Read"`.
+    """
+    if value is None:
+        return "unknown"
+    if isinstance(value, str):
+        return value[:_MAX_TOOL_NAME_CHARS]
+    try:
+        text = str(value)
+    except Exception:
+        # A `__str__` that raises would put us straight back in the transaction
+        # this function exists to protect.
+        text = f"<unrepresentable {type(value).__name__}>"
+    return text[:_MAX_TOOL_NAME_CHARS]
+
+
+def _tool_input_repr(value) -> str:
+    """A tool's arguments as a bounded string, for the audit log only.
+
+    Telemetry must never fail an attempt. `json.dumps` on a value it cannot
+    encode raised inside `_invoke`'s closing transaction, rolling back
+    `finish_attempt` — the output, tokens and cost of a model call already paid
+    for — after which `_with_retry` ran the same call again. `ClaudeSDKRunner`
+    sanitises its blocks, but the `ModelRunner` seam does not require it and a
+    second provider is a new chance to get it wrong, so the coercion lives here,
+    at the seam, rather than in one backend.
+
+    Truncated because the log records what a tool was called with, not a copy of
+    its payload: a megabyte of file content in an event row buys nothing.
+    """
+    try:
+        text = json.dumps(value, sort_keys=True)
+    except Exception:
+        # `repr` is a fallback, not a guarantee — a __repr__ that raises would
+        # put us straight back in the transaction this function exists to
+        # protect, so the last resort names the type and nothing else.
+        try:
+            text = repr(value)
+        except Exception:
+            text = f"<unrepresentable {type(value).__name__}>"
+    return text[:_MAX_TOOL_INPUT_CHARS]
+
+
 def _memory_block(
-    memory: MemoryService | None, query: str = ""
+    memory: MemoryService | None, query: str = "", task_id: int | None = None
 ) -> tuple[str, dict | None]:
     """Approved facts only — unvetted memory never reaches a prompt.
 
@@ -145,10 +204,13 @@ def _memory_block(
 
     Returns the block and its provenance, which the caller hands to `_invoke` so
     the retrieval is recorded against the attempt it fed. An unranked selection
-    (no query, or ranking disabled) has no provenance and logs nothing."""
+    (no query, or ranking disabled) has no provenance and logs nothing.
+
+    `task_id` is what any hit this injection earns is counted against — see
+    `MemoryService._record_reads`."""
     if memory is None:
         return "", None
-    facts, provenance = memory.facts_for_prompt(query=query)
+    facts, provenance = memory.facts_for_prompt(query=query, task_id=task_id)
     block = f"\n## Known project facts\n{facts}\n" if facts else ""
     return block, provenance
 
@@ -225,7 +287,9 @@ def run_worker(
         f"## Goal\n{task.goal}\n\n"
         f"## Acceptance criteria\n{task.acceptance_criteria}\n"
     )
-    memory_block, retrieval = _memory_block(memory, _retrieval_query(task, feedback))
+    memory_block, retrieval = _memory_block(
+        memory, _retrieval_query(task, feedback), task.id
+    )
     prompt += memory_block
     prompt += _upstream_block(store, task)
     if workspace:
@@ -344,7 +408,9 @@ def run_planner(
         f"## Acceptance criteria for the goal as a whole\n"
         f"{plan_task.acceptance_criteria}\n"
     )
-    memory_block, retrieval = _memory_block(memory, _retrieval_query(plan_task))
+    memory_block, retrieval = _memory_block(
+        memory, _retrieval_query(plan_task), plan_task.id
+    )
     prompt += memory_block
     prompt += (
         "\nDecompose this into independently executable tasks and their "
@@ -504,7 +570,7 @@ def run_validator(
         f"## Worker output\n{worker_output}\n"
     )
     memory_block, retrieval = _memory_block(
-        memory, _retrieval_query(task, worker_output)
+        memory, _retrieval_query(task, worker_output), task.id
     )
     prompt += memory_block
     prompt += _test_block(test_result)

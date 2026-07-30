@@ -111,8 +111,19 @@ class RetrievalBackend(Protocol):
     ) -> list[tuple[int, float]]:
         """Rank `candidates` (approved memory rows) against `query`.
 
-        Returns at most `top_k` `(memory id, score)` pairs, best first. Ids not
-        returned are simply not injected.
+        Returns at most `top_k` `(memory id, score)` pairs, best first.
+
+        Returning fewer than `top_k`, or omitting an id, decides **order only** —
+        it does not drop the fact. `MemoryService._rank` pads unreturned
+        candidates back in, in candidate order, and applies `top_k` itself, so a
+        backend that scores nothing still injects what fits under the cap. A
+        fact is withheld by the approval gate, never by a ranking miss.
+
+        Two consequences for an implementer: score ties are broken by candidate
+        order (the caller's `ORDER BY tier, key`), so rebuild any subset in
+        *candidate* order rather than the index's own; and the candidates are
+        already approved rows, so a backend re-ranks what the store handed over
+        and is never a second source of truth about what may be read.
         """
         ...
 

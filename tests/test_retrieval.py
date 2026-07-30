@@ -12,6 +12,7 @@ import pytest
 
 from agentloop.config import LoopConfig
 from agentloop.memory import MemoryService, _MAX_FACTS_IN_PROMPT
+from agentloop.models import Task
 from agentloop.retrieval import (
     HashingBackend,
     cosine,
@@ -117,10 +118,16 @@ def test_pinned_facts_still_bypass_the_cap_under_ranking(store, memory):
     assert block.splitlines()[0].startswith("- (project) *")
 
 
+def a_task(store, title="T") -> int:
+    task = Task(id=None, title=title, goal="g", acceptance_criteria="c")
+    store.add_task(task)
+    return task.id
+
+
 def test_a_fact_relevant_to_three_tasks_is_promoted(store, memory):
     store.memory_write("project", "hot", "deploy rollout", approved=True)
-    for _ in range(3):
-        memory.facts_for_prompt(query="deploy rollout")
+    for i in range(3):
+        memory.facts_for_prompt(query="deploy rollout", task_id=a_task(store, f"T{i}"))
     assert [r["key"] for r in store.memory_list(tier="loop")] == ["hot"]
 
 
@@ -132,8 +139,10 @@ def test_an_irrelevant_fact_riding_along_under_the_cap_is_not_a_hit(store, memor
     store.memory_write("project", "hot", "deploy rollout", approved=True)
     store.memory_write("project", "cold", "colour of the bikeshed", approved=True)
 
-    for _ in range(3):
-        block, _ = memory.facts_for_prompt(query="deploy rollout")
+    for i in range(3):
+        block, _ = memory.facts_for_prompt(
+            query="deploy rollout", task_id=a_task(store, f"T{i}")
+        )
         assert "cold" in block  # still injected: ranking decides order, not fit
 
     counts = {r["key"]: r["hit_count"] for r in store.memory_list(tier="project")}
@@ -238,3 +247,71 @@ def test_none_disables_retrieval_entirely():
 def test_unknown_backend_name_is_rejected():
     with pytest.raises(ValueError):
         get_backend("pinecone", LoopConfig())
+
+
+# -- ranking decides order, never membership ---------------------------------
+
+
+class _PartialBackend:
+    """A backend that ranks only what it recognises — the shape any real index
+    has, since an index returns its own hits rather than the caller's set."""
+
+    name = "partial"
+
+    def search(self, query, candidates, top_k):
+        hits = [c for c in candidates if "deploy" in c["value"]]
+        return [(int(c["id"]), 1.0) for c in hits][:top_k]
+
+
+def test_a_backend_returning_a_subset_still_fills_the_cap(store):
+    """`_rank` used to keep only the ids the backend returned, so a partial
+    backend silently shrank the injection below the cap. Ranking decides order
+    only: a fact that fits under the cap is never dropped for scoring low."""
+    for i in range(5):
+        store.memory_write("project", f"cold_{i}", f"unrelated {i}", approved=True)
+    store.memory_write("project", "hot", "deploy rollout", approved=True)
+    memory = MemoryService(store, backend=_PartialBackend())
+
+    block, _ = memory.facts_for_prompt(query="deploy rollout")
+    assert len(block.splitlines()) == 6
+    assert block.splitlines()[0].endswith("hot: deploy rollout")
+
+
+def test_facts_the_backend_ignored_keep_the_stores_own_order(store):
+    """The unranked tail falls back to the store's ORDER BY tier, key — the
+    pre-ranking selection — rather than to whatever order the index happened to
+    hand back."""
+    for key in ("ccc", "aaa", "bbb"):
+        store.memory_write("project", key, "unrelated", approved=True)
+    store.memory_write("loop", "hot", "deploy rollout", approved=True)
+    memory = MemoryService(store, backend=_PartialBackend())
+
+    block, _ = memory.facts_for_prompt(query="deploy rollout")
+    keys = [line.split(": ", 1)[0].split()[-1] for line in block.splitlines()]
+    assert keys == ["hot", "aaa", "bbb", "ccc"]
+
+
+def test_an_ignored_fact_scores_zero_and_earns_no_promotion_credit(store):
+    """It costs the fact a promotion credit, not its slot — the same rule a
+    low-scoring fact already lived under."""
+    store.memory_write("project", "cold", "unrelated", approved=True)
+    memory = MemoryService(store, promote_threshold=3, backend=_PartialBackend())
+
+    # A real task id, or the hit_count assertion could not fail whatever the
+    # score gate did — a read with no task never counts anything.
+    _, provenance = memory.facts_for_prompt(
+        query="deploy rollout", task_id=a_task(store)
+    )
+    assert provenance["facts"][0]["score"] == 0.0
+    assert store.memory_list()[0]["hit_count"] == 0
+
+
+def test_a_group_never_exceeds_its_cap_when_padded(store):
+    """Padding the unranked tail back in must respect the cap it was padded up
+    to, or memory starts crowding out the task it is supposed to serve."""
+    for i in range(_MAX_FACTS_IN_PROMPT + 5):
+        store.memory_write("project", f"cold_{i:02d}", "unrelated", approved=True)
+    memory = MemoryService(store, backend=_PartialBackend())
+
+    block, _ = memory.facts_for_prompt(query="deploy rollout")
+    assert len(block.splitlines()) == _MAX_FACTS_IN_PROMPT

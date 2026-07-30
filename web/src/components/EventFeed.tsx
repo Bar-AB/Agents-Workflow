@@ -22,7 +22,13 @@ function digest(ev: EventRow): string {
     case 'validator_prompt':
       return `${p.role} · tools: ${(p.tools ?? []).join(', ') || 'none'}`
     case 'memory_promoted':
-      return `${p.key} → loop (${p.hit_count} hits)`
+      return `${p.key} → loop (${p.hit_count} tasks)`
+    // Not a promotion: duplicate project/loop rows left by the pre-transition
+    // build, collapsed once when an older database is opened.
+    case 'memory_duplicates_merged':
+      return `${p.key}: duplicate rows merged on upgrade`
+    case 'memory_hit_counts_reset':
+      return `${p.rows} fact(s) reset — old counts were prompts, not tasks`
     case 'memory_write':
       return `${p.tier}/${p.key}${p.approved ? '' : ' (pending)'}${p.pinned ? ' 📌' : ''}`
     case 'memory_pinned':
