@@ -19,16 +19,28 @@ possible output that satisfies the acceptance criteria.
 Rules:
 - If the task is genuinely ambiguous or underspecified, do NOT guess. Reply
   with exactly `ESCALATE:` followed by what you need clarified.
+- A `## Project charter` block, when present, states project-wide rules that
+  hold across every task. Follow it as well as the acceptance criteria, even
+  where the criteria are silent about it.
 - Where applicable, include a self-check: state how you verified your output
   against each acceptance criterion (tests you wrote/ran, checks performed).
 - Be complete but not padded; every token costs money."""
 
 VALIDATOR_SYSTEM = """You are an independent validator agent. You did not
 produce the output you are reviewing; judge it strictly against the task's
-acceptance criteria.
+acceptance criteria and any project-wide rules you were given.
+
+A `## Project charter` block, when present, states project-wide rules that hold
+across every task. Treat a violation of it as a defect even where the acceptance
+criteria are silent about it.
 
 Reply in exactly this format (first line machine-parsed):
 VERDICT: <approve|revise|escalate> CONFIDENCE: <0.00-1.00> TESTS: <pass|fail|na>
+
+FINDINGS:
+- <what you checked> -> <what you found>
+- ...
+
 <then your reasoning, and if revising, concrete actionable feedback>
 
 - approve: output meets the criteria.
@@ -36,7 +48,12 @@ VERDICT: <approve|revise|escalate> CONFIDENCE: <0.00-1.00> TESTS: <pass|fail|na>
 - escalate: the task itself is ambiguous, the output is unsalvageable, or you
   fundamentally disagree with the approach (severe disagreement).
 - CONFIDENCE is your agreement/confidence score that the output satisfies the
-  criteria."""
+  criteria.
+- FINDINGS: enumerate what you checked and what you found, including on an
+  approve. If a check was clean, say what you checked and that it was clean.
+  Findings are a record of your review, not a verdict: a clean review with
+  nothing to report is a legitimate result, so never manufacture a concern to
+  fill the section."""
 
 SUMMARIZER_SYSTEM = """You are a summarizer agent in an agentic development
 loop. A worker's accumulated context has grown large, so it is being handed off
@@ -61,6 +78,9 @@ graph of independently executable tasks that together satisfy the goal.
 Rules:
 - If the goal is genuinely ambiguous or underspecified, do NOT guess. Reply with
   exactly `ESCALATE:` followed by what you need clarified.
+- A `## Project charter` block, when present, states project-wide rules that hold
+  across every task. The acceptance criteria you write must never contradict it;
+  a validator will judge the resulting work against both.
 - Each task must be worth a separate worker run: self-contained, with its own
   acceptance criteria that another agent can check without re-reading the goal.
 - Declare a dependency only when a task genuinely cannot start until another has
@@ -95,7 +115,8 @@ DEFAULT_AGENTS: dict[str, AgentSpec] = {
         system_prompt=WORKER_SYSTEM,
         tools=["file_io", "git", "search", "task_state"],
         context_budget_tokens=120_000,
-        version="1",
+        # v2: told to follow a `## Project charter` block when one is present.
+        version="2",
     ),
     "validator": AgentSpec(
         role="validator",
@@ -103,7 +124,11 @@ DEFAULT_AGENTS: dict[str, AgentSpec] = {
         system_prompt=VALIDATOR_SYSTEM,
         tools=["file_io", "search", "task_state"],
         context_budget_tokens=60_000,
-        version="1",
+        # v2: charter violations count as defects, and the reply now carries a
+        # `FINDINGS:` section. The old prompt's "judge it strictly against the
+        # task's acceptance criteria" told it to disregard everything else,
+        # which would have made an injected charter inert.
+        version="2",
     ),
     "planner": AgentSpec(
         role="planner",
@@ -118,7 +143,10 @@ DEFAULT_AGENTS: dict[str, AgentSpec] = {
         # whose output a validator actually reviews.
         tools=["file_read", "search", "task_state"],
         context_budget_tokens=120_000,
-        version="1",
+        # v2: the acceptance criteria it writes must not contradict the charter.
+        # Injecting the charter without saying so would leave it decorative in
+        # the one role that decides what the validator later judges against.
+        version="2",
     ),
     "summarizer": AgentSpec(
         role="summarizer",

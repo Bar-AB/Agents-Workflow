@@ -17,8 +17,9 @@ agentloop/
   config.py    thresholds, budget caps, model pricing, sandbox + server knobs
   models.py    Task, PlannedTask, Verdict, TestResult, AgentSpec, statuses
   store.py     SQLite source of truth: tasks, task_deps (the task graph),
-               attempts (metrics), verdicts, test_runs, events (immutable
-               audit log), two-tier memory
+               attempts (metrics), verdicts, charter (append-only, versioned
+               project rules), test_runs, events (immutable audit log),
+               two-tier memory
   registry.py  agent registry: role, model, prompt, tools, budget, version
   runner.py    ModelRunner seam: ClaudeSDKRunner | MockRunner
   agents.py    worker/validator/planner prompt building, verdict + plan parsing
@@ -31,9 +32,10 @@ agentloop/
                calibration report)
   server.py    REST + SSE dashboard backend (stdlib only)
   cli.py       add / plan / approve-plan / run / status / approve / reject /
-               redo / pause / resume / abort / events / serve / memory / eval
+               redo / pause / resume / abort / events / serve / memory /
+               charter / eval
 web/           Vite + React + TypeScript dashboard
-tests/         229 tests on MockRunner + real subprocesses (no API keys needed)
+tests/         261 tests on MockRunner + real subprocesses (no API keys needed)
 ```
 
 ## Quick start
@@ -59,6 +61,7 @@ agentloop approve 1              # human sign-off for escalated/high-risk tasks
 agentloop redo 1                 # full redo: fresh start, no carried context
 agentloop pause 1                # steer a running loop: pause / resume / abort
 agentloop memory add k v --pinned --approved   # a fact that always injects
+agentloop charter set --file RULES.md          # rules every agent prompt carries
 agentloop eval --runner mock     # validator calibration report (mock or claude)
 ```
 
@@ -69,10 +72,10 @@ cd web && npm install && npm run build   # once
 agentloop serve                          # http://127.0.0.1:8765
 ```
 
-Task board, agent state, cost/token tiles, verdict history, executed test
-runs, a live audit feed, memory gating, and approve/reject/redo — all reading
-the same store the loop writes to. `npm run dev` proxies the API for hot
-reload.
+Task board, agent state, cost/token tiles, verdict history with the validator's
+findings, executed test runs, a live audit feed, memory gating, the project
+charter panel, and approve/reject/redo — all reading the same store the loop
+writes to. `npm run dev` proxies the API for hot reload.
 
 ## Decision rules (spec §4–§5)
 
@@ -101,8 +104,87 @@ output, and the gate consults the real status rather than the validator's
 as a `test_disagreement` event — so a validator cannot approve past failing
 tests, and its reliability is measured rather than assumed.
 
+### The validator shows its work
+
+Under the verdict line the validator enumerates what it checked and what it
+found, in a free-form `FINDINGS:` section — including on an approve, where "I
+checked the unicode path and it was clean" is the useful record. It is stored on
+the verdict row and shown under the verdict chips in the dashboard.
+
+**Findings add evidence and change no outcome.** The decision table above gains
+no row, because nothing decided changed: an approve at 0.92 with tests passing
+is DONE whatever the findings say, and an empty findings section is recorded as
+"no findings recorded" rather than treated as a reason to revise. A reviewer
+that must always find something turns a legitimately clean review into a
+revision loop; ours drives an automatic state transition rather than advising a
+human who can filter it, so it does not get that trigger.
+
+The section is soft on purpose. A missing or malformed one degrades to empty and
+never fails the attempt, and the findings are *copied* out of the reasoning
+rather than moved out of it — the reasoning is what the loop hands back to the
+worker as revision feedback, and the findings are usually its most actionable
+part. Where the section ends is ambiguous in prose, and the ambiguity is
+resolved toward keeping too much rather than too little: a `# TODO` line quoted
+inside a finding does not end it, only a real section heading after a blank line
+does. Over-reading stores a little stray prose; under-reading destroys evidence.
+
+Asking for findings means the `worker`, `validator` and `planner` system prompts
+moved to version `"2"` for **every** project, chartered or not — the validator's
+old instruction to judge strictly against the acceptance criteria told it to
+disregard anything else. It is the only part of this that an unchartered project
+notices.
+
 All thresholds live in `LoopConfig` (`loopconfig.json`), agents in
 `agents.json` (`agentloop init-registry`).
+
+## Project charter
+
+Project-wide rules, written by a human, injected into every worker, validator
+and planner prompt:
+
+```bash
+agentloop charter set --file RULES.md --note "house style, agreed 2026-07"
+agentloop charter show               # what is in effect
+agentloop charter show --version 2   # what a past task actually ran under
+agentloop charter history
+agentloop charter clear --note "..." # explicit, audited removal
+```
+
+**Why it exists.** Acceptance criteria are per-task, so a rule that applies to
+*every* task has nowhere to live. Two sibling tasks running in parallel have no
+edge between them and therefore share no context at all — `## Upstream results`
+only carries output along dependency edges. The charter is the one thing they
+both see.
+
+**What it does not fix.** It shares *rules*, not *decisions made in flight*. Two
+siblings still cannot see that one named a function `to_slug` while the other
+called it `slugify`. The charter collapses the class of conflicts to the ones a
+human anticipated and wrote down; it does not eliminate the class.
+
+**It is prompt content, not a gate.** Nothing in the loop reads it and no status
+depends on it. A charter violation reaches the loop only as the validator's
+ordinary `revise`/`escalate` verdict — which is also why the validator gets the
+charter too: one that does not know the house rules cannot catch a breach of
+them.
+
+**Shape.** One row per *version* in an append-only `charter` table, so a past
+attempt's version is still readable rather than merely identifiable, and every
+attempt records the version it ran under (`agentloop status ID`, and a "Charter"
+row in the dashboard's task detail, so "was this approved under the old rules?"
+is answerable where the approve button is). Agents have no write path: the CLI
+and the dashboard panel are the only two.
+
+An empty or absent charter produces byte-for-byte the prompt the loop built
+before the feature existed, and "cleared" is indistinguishable from "never set".
+Oversize (over 4000 characters) is refused **loudly at write time** rather than
+trimmed at inject time — a rule that silently falls off the end of a cap is
+worse than no rule. A whitespace-only body is refused for the same reason;
+clearing is its own audited operation.
+
+**Cost.** The charter is rebuilt into every worker, validator and planner prompt
+on every round: at the 4000-character cap that is roughly 1000 tokens per
+invocation, counting toward `task_spend` and therefore toward the budget cap
+exactly as memory does. On a chartered project a tripped cap is not a mystery.
 
 ## Memory (spec §7)
 

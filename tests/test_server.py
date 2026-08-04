@@ -201,6 +201,78 @@ def test_memory_pin_over_http(live):
     assert body["memory"][0]["pinned"] == 0
 
 
+# -- project charter + validator findings (slice 3c) --------------------------
+
+
+def test_charter_endpoints(live):
+    """The dashboard's read/write surface for the charter. Publishing is
+    append-only, and an oversize body is a 400 rather than a silent trim —
+    the charter is never truncated at inject time, so it fails loudly here."""
+    from agentloop.store import _MAX_CHARTER_CHARS
+
+    base, store, _, _ = live
+
+    status, body = get(base, "/api/charter")
+    assert status == 200
+    assert body["active"] is None and body["history"] == []
+
+    _, body = post(base, "/api/charter", {"body": "1. Raise, never return None."})
+    assert body["active"]["id"] == 1
+    assert body["active"]["body"] == "1. Raise, never return None."
+
+    _, body = post(base, "/api/charter", {"body": "1. Rewritten.", "note": "v2"})
+    assert body["active"]["id"] == 2
+    # Append-only: the earlier version is still there, and still readable.
+    assert [h["id"] for h in body["history"]] == [1, 2]
+    assert body["history"][0]["body"] == "1. Raise, never return None."
+
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        post(base, "/api/charter", {"body": "x" * (_MAX_CHARTER_CHARS + 1)})
+    assert exc.value.code == 400
+    # The refusal changed nothing.
+    assert store.charter_active() == (2, "1. Rewritten.")
+
+    # An empty body is refused too: clearing is its own audited operation, not
+    # a side effect of submitting a blank edit box.
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        post(base, "/api/charter", {"body": "   "})
+    assert exc.value.code == 400
+
+
+def test_findings_reach_the_dashboard(live):
+    """`task_metrics`'s verdict SELECT is the only verdict data the dashboard
+    receives, so a `findings` column it does not select is stored, exposed
+    nowhere, and looks implemented."""
+    base, store, loop, _ = live
+    task = seed(store)
+    loop.runner = MockRunner(
+        [
+            "some output",
+            "VERDICT: approve CONFIDENCE: 0.92 TESTS: pass\n"
+            "FINDINGS:\n- Checked the unicode path -> clean.\n",
+        ]
+    )
+    loop.run_task(task)
+
+    _, body = get(base, f"/api/tasks/{task.id}")
+    verdict = body["metrics"]["verdicts"][0]
+    assert "Checked the unicode path" in verdict["findings"]
+    # And the charter column travels with it, so "approved under which rules"
+    # is visible where the approve button is (none in effect here).
+    assert body["metrics"]["charter_versions"] == []
+
+
+def test_charter_version_is_reported_per_task(live):
+    base, store, loop, _ = live
+    store.charter_set("1. Raise, never return None.")
+    task = seed(store)
+    loop.runner = MockRunner(["some output", APPROVE])
+    loop.run_task(task)
+
+    _, body = get(base, f"/api/tasks/{task.id}")
+    assert body["metrics"]["charter_versions"] == [1]
+
+
 def test_pause_resume_abort_over_http(live):
     base, store, loop, _ = live
     task = seed(store)
