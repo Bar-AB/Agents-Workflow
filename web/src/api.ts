@@ -3,6 +3,7 @@
 
 import type {
   Agent,
+  CharterView,
   EventRow,
   MemoryFact,
   LoopConfigView,
@@ -63,6 +64,13 @@ export const api = {
     post<{ task: Task }>(`/api/tasks/${id}/${action}`, { note }).then(
       (r) => r.task,
     ),
+
+  charter: () => get<CharterView>('/api/charter'),
+
+  // Publishing a version, never editing one: the charter table is append-only.
+  // An oversize or empty body is refused with a 400 rather than trimmed.
+  setCharter: (body: string, note = '') =>
+    post<CharterView>('/api/charter', { body, note }),
 
   gateMemory: (id: number, action: 'approve' | 'reject' | 'pin' | 'unpin') =>
     post<{ memory: MemoryFact[] }>(`/api/memory/${id}/${action}`).then(

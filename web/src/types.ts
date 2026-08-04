@@ -50,6 +50,10 @@ export interface VerdictRow {
   kind: VerdictKind
   confidence: number
   tests_passed: number | null
+  // What the validator says it checked and what it found. Evidence, not a gate:
+  // nothing in the loop reads it, and an empty section is a legitimate clean
+  // review rather than a reason to revise.
+  findings: string
 }
 
 export interface TaskMetrics {
@@ -58,6 +62,26 @@ export interface TaskMetrics {
   attempts: number
   wall_seconds: number
   verdicts: VerdictRow[]
+  // Charter versions this task's agents actually ran under — so "was this
+  // approved under the old rules" is answerable next to the approve button.
+  // Empty when no charter was in effect.
+  charter_versions: number[]
+}
+
+// One version of the project charter. The table is append-only and `id` *is*
+// the version, so a past attempt's recorded version stays readable forever.
+export interface CharterVersion {
+  id: number
+  body: string
+  note: string
+  created_at: number
+}
+
+export interface CharterView {
+  // Null when the charter was never set or has been explicitly cleared — the
+  // two are deliberately indistinguishable.
+  active: CharterVersion | null
+  history: CharterVersion[]
 }
 
 export interface TestRun {

@@ -92,6 +92,15 @@ export function TaskDetail({
         <dd className={latestTest ? `t-${latestTest.status}` : 't-na'}>
           {latestTest ? `${latestTest.status} — ${latestTest.summary}` : 'not run'}
         </dd>
+        {/* Which project charter this task's agents actually ran under, shown
+            next to the approve button so "approved under the old rules" is
+            visible where the decision is made. */}
+        <dt>Charter</dt>
+        <dd>
+          {metrics.charter_versions.length
+            ? metrics.charter_versions.map((v) => `v${v}`).join(', ')
+            : 'none in effect'}
+        </dd>
       </dl>
 
       {metrics.verdicts.length > 0 && (
@@ -104,6 +113,19 @@ export function TaskDetail({
               </span>
             ))}
           </div>
+          {/* What each validator says it checked. Collapsed by default: this is
+              evidence behind a verdict, not the verdict. An empty section is a
+              clean review, never a reason to revise. */}
+          {metrics.verdicts.map((v, i) =>
+            v.findings ? (
+              <details key={i}>
+                <summary>
+                  Findings · round {i + 1} ({v.kind})
+                </summary>
+                <pre>{v.findings}</pre>
+              </details>
+            ) : null,
+          )}
         </>
       )}
 

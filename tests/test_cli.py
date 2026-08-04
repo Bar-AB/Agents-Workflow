@@ -85,6 +85,71 @@ def test_plan_command_prints_the_graph_and_gates_it(capsys, monkeypatch):
     assert "3 task(s) released" in capsys.readouterr().out
 
 
+# -- charter CLI (slice 3c) ---------------------------------------------------
+
+
+def test_charter_cli_show_set_clear_history(capsys, tmp_path):
+    """The human write surface, end to end. Agents have no write path at all,
+    so this and the dashboard are the only two ways the charter can change."""
+    assert main(["charter", "show"]) == 0
+    assert "no charter set" in capsys.readouterr().out
+
+    assert main(["charter", "set", "--text", "1. Raise, never return None."]) == 0
+    assert "Charter v1 set" in capsys.readouterr().out
+    assert main(["charter", "show"]) == 0
+    out = capsys.readouterr().out
+    assert "v1 (in effect)" in out and "Raise, never return None" in out
+
+    rules = tmp_path / "RULES.md"
+    rules.write_text("1. Raise, never return None.\n2. Docstrings required.\n")
+    assert main(["charter", "set", "--file", str(rules), "--note", "added rule 2"]) == 0
+    assert "Charter v2 set" in capsys.readouterr().out
+
+    # A past version stays readable after a newer one exists — that is what
+    # makes "approved under the old rules" answerable.
+    assert main(["charter", "show", "--version", "1"]) == 0
+    assert "Docstrings required" not in capsys.readouterr().out
+
+    assert main(["charter", "clear", "--note", "paused"]) == 0
+    assert "Charter cleared" in capsys.readouterr().out
+    assert main(["charter", "show"]) == 0
+    assert "no charter set" in capsys.readouterr().out
+
+    assert main(["charter", "history"]) == 0
+    hist = capsys.readouterr().out
+    assert "[v  1]" in hist and "[v  2]" in hist and "CLEARED" in hist
+    assert "added rule 2" in hist
+
+
+def test_oversize_charter_set_is_a_clean_error_not_a_traceback(capsys):
+    """The charter is refused loudly at write time precisely because it is
+    never trimmed at inject time. That refusal must read as a user error."""
+    from agentloop.store import _MAX_CHARTER_CHARS
+
+    rc = main(["charter", "set", "--text", "x" * (_MAX_CHARTER_CHARS + 1)])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "error:" in err and "over the" in err
+    assert "Traceback" not in err
+
+
+def test_charter_set_needs_exactly_one_source(capsys):
+    rc = main(["charter", "set"])
+    assert rc == 1
+    assert "exactly one of --file or --text" in capsys.readouterr().err
+
+    rc = main(["charter", "set", "--text", "a", "--file", "b.md"])
+    assert rc == 1
+    assert "Traceback" not in capsys.readouterr().err
+
+
+def test_charter_show_of_a_missing_version_is_a_clean_error(capsys):
+    rc = main(["charter", "show", "--version", "42"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "42" in err and "Traceback" not in err
+
+
 def test_plan_that_cannot_be_parsed_exits_1_with_no_tasks(capsys, monkeypatch):
     import agentloop.cli as cli
     from agentloop.runner import MockRunner

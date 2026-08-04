@@ -42,6 +42,31 @@ _MAX_UPSTREAM_CHARS = 2000
 _MAX_TOOL_INPUT_CHARS = 2000
 _MAX_TOOL_NAME_CHARS = 200
 
+# How much of a validator's findings section the verdict row keeps. Truncation
+# is acceptable here and deliberately *not* for the charter: the charter is an
+# input the agent must obey in full, so cutting it removes a rule, while
+# findings are a record of something that already happened, so cutting them
+# loses detail from an account — the same trade `_tool_input_repr` makes.
+_MAX_FINDINGS_CHARS = 4000
+
+# The validator's findings marker. Soft by design: line-anchored and
+# case-insensitive, matched only *after* the verdict line, and a miss simply
+# yields no findings. A grammar would need validation, and validation is an
+# exception path in something that must never fail an attempt.
+_FINDINGS_RE = re.compile(r"^[ \t]*FINDINGS:[ \t]*", re.IGNORECASE | re.MULTILINE)
+# A markdown *section heading* after the findings ends them, so a validator that
+# writes `## Reasoning` below its list does not fold the reasoning into the
+# evidence. Any heading level, matching what the docs promise.
+#
+# The blank line is load-bearing, not decoration. A bare `^#{1,6}\s` also matches
+# a `# TODO: ...` line quoted *inside* a finding — a code reviewer quoting a
+# comment is the common case here, not an exotic one — and every finding after it
+# would be dropped with no signal. Requiring the blank line that precedes a real
+# heading biases the remaining ambiguity toward keeping too much rather than too
+# little, which is the right direction: these findings are evidence, so
+# over-inclusion costs tidiness while under-inclusion destroys the record.
+_FINDINGS_END_RE = re.compile(r"\n[ \t]*\n[ \t]*#{1,6}\s")
+
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(.+?)```", re.DOTALL | re.IGNORECASE)
 
 # Largest planner reply worth attempting to parse. A real plan is a few KB; far
@@ -61,13 +86,21 @@ def _invoke(
     prompt: str,
     tools: list[str] | None = None,
     retrieval: dict | None = None,
+    charter_version: int | None = None,
 ) -> tuple[RunResult, int]:
-    """Run one agent invocation with full attempt/metrics bookkeeping."""
+    """Run one agent invocation with full attempt/metrics bookkeeping.
+
+    `charter_version` is which version of the project charter the caller put in
+    `prompt`. It is a column on the attempt rather than an event: one scalar per
+    invocation, unlike the variable-length lists `retrieval` and `tool_call`
+    record. The caller builds the block and passes the version it built from, so
+    the recorded version is by construction the one in the prompt.
+    """
     # The model call sits deliberately *between* two transactions, never inside
     # one: the store lock must not be held across a network call. Each paired
     # write (attempt row + its audit event) is atomic on its own.
     with store.transaction():
-        attempt_id = store.start_attempt(task.id, kind, role, model)
+        attempt_id = store.start_attempt(task.id, kind, role, model, charter_version)
         # Which facts memory put in front of *this* agent on *this* round. It
         # goes in the opening transaction rather than the closing one because
         # the retrieval already happened — it built the prompt below — so a
@@ -193,6 +226,32 @@ def _tool_input_repr(value) -> str:
     return text[:_MAX_TOOL_INPUT_CHARS]
 
 
+def _charter_block(store: Store) -> tuple[str, int | None]:
+    """Project-wide rules every agent works under, and the version they are.
+
+    Returned with the version so the caller can record what this invocation
+    actually ran under (`attempts.charter_version`), the same way `_memory_block`
+    returns its provenance.
+
+    `("", None)` when there is no charter — the same "empty means absent"
+    convention the memory block uses, which is what makes "an empty or absent
+    charter produces byte-for-byte today's prompt" hold structurally rather than
+    by inspection.
+
+    The body goes in verbatim and whole. It is never truncated, reordered or
+    dropped here: a rule that silently falls off the end of a cap is worse than
+    no rule, so oversize is refused loudly at write time in `Store.charter_set`
+    instead. Note the block is rebuilt on every call, so the charter also
+    survives a context handoff, which a rule mentioned once in a transcript does
+    not.
+    """
+    active = store.charter_active()
+    if active is None:
+        return "", None
+    version, body = active
+    return f"\n## Project charter (v{version})\n{body}\n", version
+
+
 def _memory_block(
     memory: MemoryService | None, query: str = "", task_id: int | None = None
 ) -> tuple[str, dict | None]:
@@ -221,7 +280,12 @@ def _retrieval_query(task: Task, extra: str = "") -> str:
     Title/goal/criteria are the stable statement of what the task needs;
     `extra` (validator feedback, or the output under review) is what makes a
     revision retrieve differently from the first attempt. Bounded, so a huge
-    worker output can't drown the task's own vocabulary."""
+    worker output can't drown the task's own vocabulary.
+
+    The project charter is deliberately **not** part of this. It is prompt
+    content only: folding it in would rank every task's memory against the same
+    house-rule vocabulary, converging the ordering across all tasks and quietly
+    undoing the relevance work retrieval exists to do."""
     base = f"{task.title}\n{task.goal}\n{task.acceptance_criteria}"
     return f"{base}\n{extra[:_MAX_QUERY_EXTRA_CHARS]}" if extra else base
 
@@ -287,6 +351,8 @@ def run_worker(
         f"## Goal\n{task.goal}\n\n"
         f"## Acceptance criteria\n{task.acceptance_criteria}\n"
     )
+    charter, charter_version = _charter_block(store)
+    prompt += charter
     memory_block, retrieval = _memory_block(
         memory, _retrieval_query(task, feedback), task.id
     )
@@ -328,6 +394,7 @@ def run_worker(
         prompt,
         spec.tools,
         retrieval,
+        charter_version,
     )
     return result
 
@@ -344,7 +411,12 @@ def run_summarizer(
 
     A ModelRunner call (so it works under MockRunner in tests). Recorded as its
     own attempt (kind='summarizer'), so its cost feeds the task budget cap but
-    is kept separate from the worker's accumulated-context measure."""
+    is kept separate from the worker's accumulated-context measure.
+
+    Deliberately the one role with **no** project charter block: its output is
+    consumed by a worker that rebuilds the charter fresh on every call,
+    post-handoff included, so charging every handoff for a second copy of rules
+    that arrive by another route buys nothing."""
     try:
         spec = registry.get("summarizer")
     except KeyError:
@@ -408,6 +480,11 @@ def run_planner(
         f"## Acceptance criteria for the goal as a whole\n"
         f"{plan_task.acceptance_criteria}\n"
     )
+    # The planner is chartered because it authors the acceptance criteria the
+    # validator later judges against: criteria that contradict a house rule
+    # reproduce the conflict one level up, before any worker runs.
+    charter, charter_version = _charter_block(store)
+    prompt += charter
     memory_block, retrieval = _memory_block(
         memory, _retrieval_query(plan_task), plan_task.id
     )
@@ -427,6 +504,7 @@ def run_planner(
         prompt,
         spec.tools,
         retrieval,
+        charter_version,
     )
     return result
 
@@ -569,6 +647,11 @@ def run_validator(
         f"## Acceptance criteria\n{task.acceptance_criteria}\n\n"
         f"## Worker output\n{worker_output}\n"
     )
+    # The validator is chartered too: one that does not know the house rules
+    # cannot catch a violation of them, and its verdict is the only route by
+    # which a charter violation reaches the loop at all.
+    charter, charter_version = _charter_block(store)
+    prompt += charter
     memory_block, retrieval = _memory_block(
         memory, _retrieval_query(task, worker_output), task.id
     )
@@ -585,13 +668,54 @@ def run_validator(
         prompt,
         spec.tools,
         retrieval,
+        charter_version,
     )
     return parse_verdict(result.output), attempt_id
 
 
+def _extract_findings(text: str) -> str:
+    """The validator's `FINDINGS:` section, or "" — never an exception.
+
+    A missing or malformed section must never fail an attempt, so every failure
+    mode here degrades to empty. Findings run from the marker to the end of the
+    text, or to the next markdown *section heading* — a heading on its own line
+    after a blank one, so a `#`-prefixed line quoted inside a finding does not
+    silently truncate the list.
+
+    Deliberately lenient about the marker itself: it is matched anywhere at the
+    start of a line rather than as a whole line, so a validator that writes
+    `FINDINGS: nothing of note` inline is still recorded. Over-reading here
+    stores a little extra prose; under-reading loses evidence, and only one of
+    those is recoverable.
+
+    Bounded, because this is a record of what already happened rather than an
+    instruction that has to arrive intact.
+    """
+    try:
+        m = _FINDINGS_RE.search(text)
+        if not m:
+            return ""
+        tail = text[m.end() :]
+        end = _FINDINGS_END_RE.search(tail)
+        if end:
+            tail = tail[: end.start()]
+        return tail.strip()[:_MAX_FINDINGS_CHARS]
+    except Exception:
+        # Telemetry must never fail an attempt, and "no findings recorded" is a
+        # legitimate state the loop already handles.
+        return ""
+
+
 def parse_verdict(text: str) -> Verdict:
     """Parse the validator's structured first line. An unparseable verdict is
-    itself a failure signal -> escalate at confidence 0 (never guess-approve)."""
+    itself a failure signal -> escalate at confidence 0 (never guess-approve).
+
+    `findings` is *added* to the verdict, never subtracted from `reasoning`:
+    `reasoning` stays the whole post-verdict tail byte for byte, because the
+    loop feeds it back to the worker as revision feedback and the findings are
+    usually its most actionable part. Findings never rescue an unparseable
+    verdict either — no `VERDICT:` line still escalates at confidence 0.
+    """
     m = _VERDICT_RE.search(text)
     if not m:
         return Verdict(
@@ -604,5 +728,9 @@ def parse_verdict(text: str) -> Verdict:
     tests = {"pass": True, "fail": False, "na": None}[m.group(3).lower()]
     reasoning = text[m.end() :].strip()
     return Verdict(
-        kind=kind, confidence=confidence, reasoning=reasoning, tests_passed=tests
+        kind=kind,
+        confidence=confidence,
+        reasoning=reasoning,
+        tests_passed=tests,
+        findings=_extract_findings(reasoning),
     )

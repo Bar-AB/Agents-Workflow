@@ -16,6 +16,11 @@ Every agent and (later) the Phase-2 UI reads and writes here. Design notes:
 - `claim_next_task` hands a task to exactly one worker (atomic select+claim via
   a `claimed_by` lease column), the prerequisite for parallel workers; the
   sequential loop uses one stable worker id and is behaviorally unchanged.
+- `charter` is the human-authored, project-wide rule document, one row per
+  *version* (`id` is the version). Append-only: the accessors only INSERT, the
+  highest id is what is in force, and every attempt records the version it ran
+  under, so "what did this task's agents actually read" stays answerable after
+  the rules change. Agents have no write path to it at all.
 - `task_deps` holds the planner's task graph. Being blocked is a *predicate*
   evaluated inside the claim (`_UNBLOCKED`), not a status: a task waiting on an
   unfinished dependency, or on an unapproved plan, stays ordinary `pending` and
@@ -86,6 +91,20 @@ CREATE TABLE IF NOT EXISTS task_deps (
     PRIMARY KEY (task_id, depends_on_id)
 );
 
+-- Human-authored, project-wide rules injected into every worker, validator and
+-- planner prompt. One row per *version*: the charter is a document, and a past
+-- attempt's recorded version must still be readable, not merely identifiable.
+-- Append-only in practice — `charter_set` and `charter_clear` only ever INSERT,
+-- and the row with the highest id is the charter in effect, so "what is in
+-- force" is a pure function of the table and nothing can disagree with it.
+-- Declared before `attempts` so the FK target exists when the script runs.
+CREATE TABLE IF NOT EXISTS charter (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,   -- the version number
+    body TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT '',          -- why this edit was made
+    created_at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS attempts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id INTEGER NOT NULL REFERENCES tasks(id),
@@ -99,7 +118,12 @@ CREATE TABLE IF NOT EXISTS attempts (
     tokens_out INTEGER NOT NULL DEFAULT 0,
     cache_creation_tokens INTEGER NOT NULL DEFAULT 0,  -- prompt-cache writes
     cache_read_tokens INTEGER NOT NULL DEFAULT 0,      -- prompt-cache reads
-    cost_usd REAL NOT NULL DEFAULT 0.0         -- includes cache cost
+    cost_usd REAL NOT NULL DEFAULT 0.0,        -- includes cache cost
+    -- Which charter version was in the prompt of this invocation. NULL = none
+    -- in effect. A per-invocation measurement, so it is a column on `attempts`
+    -- rather than an event: "which tasks ran under v3" is then one join instead
+    -- of a full-text scan of every `*_prompt` payload.
+    charter_version INTEGER REFERENCES charter(id)
 );
 
 CREATE TABLE IF NOT EXISTS verdicts (
@@ -110,6 +134,12 @@ CREATE TABLE IF NOT EXISTS verdicts (
     confidence REAL NOT NULL,
     reasoning TEXT NOT NULL DEFAULT '',
     tests_passed INTEGER,             -- NULL = n/a
+    -- What the validator says it checked and what it found. A *copy* of a slice
+    -- of `reasoning`, never a piece removed from it: `reasoning` is fed back to
+    -- the worker as revision feedback, so subtracting the findings out would
+    -- strip the most actionable part of every revision prompt. Evidence, not a
+    -- gate — nothing in the loop reads this column.
+    findings TEXT NOT NULL DEFAULT '',
     created_at REAL NOT NULL
 );
 
@@ -186,6 +216,14 @@ CREATE TABLE IF NOT EXISTS eval_runs (
 # How much of a displaced memory value a merge event keeps. Enough to recognise
 # and recover what was overwritten; not a second copy of the store.
 _MAX_EVENT_VALUE_CHARS = 400
+
+# Largest charter a human may set. Refused *loudly at write time* rather than
+# trimmed at inject time: the charter is an input the agent must obey in full,
+# so a rule that silently falls off the end of a cap is worse than no rule.
+# ~4000 chars is roughly 1000 tokens, against a memory block that can already
+# reach ~8000. A module constant, like the other prompt-shape bounds, not a
+# LoopConfig field — LoopConfig holds decision thresholds and budget caps.
+_MAX_CHARTER_CHARS = 4000
 
 
 class TransactionAborted(RuntimeError):
@@ -377,6 +415,12 @@ class Store:
             ("tasks", "plan_approved", "INTEGER NOT NULL DEFAULT 0"),
             ("memory", "pinned", "INTEGER NOT NULL DEFAULT 0"),
             ("memory", "last_used_at", "REAL"),
+            # Same FK trap and same handling as `plan_id` above: fresh dbs get
+            # `REFERENCES charter(id)` from _SCHEMA, older dbs get the bare
+            # column. NULL means "no charter was in effect", which is exactly
+            # what every pre-charter attempt row correctly becomes.
+            ("attempts", "charter_version", "INTEGER"),
+            ("verdicts", "findings", "TEXT NOT NULL DEFAULT ''"),
         ]
         for table, column, decl in additions:
             cols = {
@@ -770,13 +814,101 @@ class Store:
         ).fetchone()
         return bool(row["plan_approved"]) if row else False
 
+    # -- project charter -----------------------------------------------------
+
+    def charter_active(self) -> tuple[int, str] | None:
+        """The charter in effect as `(version, body)`, or None if there is none.
+
+        "None" covers both never-set and explicitly cleared, deliberately: a
+        cleared charter must be indistinguishable from one that never existed,
+        so turning the charter off restores byte-for-byte the prompts the loop
+        built before it was introduced.
+        """
+        row = self._conn.execute(
+            "SELECT id, body FROM charter ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if row is None or not row["body"].strip():
+            return None
+        return int(row["id"]), row["body"]
+
+    def charter_set(self, body: str, note: str = "") -> int:
+        """Publish a new charter version. Returns the new version number.
+
+        Validation happens *before* anything is written, so a refusal leaves the
+        previous version in force and puts nothing in the audit log. Both
+        failures are loud on purpose:
+
+        - Over `_MAX_CHARTER_CHARS`: the alternative is trimming at inject time,
+          which drops a rule the human believes is being enforced.
+        - Whitespace-only: a typo'd `>` redirect that empties a rules file must
+          not be a silent policy removal. `charter_clear` is the explicit,
+          audited way to turn the charter off.
+        """
+        if len(body) > _MAX_CHARTER_CHARS:
+            raise ValueError(
+                f"charter is {len(body)} chars, over the {_MAX_CHARTER_CHARS} "
+                f"limit; shorten it rather than having it silently truncated"
+            )
+        if not body.strip():
+            raise ValueError(
+                "refusing to set an empty charter; use `charter clear` to "
+                "remove the charter explicitly"
+            )
+        return self._charter_insert(body, note, "charter_set")
+
+    def charter_clear(self, note: str = "") -> int:
+        """Turn the charter off by appending an empty version.
+
+        A new row rather than a DELETE: the table is the whole history, and a
+        past attempt's `charter_version` has to stay readable. The clear itself
+        is a version, so "when did the rules stop applying" is in the record.
+        """
+        return self._charter_insert("", note, "charter_cleared")
+
+    def _charter_insert(self, body: str, note: str, event: str) -> int:
+        with self.transaction():
+            cur = self._conn.execute(
+                "INSERT INTO charter (body, note, created_at) VALUES (?,?,?)",
+                (body, note, time.time()),
+            )
+            version = cur.lastrowid
+            # The body is not duplicated into the payload: unlike a memory
+            # merge's displaced value, the charter row keeps it forever, and
+            # every event row is pushed to every open dashboard stream.
+            payload = {"version": version, "note": note}
+            if event == "charter_set":
+                payload["n_chars"] = len(body)
+            self.log_event(None, event, payload)
+        return version
+
+    def charter_history(self) -> list[dict]:
+        """Every version, oldest first. There is no update or delete path."""
+        return [
+            dict(r)
+            for r in self._conn.execute("SELECT * FROM charter ORDER BY id").fetchall()
+        ]
+
+    def charter_version(self, version: int) -> dict | None:
+        """The text a past attempt actually ran under, by version number."""
+        row = self._conn.execute(
+            "SELECT * FROM charter WHERE id=?", (version,)
+        ).fetchone()
+        return dict(row) if row else None
+
     # -- attempts / metrics --------------------------------------------------
 
-    def start_attempt(self, task_id: int, kind: str, role: str, model: str) -> int:
+    def start_attempt(
+        self,
+        task_id: int,
+        kind: str,
+        role: str,
+        model: str,
+        charter_version: int | None = None,
+    ) -> int:
         cur = self._conn.write(
-            "INSERT INTO attempts (task_id, kind, agent_role, model, started_at)"
-            " VALUES (?,?,?,?,?)",
-            (task_id, kind, role, model, time.time()),
+            "INSERT INTO attempts (task_id, kind, agent_role, model, started_at,"
+            " charter_version) VALUES (?,?,?,?,?,?)",
+            (task_id, kind, role, model, time.time(), charter_version),
         )
         return cur.lastrowid
 
@@ -859,16 +991,30 @@ class Store:
             (task_id,),
         ).fetchone()
         verdicts = self._conn.execute(
-            "SELECT kind, confidence, tests_passed FROM verdicts"
+            "SELECT kind, confidence, tests_passed, findings FROM verdicts"
             " WHERE task_id=? ORDER BY id",
             (task_id,),
         ).fetchall()
+        # Which charter version(s) this task's agents actually ran under, so
+        # "was this approved under the old rules" is answerable where the
+        # approve button is. NULLs (no charter in effect) are left out rather
+        # than rendered as a version nobody can look up.
+        charter_versions = [
+            int(r["charter_version"])
+            for r in self._conn.execute(
+                "SELECT DISTINCT charter_version FROM attempts"
+                " WHERE task_id=? AND charter_version IS NOT NULL"
+                " ORDER BY charter_version",
+                (task_id,),
+            ).fetchall()
+        ]
         return {
             "tokens": toks,
             "cost_usd": round(cost, 6),
             "attempts": row["n"],
             "wall_seconds": round(row["wall"], 3),
             "verdicts": [dict(v) for v in verdicts],
+            "charter_versions": charter_versions,
         }
 
     # -- verdicts ------------------------------------------------------------
@@ -877,7 +1023,8 @@ class Store:
         with self.transaction():
             cur = self._conn.execute(
                 "INSERT INTO verdicts (task_id, attempt_id, kind, confidence,"
-                " reasoning, tests_passed, created_at) VALUES (?,?,?,?,?,?,?)",
+                " reasoning, tests_passed, findings, created_at)"
+                " VALUES (?,?,?,?,?,?,?,?)",
                 (
                     task_id,
                     attempt_id,
@@ -885,6 +1032,7 @@ class Store:
                     v.confidence,
                     v.reasoning,
                     None if v.tests_passed is None else int(v.tests_passed),
+                    v.findings,
                     time.time(),
                 ),
             )
@@ -895,6 +1043,10 @@ class Store:
                     "kind": v.kind.value,
                     "confidence": v.confidence,
                     "tests_passed": v.tests_passed,
+                    # A flag, not the text: the verdict row is the record, and
+                    # every event is pushed to every connected dashboard, so a
+                    # 4000-char blob per round would bloat the SSE feed.
+                    "has_findings": bool(v.findings),
                 },
             )
         return cur.lastrowid

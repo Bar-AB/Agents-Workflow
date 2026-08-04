@@ -142,6 +142,8 @@ class _Handler(BaseHTTPRequestHandler):
                 )
             elif path == "/api/memory":
                 self._send_json({"memory": self.store.memory_list()})
+            elif path == "/api/charter":
+                self._send_json(self._charter_json())
             elif path == "/api/metrics":
                 self._send_json(self.store.run_metrics())
             elif path == "/api/config":
@@ -201,6 +203,9 @@ class _Handler(BaseHTTPRequestHandler):
                 else:
                     task = getattr(loop, parts[3])(int(parts[2]))
                 self._send_json({"task": self._task_json(task)})
+            # /api/charter — the human write surface; agents have none.
+            elif parts == ["api", "charter"]:
+                self._set_charter(body)
             # /api/memory/{id}/{approve|reject|pin|unpin}
             elif (
                 len(parts) == 4
@@ -249,6 +254,34 @@ class _Handler(BaseHTTPRequestHandler):
         )
         self.store.add_task(task)
         self._send_json({"task": self._task_json(task)}, status=201)
+
+    def _charter_json(self) -> dict:
+        # One transaction so the two reads are a consistent snapshot: taken
+        # separately, a `charter_set` landing between them serves "v3 in effect"
+        # beside a history whose newest row is v4.
+        with self.store.transaction():
+            active = self.store.charter_active()
+            history = self.store.charter_history()
+        by_id = {r["id"]: r for r in history}
+        return {
+            "active": dict(by_id[active[0]]) if active else None,
+            "history": history,
+        }
+
+    def _set_charter(self, body: dict) -> None:
+        """POST /api/charter — publish a new charter version.
+
+        An oversize or whitespace-only body raises `ValueError` in the store and
+        `do_POST` maps it to 400. That refusal is the point: the charter is never
+        trimmed or emptied by accident, so it has to fail loudly here. Clearing
+        is deliberately not a side effect of submitting an empty box — it is its
+        own audited operation, on the CLI (`agentloop charter clear --note ...`).
+        """
+        text = body.get("body")
+        if not isinstance(text, str):
+            raise ValueError("body must be a string")
+        self.store.charter_set(text, str(body.get("note") or ""))
+        self._send_json(self._charter_json())
 
     def _task_detail(self, path: str) -> None:
         try:

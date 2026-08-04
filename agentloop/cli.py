@@ -11,6 +11,7 @@ agentloop redo TASK_ID [--note ...]
 agentloop events TASK_ID
 agentloop serve [--host H] [--port P]   # live dashboard (spec §8)
 agentloop memory list|approve|reject|add
+agentloop charter show|set|clear|history   # project-wide rules for every agent
 agentloop init-registry          # write default agents.json for editing
 """
 
@@ -20,6 +21,8 @@ import argparse
 import json
 import os
 import sys
+import time
+from pathlib import Path
 
 from .config import LoopConfig
 from .loop import Loop
@@ -57,6 +60,59 @@ def _memory_cmd(store: Store, args) -> int:
     elif args.mem_cmd in ("pin", "unpin"):
         store.memory_set_pinned(args.memory_id, args.mem_cmd == "pin")
         print(f"Memory {args.memory_id} {args.mem_cmd}ned.")
+    return 0
+
+
+def _charter_cmd(store: Store, args) -> int:
+    """The human write surface for the project charter. Agents have none."""
+    if args.charter_cmd == "show":
+        if args.version:
+            row = store.charter_version(args.version)
+            if row is None:
+                raise KeyError(f"No charter version {args.version}")
+            print(f"--- charter v{row['id']} ---")
+            if row["note"]:
+                print(f"note: {row['note']}")
+            print(row["body"] or "(cleared)")
+            return 0
+        active = store.charter_active()
+        if active is None:
+            print("(no charter set — agent prompts are unchanged)")
+            return 0
+        version, body = active
+        print(f"--- charter v{version} (in effect) ---")
+        print(body)
+    elif args.charter_cmd == "set":
+        if bool(args.file) == bool(args.text):
+            raise ValueError("give exactly one of --file or --text")
+        try:
+            # utf-8-sig: a rules file is hand-written, often on Windows.
+            body = (
+                Path(args.file).read_text(encoding="utf-8-sig")
+                if args.file
+                else args.text
+            )
+        except OSError as exc:
+            # An unreadable path is user input, not a crash — render it like a
+            # bad id rather than a traceback.
+            raise ValueError(f"cannot read {args.file}: {exc}") from exc
+        # A ValueError from the store (oversize, or whitespace-only) surfaces
+        # through main()'s handler as `error: ...`, which is the loud write-time
+        # refusal the charter trades for never being trimmed at inject time.
+        version = store.charter_set(body, args.note)
+        print(f"Charter v{version} set ({len(body)} chars) — every agent prompt now.")
+    elif args.charter_cmd == "clear":
+        version = store.charter_clear(args.note)
+        print(f"Charter cleared (v{version}); prompts return to having no charter.")
+    elif args.charter_cmd == "history":
+        rows = store.charter_history()
+        if not rows:
+            print("(no charter history)")
+        for r in rows:
+            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(r["created_at"]))
+            label = f"{len(r['body'])} chars" if r["body"].strip() else "CLEARED"
+            note = f"  {r['note']}" if r["note"] else ""
+            print(f"[v{r['id']:3d}] {when}  {label}{note}")
     return 0
 
 
@@ -161,6 +217,20 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Pin: always injected, ahead of the cap (still needs approval to be read)",
     )
+
+    ch = sub.add_parser("charter", help="Project-wide rules injected into agents")
+    chsub = ch.add_subparsers(dest="charter_cmd", required=True)
+    cshow = chsub.add_parser("show", help="The charter in effect (or one version)")
+    cshow.add_argument(
+        "--version", type=int, default=None, help="Show a past version instead"
+    )
+    cset = chsub.add_parser("set", help="Publish a new charter version")
+    cset.add_argument("--file", default=None, help="Read the charter from a file")
+    cset.add_argument("--text", default=None, help="Charter body inline")
+    cset.add_argument("--note", default="", help="Why this edit was made")
+    cclear = chsub.add_parser("clear", help="Turn the charter off (audited)")
+    cclear.add_argument("--note", default="")
+    chsub.add_parser("history", help="Every version, oldest first")
 
     ev = sub.add_parser("eval", help="Validator calibration harness")
     ev.add_argument("--runner", default="mock", choices=["claude", "mock"])
@@ -315,6 +385,9 @@ def _dispatch(args, store: Store, loop: Loop) -> int:
 
     elif args.cmd == "memory":
         return _memory_cmd(store, args)
+
+    elif args.cmd == "charter":
+        return _charter_cmd(store, args)
     return 0
 
 

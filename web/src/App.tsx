@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { AgentPanel } from './components/AgentPanel'
+import { CharterPanel } from './components/CharterPanel'
 import { EventFeed } from './components/EventFeed'
 import { MemoryPanel } from './components/MemoryPanel'
 import { NewTaskForm } from './components/NewTaskForm'
@@ -8,7 +9,7 @@ import { TaskBoard } from './components/TaskBoard'
 import { TaskDetail } from './components/TaskDetail'
 import { useLiveLoop } from './useLiveLoop'
 
-type Tab = 'detail' | 'new' | 'memory'
+type Tab = 'detail' | 'new' | 'memory' | 'charter'
 
 export default function App() {
   const {
@@ -87,12 +88,19 @@ export default function App() {
             >
               Memory{pendingFacts > 0 ? ` (${pendingFacts})` : ''}
             </button>
+            <button
+              className={`tab ${tab === 'charter' ? 'on' : ''}`}
+              onClick={() => setTab('charter')}
+            >
+              Charter
+            </button>
           </div>
 
           {tab === 'new' && <NewTaskForm onCreated={() => void refresh()} />}
           {tab === 'memory' && (
             <MemoryPanel memory={memory} onChanged={setMemory} />
           )}
+          {tab === 'charter' && <CharterPanel />}
 
           <AgentPanel agents={agents} tasks={tasks} />
           <EventFeed events={events} />

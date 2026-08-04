@@ -130,6 +130,13 @@ class Verdict:
     confidence: float  # 0.0–1.0 agreement/confidence score (spec §5)
     reasoning: str
     tests_passed: bool | None = None  # test state feeds the verdict (spec §5)
+    # What the validator says it checked and what it found: evidence, not a
+    # gate. A *copy* of a slice of `reasoning`, never a piece removed from it —
+    # `reasoning` is what the loop feeds back to the worker as revision
+    # feedback, so moving the findings out would strip the most actionable part
+    # of every revision prompt. Empty when the validator wrote no findings
+    # section, which is recorded and never treated as a reason to revise.
+    findings: str = ""
 
 
 @dataclass
