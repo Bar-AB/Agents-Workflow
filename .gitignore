@@ -1,5 +1,6 @@
-# Claude context / session files
-CLAUDE.md
+# Claude context / session files. CLAUDE.md itself is tracked: it outgrew
+# "session file" and is now the project's design spec — the rationale behind
+# every decision rule lives there and nowhere else.
 .claude/*
 # ...but keep project skills under version control
 !.claude/skills/
@@ -19,6 +20,10 @@ node_modules/
 
 # Agent task workspaces — scratch space for worker output, never source
 .agentloop/
+
+# cc10x orchestration state (agent-maintained: activeContext/patterns/progress,
+# workflow JSON + event logs). Churns every workflow; not source.
+.cc10x/
 
 # Developer-facing working notes: delivery reports, goal prompts, design specs.
 # Process artifacts for whoever is driving the build, not part of the project
