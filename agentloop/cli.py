@@ -3,7 +3,7 @@
 agentloop add "Title" --goal "..." --criteria "..." [--risk 0|1|2]
 agentloop plan "Goal" --criteria "..." [--runner ...]   # decompose into a graph
 agentloop approve-plan PLAN_ID [--note ...]             # release a plan's tasks
-agentloop run [--runner claude|mock] [--max-tasks N]
+agentloop run [--runner claude|openai|mock] [--max-tasks N]
 agentloop status [TASK_ID]
 agentloop approve TASK_ID [--note ...]
 agentloop reject TASK_ID [--note ...]
@@ -28,7 +28,7 @@ from .config import LoopConfig
 from .loop import Loop
 from .models import Task, TaskStatus
 from .registry import DEFAULT_AGENTS, Registry
-from .runner import get_runner
+from .runner import RunnerConfigError, get_runner
 from .server import serve_forever
 from .store import Store
 
@@ -138,6 +138,20 @@ def _eval_cmd(store: Store, args) -> int:
         from .runner import ClaudeSDKRunner
 
         runner = ClaudeSDKRunner()
+    elif args.runner == "openai":
+        # The choice was accepted and then fell through to the mock branch, so
+        # an operator asking for an OpenAI calibration got scripted-fixture
+        # agreement numbers printed as a calibration report, with no warning and
+        # exit 0. A calibration number that measured nothing is worse than none.
+        if not os.environ.get("OPENAI_API_KEY"):
+            print(
+                "eval --runner openai skipped: set OPENAI_API_KEY to run a real "
+                "calibration against an OpenAI-compatible endpoint."
+            )
+            return 0
+        from .runner import OpenAICompatRunner
+
+        runner = OpenAICompatRunner()
     else:
         runner = evalmod.mock_runner_for(evalmod.FIXTURES)
 
@@ -170,14 +184,14 @@ def main(argv: list[str] | None = None) -> int:
     pl.add_argument("--criteria", required=True)
     pl.add_argument("--title", default="")
     pl.add_argument("--risk", type=int, default=1, choices=[0, 1, 2])
-    pl.add_argument("--runner", default="claude", choices=["claude", "mock"])
+    pl.add_argument("--runner", default="claude", choices=["claude", "openai", "mock"])
 
     ap = sub.add_parser("approve-plan", help="Sign a plan off; its tasks may run")
     ap.add_argument("task_id", type=int)
     ap.add_argument("--note", default="")
 
     r = sub.add_parser("run", help="Run the loop over pending tasks")
-    r.add_argument("--runner", default="claude", choices=["claude", "mock"])
+    r.add_argument("--runner", default="claude", choices=["claude", "openai", "mock"])
     r.add_argument("--max-tasks", type=int, default=None)
 
     s = sub.add_parser("status", help="Show tasks (or one task's metrics)")
@@ -199,7 +213,7 @@ def main(argv: list[str] | None = None) -> int:
     sv = sub.add_parser("serve", help="Run the live dashboard (Phase 2)")
     sv.add_argument("--host", default=None)
     sv.add_argument("--port", type=int, default=None)
-    sv.add_argument("--runner", default="mock", choices=["claude", "mock"])
+    sv.add_argument("--runner", default="mock", choices=["claude", "openai", "mock"])
 
     m = sub.add_parser("memory", help="Inspect and gate the memory store")
     msub = m.add_subparsers(dest="mem_cmd", required=True)
@@ -233,7 +247,7 @@ def main(argv: list[str] | None = None) -> int:
     chsub.add_parser("history", help="Every version, oldest first")
 
     ev = sub.add_parser("eval", help="Validator calibration harness")
-    ev.add_argument("--runner", default="mock", choices=["claude", "mock"])
+    ev.add_argument("--runner", default="mock", choices=["claude", "openai", "mock"])
 
     sub.add_parser("init-registry", help="Write default agents.json")
 
@@ -244,7 +258,17 @@ def main(argv: list[str] | None = None) -> int:
         print("Wrote agents.json")
         return 0
 
-    store, loop = _build(args)
+    try:
+        store, loop = _build(args)
+    except (KeyError, ValueError, RunnerConfigError) as exc:
+        # Construction happens before the store exists, so it needs its own
+        # handler rather than the one below: there is nothing to `close()` yet.
+        # A bad `--runner`, an unparseable loopconfig.json or an OPENAI_BASE_URL
+        # the runner refuses are all user input, and the whole point of raising
+        # them loudly at construction is defeated if they arrive as a traceback.
+        print(f"error: {exc.args[0] if exc.args else exc}", file=sys.stderr)
+        return 1
+
     try:
         return _dispatch(args, store, loop)
     except (KeyError, ValueError) as exc:

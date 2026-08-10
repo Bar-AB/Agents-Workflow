@@ -21,7 +21,7 @@ agentloop/
                project rules), test_runs, events (immutable audit log),
                two-tier memory
   registry.py  agent registry: role, model, prompt, tools, budget, version
-  runner.py    ModelRunner seam: ClaudeSDKRunner | MockRunner
+  runner.py    ModelRunner seam: ClaudeSDKRunner | OpenAICompatRunner | MockRunner
   agents.py    worker/validator/planner prompt building, verdict + plan parsing
   executor.py  sandboxed test execution in a per-task workspace
   memory.py    two-tier memory policy: gating + auto-promotion
@@ -54,7 +54,7 @@ agentloop plan "Build a slugify library" \
   --criteria "Published, tested, documented"
 agentloop approve-plan 1         # sign the plan off; its tasks may now run
 
-agentloop run --runner claude    # or --runner mock for a dry run
+agentloop run --runner claude    # or --runner openai or --runner mock
 agentloop status 1               # metrics: tokens, cost, wall time, verdicts
 agentloop events 1               # immutable audit trail
 agentloop approve 1              # human sign-off for escalated/high-risk tasks
@@ -62,7 +62,7 @@ agentloop redo 1                 # full redo: fresh start, no carried context
 agentloop pause 1                # steer a running loop: pause / resume / abort
 agentloop memory add k v --pinned --approved   # a fact that always injects
 agentloop charter set --file RULES.md          # rules every agent prompt carries
-agentloop eval --runner mock     # validator calibration report (mock or claude)
+agentloop eval --runner mock     # validator calibration (mock, claude, or openai)
 ```
 
 ### Dashboard (Phase 2)
@@ -87,6 +87,7 @@ Validator returns `VERDICT: <kind> CONFIDENCE: <0-1> TESTS: <pass|fail|na>`:
 | revise, or approve below threshold | revision with feedback, max 3 |
 | escalate, or confidence < 0.40 | needs_human (severe disagreement) |
 | worker replies `ESCALATE:` | needs_human (genuine ambiguity) |
+| worker returns an empty output | needs_human — nothing to validate, and a `done` here would release dependents against output that does not exist; not a revise |
 | budget cap exceeded | needs_human (never burn unbounded) |
 | unparseable verdict | needs_human (never guess-approve) |
 | transient infra failure (runner/executor raises) | retried with backoff, then needs_human (`infra_error`) — not a revise |
@@ -447,8 +448,9 @@ verdicts through `run_validator` and reports agreement rate, an
 approve/revise/escalate confusion matrix, and a confidence-vs-correctness
 calibration table (buckets straddling the 0.40/0.70 thresholds). `--runner mock`
 is deterministic and runs in CI to exercise the harness mechanics; `--runner
-claude` (opt-in, skipped without `ANTHROPIC_API_KEY`) produces a genuine
-calibration measurement. Results persist to the `eval_runs` table.
+claude` and `--runner openai` (both opt-in, skipped when their respective
+`ANTHROPIC_API_KEY` or `OPENAI_API_KEY` is unset) produce genuine calibration
+measurements. Results persist to the `eval_runs` table.
 
 ## Sandboxing
 
@@ -475,10 +477,58 @@ command runs is the real exposure. Defenses are layered:
 ## Provider seam
 
 The loop only knows the `ModelRunner` protocol. `ClaudeSDKRunner` is the
-default backend; a litellm/OpenAI runner (e.g. a Codex cross-validator) is
-just another implementation — this keeps the project open-sourceable and
-model-agnostic. Your code, your license; SDK users bring their own
-Anthropic credentials.
+default backend; `OpenAICompatRunner` (slice 4) brings a second provider into
+the same architecture, so a validator can review a worker's output on a
+different model family — a cross-validator for independent review. Which
+backend serves which role is a registry decision (`AgentSpec.runner`), so you
+can pin the validator to OpenAI while the worker stays on Claude, ensuring a
+model does not rubber-stamp its own output. This keeps the project
+open-sourceable and multi-provider. Your code, your license; SDK users bring
+their own credentials.
+
+**Configuration:** `OpenAICompatRunner` works with any OpenAI-compatible
+endpoint — OpenAI, Azure, OpenRouter, vLLM, or a local endpoint. The API key
+is read from `OPENAI_API_KEY` (required to run) and the base URL from
+`OPENAI_BASE_URL` (defaults to OpenAI's public endpoint). Usage is parsed and
+pricing is applied per model, including provider-specific cache pricing (OpenAI
+caches automatically, Anthropic charges write tokens). An unpinned run is
+behaviorally identical to the pre-slice-4 loop — every role uses the loop's
+default runner when nothing is pinned.
+
+**Pinning a role**, in `agents.json` (`agentloop init-registry` writes the
+defaults; the `runner` key is optional and absent means "the loop's default"):
+
+```jsonc
+{
+  "worker":    { "role": "worker",    "model": "claude-sonnet-5",
+                 /* system_prompt, tools, … as written by init-registry */ },
+  "validator": { "role": "validator", "model": "gpt-5-mini",
+                 "runner": "openai",  /* ← the only added key */ }
+}
+```
+
+The worker keeps writing files on Claude; the validator reviews its output on
+another family. `model` and `runner` travel together deliberately — a
+`claude-sonnet-5` string means nothing to an OpenAI endpoint, so the pair is
+validated and a mismatch is refused rather than sent.
+
+**Limitations:** The OpenAI-compatible backend cannot execute tools — a
+chat-completions call has no execution loop — so a role pinned to it reviews
+what is in its prompt rather than reading the workspace. This is why the role
+to pin is the **validator** (whose prompt carries worker output, test results,
+charter and memory) and not the worker (whose job is writing files).
+
+Pricing rows are point-in-time list rates, kept in `MODEL_PRICING`. A model
+with no row prices at `DEFAULT_PRICING` rather than failing, so a stale or
+missing rate is a wrong cost, not a crash — check them when the numbers start
+to matter. Dated snapshot ids (`gpt-4o-mini-2024-07-18`, which is what the API
+echoes back) are normalized to their family before the lookup, so the rate you
+listed is the rate you are charged at.
+
+**Config errors fail fast:** A missing or revoked API key, a non-https base URL,
+a model the endpoint does not serve, or a `claude-*` model pinned to the OpenAI
+backend (which would 404) escalate to `NEEDS_HUMAN` without retry, naming the
+problem. That's different from transient HTTP errors (408, 429, 5xx), which retry.
 
 ## Roadmap (from the seed spec)
 
@@ -499,6 +549,7 @@ Anthropic credentials.
 - [x] Retrieval / tool-call provenance events, attributed to the attempt and
       agent that used them
 - [x] Planner agent + task graph; parallel workers
-- [ ] Second-provider cross-validator
+- [x] Second-provider cross-validator (stdlib `OpenAICompatRunner`, per-role
+      pinning via `AgentSpec.runner`)
 - [ ] Agent-requested tools with an auto-approval policy
 - [ ] git-commit-per-task rollback; infra retry/backoff; batch evaluation

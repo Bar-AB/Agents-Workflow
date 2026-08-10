@@ -162,3 +162,41 @@ def test_plan_that_cannot_be_parsed_exits_1_with_no_tasks(capsys, monkeypatch):
     err = capsys.readouterr().err
     assert "produced no tasks" in err
     assert "Traceback" not in err
+
+
+def test_a_runner_that_refuses_to_construct_is_a_clean_error(capsys, monkeypatch):
+    """Slice 4: construction failures need their own handler.
+
+    `_build` runs *before* the try/except that renders `error: ...`, because
+    that block's `finally` closes a store which does not exist yet. Slice 4 gave
+    the runner real constructor-time refusals (an unknown `--runner` name, a
+    plaintext `OPENAI_BASE_URL`), and the whole value of refusing loudly at
+    construction is lost if the refusal reaches the operator as a traceback.
+    """
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://not-https.example.com/v1")
+    rc = main(["run", "--runner", "openai", "--max-tasks", "1"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert err.startswith("error: ")
+    assert "https" in err  # the refusal explains itself
+    assert "Traceback" not in err
+
+
+def test_an_unknown_runner_name_is_a_clean_error(capsys):
+    rc = main(["run", "--runner", "mock", "--max-tasks", "0"])
+    assert rc == 0  # sanity: a known runner still builds
+
+    from agentloop import cli
+
+    def _boom(name):
+        raise ValueError(f"Unknown runner: {name!r}")
+
+    import pytest as _pytest
+
+    with _pytest.MonkeyPatch.context() as mp:
+        mp.setattr(cli, "get_runner", _boom)
+        rc = main(["run", "--runner", "mock", "--max-tasks", "1"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "Unknown runner" in err
+    assert "Traceback" not in err

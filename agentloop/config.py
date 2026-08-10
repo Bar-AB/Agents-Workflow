@@ -19,6 +19,7 @@ All values are tunable globally here or via loopconfig.json.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -145,15 +146,110 @@ MODEL_PRICING: dict[str, tuple[float, float]] = {
     "claude-haiku-4-5": (1.00, 5.00),
     "claude-sonnet-5": (3.00, 15.00),
     "claude-opus-4-8": (15.00, 75.00),
+    # OpenAI-compatible models the second-provider runner emits (slice 4).
+    # Point-in-time list rates; providers change them, and a stale row here is
+    # a wrong cost, not a crash — check them when the numbers start to matter.
+    "gpt-5": (1.25, 10.00),
+    "gpt-5-mini": (0.25, 2.00),
+    "gpt-5-nano": (0.05, 0.40),
+    "gpt-4.1": (2.00, 8.00),
+    "gpt-4.1-mini": (0.40, 1.60),
+    "gpt-4o": (2.50, 10.00),
+    "gpt-4o-mini": (0.15, 0.60),
+    "o3": (2.00, 8.00),
     "mock": (0.0, 0.0),
 }
 DEFAULT_PRICING: tuple[float, float] = (3.00, 15.00)
+
+# The models `OpenAICompatRunner` is expected to be pointed at. Kept as an
+# explicit list so a test can assert every one of them has a pricing row: a
+# model missing from MODEL_PRICING does not fail, it silently prices at
+# DEFAULT_PRICING, which is the quiet wrong-cost trap the skill warns about.
+# Pointing the runner at some other OpenAI-compatible endpoint still works —
+# it just prices at the fallback until its model is added here.
+OPENAI_MODELS: tuple[str, ...] = (
+    "gpt-5",
+    "gpt-5-mini",
+    "gpt-5-nano",
+    "gpt-4.1",
+    "gpt-4.1-mini",
+    "gpt-4o",
+    "gpt-4o-mini",
+    "o3",
+)
 
 
 # Prompt-cache multipliers on the input rate (Anthropic pricing model):
 # writing a cache entry costs more than fresh input, reading one costs far less.
 CACHE_WRITE_MULTIPLIER = 1.25
 CACHE_READ_MULTIPLIER = 0.10
+
+# ...which is why these two cannot stay global now that a second provider
+# exists. They encode *Anthropic's* cache pricing, and OpenAI's differs on both
+# axes: writing a cache entry is free (caching is automatic, not a paid
+# operation), and a cached read is discounted by a factor that varies per model
+# family — 0.10x on the gpt-5 line, 0.25x on gpt-4.1/o3, 0.50x on gpt-4o. Left
+# global, a cross-provider run would under-bill a gpt-4o cached read five-fold,
+# and the budget cap is only as honest as the worst-priced attempt under it.
+#
+# Overrides rather than a third element on the MODEL_PRICING tuple: that tuple
+# is `(input, output)` in the docs, in every test that reads it and in the
+# dashboard, and widening it would rewrite all of those to express something
+# only two providers care about.
+CACHE_MULTIPLIERS: dict[str, tuple[float, float]] = {
+    # model: (cache write multiplier, cache read multiplier) on the input rate
+    **{m: (0.0, 0.10) for m in ("gpt-5", "gpt-5-mini", "gpt-5-nano")},
+    **{m: (0.0, 0.25) for m in ("gpt-4.1", "gpt-4.1-mini", "o3")},
+    **{m: (0.0, 0.50) for m in ("gpt-4o", "gpt-4o-mini")},
+}
+
+
+# A dated snapshot suffix, e.g. `gpt-4o-mini-2024-07-18` or `gpt-5-2025-08-07`.
+_SNAPSHOT_SUFFIX = re.compile(r"-\d{4}-\d{2}-\d{2}$")
+
+
+def pricing_key(model: str) -> str:
+    """The pricing-table key for a *serving* model id.
+
+    OpenAI echoes the resolved snapshot rather than the alias that was
+    requested, so the exact-match lookup missed on every real call: a
+    `gpt-4o-mini-2024-07-18` attempt priced at DEFAULT_PRICING — twenty times
+    the true input rate — and picked up Anthropic's cache multipliers, the exact
+    five-fold cached-read under-bill CACHE_MULTIPLIERS was written to prevent.
+    Both tables were unreachable in production while the dashboard reported the
+    fabricated numbers as measured ones.
+
+    Normalization happens *here*, at the pricing boundary, and never by
+    rewriting `RunResult.model`: which snapshot served a call is provenance the
+    audit trail keeps.
+
+    Exact match first, then the dated suffix stripped, then the longest table
+    key the id extends at a `-` boundary — so `gpt-5-mini-2025-08-07` prices as
+    `gpt-5-mini` and not as `gpt-5`. A family price for an unlisted variant is a
+    close estimate; DEFAULT_PRICING for it is not an estimate at all.
+    """
+    if model in MODEL_PRICING:
+        return model
+    stripped = _SNAPSHOT_SUFFIX.sub("", model)
+    if stripped in MODEL_PRICING:
+        return stripped
+    best = ""
+    for key in MODEL_PRICING:
+        if stripped.startswith(f"{key}-") and len(key) > len(best):
+            best = key
+    return best or model
+
+
+def cache_multipliers(model: str) -> tuple[float, float]:
+    """(cache write, cache read) multipliers on a model's input rate.
+
+    Defaults to the Anthropic pair, so every pre-slice-4 model prices exactly as
+    it did before and an unknown model is treated as the provider the loop was
+    built against rather than as free.
+    """
+    return CACHE_MULTIPLIERS.get(
+        pricing_key(model), (CACHE_WRITE_MULTIPLIER, CACHE_READ_MULTIPLIER)
+    )
 
 
 def estimate_cost_usd(
@@ -166,13 +262,15 @@ def estimate_cost_usd(
     """Cost of one invocation in USD.
 
     Cache arguments default to 0 so existing callers and the zero-priced
-    MockRunner stay at $0. Cache tokens are priced off the input rate: writes
-    at 1.25x, reads at 0.10x; output is unaffected.
+    MockRunner stay at $0. Cache tokens are priced off the input rate, at
+    whatever multipliers that model's provider charges (`cache_multipliers`);
+    output is unaffected.
     """
-    pin, pout = MODEL_PRICING.get(model, DEFAULT_PRICING)
+    pin, pout = MODEL_PRICING.get(pricing_key(model), DEFAULT_PRICING)
+    write_mult, read_mult = cache_multipliers(model)
     return (
         tokens_in * pin
         + tokens_out * pout
-        + cache_creation_tokens * pin * CACHE_WRITE_MULTIPLIER
-        + cache_read_tokens * pin * CACHE_READ_MULTIPLIER
+        + cache_creation_tokens * pin * write_mult
+        + cache_read_tokens * pin * read_mult
     ) / 1_000_000

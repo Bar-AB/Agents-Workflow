@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import threading
 import time
+import warnings
 
 from .agents import (
     PlanError,
@@ -63,13 +64,18 @@ from .agents import (
     run_validator,
     run_worker,
 )
-from .config import LoopConfig
+from .config import OPENAI_MODELS, LoopConfig
 from .executor import TestExecutor, clear_workspace, workspace_for
 from .memory import MemoryService
 from .models import Task, TaskStatus, TestResult, VerdictKind
 from .registry import Registry
 from .retrieval import get_backend
-from .runner import ModelRunner
+from .runner import (
+    ModelRunner,
+    OpenAICompatRunner,
+    RunnerConfigError,
+    get_runner,
+)
 from .store import Store
 
 
@@ -91,6 +97,64 @@ class _InfraError(Exception):
         super().__init__(f"{stage}: {type(original).__name__}: {original}")
 
 
+class _ConfigError(Exception):
+    """The registry asks for something that does not exist — an unknown runner
+    name on an `AgentSpec`, say. Deliberately not an `_InfraError`: retrying a
+    configuration error with backoff only burns the clock to reach the same
+    conclusion, and reporting it as `infra_error` points the human at the
+    network instead of at their agents.json. Same reasoning `Loop.plan` applies
+    to a missing `planner` role.
+
+    A backend can raise the same class of problem from inside a call rather than
+    at resolution time — a missing API key, a 401 on a revoked one, a 404 on a
+    model that endpoint does not serve. Those arrive as `RunnerConfigError` from
+    the seam and `_with_retry` converts them here, because `run()` is invoked
+    inside the retry loop and would otherwise be retried like a network blip."""
+
+
+# A model id belonging to the Anthropic family. Pinned to an OpenAI-compatible
+# endpoint it is a guaranteed 404, so it is refused before the call rather than
+# after three paid round trips.
+_CLAUDE_MODEL_PREFIXES = ("claude-", "anthropic/")
+
+
+def _check_model_for_backend(role: str, model: str, backend: ModelRunner) -> None:
+    """Refuse a pinned model that cannot belong to its pinned provider.
+
+    `AgentSpec` co-locates `runner` and `model` because "a `claude-sonnet-5`
+    string means nothing to an OpenAI endpoint" — but nothing enforced the pair,
+    so the single most likely first edit (set `runner: openai` on the validator,
+    leave `model` alone) sent `claude-sonnet-5` to OpenAI, took a 404, retried
+    it and escalated reading `infra_error`. The failure mode the comment claims
+    to have designed away was the default first-use outcome.
+
+    Deliberately asymmetric in strictness. A `claude-*` id on an OpenAI endpoint
+    is *certainly* wrong, so it is a hard config error. An unrecognised id is
+    not: pointing this backend at a gateway, a fine-tune or a self-hosted model
+    is exactly what "second provider = second base_url" is for, and refusing it
+    would break a legitimate deployment on nothing but an incomplete list. That
+    one warns — it also prices at DEFAULT_PRICING, which is worth saying once.
+    """
+    if not isinstance(backend, OpenAICompatRunner):
+        return
+    if model.startswith(_CLAUDE_MODEL_PREFIXES):
+        raise _ConfigError(
+            f"Agent role {role!r} is pinned to the OpenAI-compatible backend "
+            f"but its model is {model!r}, which is an Anthropic model id. That "
+            f"request can only 404. Set a model the endpoint serves (e.g. one "
+            f"of {', '.join(OPENAI_MODELS[:3])}, ...) in agents.json."
+        )
+    if model not in OPENAI_MODELS:
+        warnings.warn(
+            f"Agent role {role!r} is pinned to the OpenAI-compatible backend "
+            f"with model {model!r}, which is not in config.OPENAI_MODELS. That "
+            f"is fine for a gateway, fine-tune or self-hosted id, but it has no "
+            f"pricing row, so its attempts cost DEFAULT_PRICING.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+
 class Loop:
     def __init__(
         self,
@@ -100,9 +164,23 @@ class Loop:
         config: LoopConfig,
         executor: TestExecutor | None = None,
         memory: MemoryService | None = None,
+        runners: dict[str, ModelRunner] | None = None,
     ):
         self.store = store
         self.runner = runner
+        # Backends a role may be pinned to by name (`AgentSpec.runner`), beyond
+        # the default `runner` above. Doubles as the cache for names resolved
+        # through `get_runner`: resolving per call would build a fresh backend
+        # for every invocation, and a MockRunner's script is per instance, so a
+        # test pinning a role would silently get an unscripted runner each round.
+        #
+        # What the lock guarantees is exactly one *construction* per name, so a
+        # backend holding state (a script, a connection, a rate limiter) is the
+        # same object for every thread. It does not make a backend thread-safe —
+        # that is the backend's own contract, and `MockRunner` explicitly does
+        # not offer it.
+        self._runners: dict[str, ModelRunner] = dict(runners or {})
+        self._runners_lock = threading.Lock()
         self.registry = registry
         self.config = config
         self.executor = executor or TestExecutor(
@@ -338,14 +416,30 @@ class Loop:
             )
             return plan_task
 
+        # Resolved before the retry loop for the same reason the role itself is:
+        # a runner name that does not exist is a config error, not a transient
+        # one, and it escalates the plan row with no child tasks created.
+        try:
+            planner_runner = self._runner_for("planner")
+        except _ConfigError as exc:
+            self.store.set_status(plan_task, TaskStatus.NEEDS_HUMAN, reason=str(exc))
+            return plan_task
+
         try:
             result = self._with_retry(
                 plan_task,
                 "planner",
                 lambda: run_planner(
-                    self.store, self.runner, self.registry, plan_task, self.memory
+                    self.store, planner_runner, self.registry, plan_task, self.memory
                 ),
             )
+        except _ConfigError as exc:
+            # A config error the backend only discovers when called (a missing
+            # key, a model it does not serve). Same outcome as an unknown runner
+            # name resolved above: the plan row escalates with zero child tasks,
+            # no retry and no `infra_error`.
+            self.store.set_status(plan_task, TaskStatus.NEEDS_HUMAN, reason=str(exc))
+            return plan_task
         except _InfraError as exc:
             self.store.set_status(
                 plan_task,
@@ -516,12 +610,13 @@ class Loop:
                 # Worker self-checks in its own output (spec §4.2–4.3).
                 self.store.set_status(task, TaskStatus.IN_PROGRESS)
                 ws = workspace_for(self.config.workspace_root, task.id, create=True)
+                worker_runner = self._runner_for(task.worker_role)
                 result = self._with_retry(
                     task,
                     "worker",
                     lambda: run_worker(
                         self.store,
-                        self.runner,
+                        worker_runner,
                         self.registry,
                         task,
                         feedback,
@@ -538,6 +633,36 @@ class Loop:
                         reason=f"Worker ambiguity: {result.output.strip()[9:].strip()}",
                     )
                     return task
+                if not result.output.strip():
+                    # An empty worker output is not work; it is the absence of
+                    # work, and every downstream step treats it as the former.
+                    # The validator would review a blank diff against criteria it
+                    # cannot check, and an approve there marks the task DONE —
+                    # which, under the slice-3 graph, is exactly what releases
+                    # dependents to run against upstream output that does not
+                    # exist. `human_approve` refuses a `pending` task for this
+                    # same reason; this is the same refusal one step earlier.
+                    #
+                    # Escalating (rather than revising) because emptiness is not
+                    # a quality gap a worker can be told to fix: it means the
+                    # provider returned nothing, and re-prompting the same way
+                    # burns the revision budget on a call that already failed
+                    # silently. A runner that knows *why* it is empty raises
+                    # instead (see OpenAICompatRunner's error-envelope and
+                    # finish_reason checks); this catches the backends that
+                    # cannot tell — ClaudeSDKRunner joins its chunks, so a stream
+                    # carrying no text is "" with nothing to report.
+                    self.store.set_status(
+                        task,
+                        TaskStatus.NEEDS_HUMAN,
+                        reason=(
+                            "Worker returned an empty output — nothing to "
+                            "validate. The model call succeeded but produced no "
+                            "text; check the runner's audit events for this "
+                            "attempt."
+                        ),
+                    )
+                    return task
                 task.output = result.output
                 self.store.update_task(task)
 
@@ -550,12 +675,17 @@ class Loop:
 
                 # Validation runs in a separate context (spec §5).
                 self.store.set_status(task, TaskStatus.VALIDATING)
+                # The cross-validator (slice 4): when the validator's spec pins a
+                # different backend, the output is reviewed by a model from
+                # another family than produced it. Nothing below this line
+                # changes — the verdict path is identical either way.
+                validator_runner = self._runner_for(task.validator_role)
                 verdict, attempt_id = self._with_retry(
                     task,
                     "validator",
                     lambda: run_validator(
                         self.store,
-                        self.runner,
+                        validator_runner,
                         self.registry,
                         task,
                         task.output,
@@ -563,6 +693,11 @@ class Loop:
                         test_result=test_result,
                     ),
                 )
+            except _ConfigError as exc:
+                # Escalates without a retry and without an infra_error event: a
+                # typo'd runner name is not going to resolve on the third try.
+                self.store.set_status(task, TaskStatus.NEEDS_HUMAN, reason=str(exc))
+                return task
             except _InfraError as exc:
                 self.store.set_status(
                     task,
@@ -760,6 +895,54 @@ class Loop:
 
     # -- internals -----------------------------------------------------------
 
+    def _runner_for(self, role: str) -> ModelRunner:
+        """Which backend serves this role (slice 4).
+
+        Provider selection is policy, so it lives here rather than in
+        `agents.py`: the `run_*` functions already take a runner and stay a pure
+        "invoke this runner" layer, which is what lets them be reused by `eval`
+        and by anything else that wants to drive one agent with a backend of its
+        own choosing. Pushing the lookup into them would give every caller the
+        loop's registry policy whether it wanted it or not, and would put a
+        second thing in the module whose job is building prompts.
+
+        An unpinned role returns `self.runner` — the same object, not a copy or
+        an equivalent — so with nothing pinned anywhere the loop makes exactly
+        the calls it made before this slice existed.
+
+        A role missing from the registry is *not* an error here: `run_summarizer`
+        deliberately falls back to the worker's spec for a hand-edited
+        agents.json predating that role, and this lookup must not turn that
+        graceful degrade into a crash.
+        """
+        try:
+            spec = self.registry.get(role)
+        except KeyError:
+            return self.runner
+        name = spec.runner
+        if not name:
+            return self.runner
+        # Check-then-act under a lock, not around it: `max_parallel_workers > 1`
+        # runs this from several threads at once, and the dict is sold as a
+        # cache *guaranteeing* one instance per name. What it actually
+        # guarantees without the lock is one instance per name eventually — fine
+        # for the two stateless backends that ship, wrong for anything holding a
+        # connection, and wrong today for a MockRunner injected through
+        # `runners={...}`, whose script is per instance.
+        with self._runners_lock:
+            if name not in self._runners:
+                try:
+                    self._runners[name] = get_runner(name)
+                except (ValueError, RunnerConfigError) as exc:
+                    raise _ConfigError(
+                        f"Agent role {role!r} is pinned to runner {name!r}, "
+                        f"which cannot be used ({exc}). Fix `runner` for that "
+                        f"role in agents.json."
+                    ) from exc
+            backend = self._runners[name]
+        _check_model_for_backend(role, spec.model, backend)
+        return backend
+
     def _with_retry(self, task: Task, stage: str, fn):
         """Call `fn`, retrying transient failures with exponential backoff.
         Each failure is logged as an `infra_error` event; once retries are
@@ -770,6 +953,15 @@ class Loop:
         while True:
             try:
                 return fn()
+            except RunnerConfigError as exc:
+                # A permanent, operator-fixable provider problem raised from
+                # inside the call rather than at resolution time: a missing key,
+                # a revoked one, a model the endpoint does not serve. Retrying
+                # it burns the clock to reach the same conclusion and an
+                # `infra_error` event points the human at the network. Escalates
+                # like any other config error, with no event of its own — the
+                # reason lands on the task row.
+                raise _ConfigError(f"{stage}: {exc}") from exc
             except Exception as exc:  # transient infra failure
                 attempts += 1
                 self.store.log_event(
@@ -804,12 +996,13 @@ class Loop:
         threshold = self.config.context_handoff_ratio * spec.context_budget_tokens
         if used < threshold:
             return None
+        summarizer_runner = self._runner_for("summarizer")
         summary = self._with_retry(
             task,
             "summarizer",
             lambda: run_summarizer(
                 self.store,
-                self.runner,
+                summarizer_runner,
                 self.registry,
                 task,
                 feedback,
