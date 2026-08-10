@@ -119,6 +119,44 @@ def test_worker_ambiguity_escalates(store):
     assert "locale" in task.escalation_reason
 
 
+@pytest.mark.parametrize("empty", ["", "   ", "\n\n\t "])
+def test_empty_worker_output_escalates_and_is_never_validated(store, empty):
+    """An empty worker output is the absence of work, not work.
+
+    Validating it would review a blank output against criteria it cannot check,
+    and an approve there marks the task DONE — which, under the task graph,
+    releases dependents against upstream output that does not exist.
+    """
+    task = add_task(store)
+    # APPROVE is scripted but must never be consumed: the loop has to stop at
+    # the worker, so the validator is never invoked at all.
+    loop, runner = make_loop(store, [empty, APPROVE])
+    loop.run_task(task)
+
+    assert task.status == TaskStatus.NEEDS_HUMAN
+    assert "empty output" in task.escalation_reason
+    assert task.revision_count == 0  # not a quality gap; not a revision
+    # The validator never ran, so its scripted line is still queued.
+    assert len(runner.calls) == 1
+    assert runner.outputs == [APPROVE]
+    assert store.task_metrics(task.id)["verdicts"] == []
+
+
+def test_empty_output_escalation_does_not_release_dependents(store):
+    """The reason this rule is load-bearing rather than cosmetic."""
+    parent = add_task(store)
+    child = add_task(store)
+    store.add_dependency(child.id, parent.id)
+
+    loop, _ = make_loop(store, ["", APPROVE])
+    loop.run_task(parent)
+    assert parent.status == TaskStatus.NEEDS_HUMAN
+
+    # The dependent stays unclaimable: `done` is what satisfies a dependency,
+    # and an empty parent never reached it.
+    assert loop.store.claim_next_task("w") is None
+
+
 def test_high_risk_needs_human_signoff_then_approve(store):
     task = add_task(store, risk=2)
     loop, _ = make_loop(store, ["out", APPROVE])

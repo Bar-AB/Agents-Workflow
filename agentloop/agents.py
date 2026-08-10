@@ -41,6 +41,10 @@ _MAX_UPSTREAM_CHARS = 2000
 # was this tool called with", not "what did it write".
 _MAX_TOOL_INPUT_CHARS = 2000
 _MAX_TOOL_NAME_CHARS = 200
+# A runner's own degradation note ("usage was estimated, here is why"). Wider
+# than a tool name: it is a sentence with numbers in it, and truncating it to a
+# name's width would cut off the part worth logging.
+_MAX_RUNNER_NOTE_CHARS = 1000
 
 # How much of a validator's findings section the verdict row keeps. Truncation
 # is acceptable here and deliberately *not* for the charter: the charter is an
@@ -154,6 +158,36 @@ def _invoke(
                     "role": role,
                     "tool": _tool_name_repr(call.get("tool")),
                     "input": _tool_input_repr(call.get("input")),
+                    # Whether the tool *ran*, or was merely requested. The SDK
+                    # path executes what it reports, so it defaults to True; a
+                    # chat-completions backend has no execution loop and reports
+                    # False. Recording both as the same fact would let slice 5's
+                    # auto-approval policy read a request as an execution.
+                    "executed": bool(call.get("executed", True)),
+                },
+            )
+        # A runner that had to estimate its own usage, or degrade in any other
+        # way, says so *in the audit log* — the one place `agentloop events`,
+        # the REST API and the SSE feed all read. A `warnings.warn` alone is
+        # invisible there, and the estimated tokens land in `attempts` and in
+        # the `{kind}_output` event indistinguishable from measured ones, so the
+        # dashboard renders a fabricated cost as a real measurement.
+        if result.usage_estimated or result.notes:
+            store.log_event(
+                task.id,
+                "runner_warning",
+                {
+                    "attempt_id": attempt_id,
+                    "agent_kind": kind,
+                    "role": role,
+                    "model": _tool_name_repr(result.model),
+                    "usage_estimated": bool(result.usage_estimated),
+                    # Coerced for the same reason `tool` is, and it is not
+                    # optional: this event shares `log_event`'s one
+                    # `json.dumps`, so an unencodable note here would raise
+                    # inside the closing transaction and roll back the
+                    # already-paid `finish_attempt` above.
+                    "note": _runner_note_repr(result.notes),
                 },
             )
         store.log_event(
@@ -186,17 +220,35 @@ def _tool_name_repr(value) -> str:
     the dashboard and read as one by slice 5's policy, and `json.dumps` would
     turn `Read` into `"Read"`.
     """
+    return _plain_str(value, _MAX_TOOL_NAME_CHARS)
+
+
+def _runner_note_repr(value) -> str:
+    """A runner's degradation note as a bounded string, for the audit log only.
+
+    Same coercion as `_tool_name_repr` and for the same reason — it rides the
+    same `json.dumps` inside the same closing transaction, and the `notes` field
+    crosses the `ModelRunner` seam, where the type is a protocol's promise
+    rather than a guarantee. Given a wider bound than a tool name because a note
+    is a sentence about why a number is an estimate, and a truncated one loses
+    exactly the numbers.
+    """
+    return _plain_str(value, _MAX_RUNNER_NOTE_CHARS)
+
+
+def _plain_str(value, limit: int) -> str:
+    """Any value as a bounded plain string, never raising, never JSON-quoted."""
     if value is None:
         return "unknown"
     if isinstance(value, str):
-        return value[:_MAX_TOOL_NAME_CHARS]
+        return value[:limit]
     try:
         text = str(value)
     except Exception:
         # A `__str__` that raises would put us straight back in the transaction
         # this function exists to protect.
         text = f"<unrepresentable {type(value).__name__}>"
-    return text[:_MAX_TOOL_NAME_CHARS]
+    return text[:limit]
 
 
 def _tool_input_repr(value) -> str:

@@ -51,6 +51,33 @@ dashboard are the only two. The validator now also enumerates what it checked
 under a soft `FINDINGS:` marker, stored in `verdicts.findings` — **added to**
 `Verdict.reasoning`, never subtracted from it, since `reasoning` is what the
 loop feeds back as revision feedback.
+Plus Slice 4: **second-provider cross-validator** — the `ModelRunner` seam
+finally carries a second provider. `OpenAICompatRunner` POSTs to any
+OpenAI-compatible `/v1/chat/completions` endpoint over stdlib `urllib.request`
+(no SDK, no runtime dependency, no optional extra — `retrieval.py` already
+established what an optional CI-untested provider path is worth), so "second
+provider" means "second base_url". Which backend serves a role is a *registry*
+decision — a new `AgentSpec.runner` field, `None` meaning the loop's default —
+resolved per role in `loop.py` (`_runner_for`), so pinning the validator to
+another model family makes a worker's output reviewed by something that is not
+its own family. It is a provider axis, **not a new gate**: no decision rule
+reads it, and with nothing pinned anywhere every role goes to the same runner
+object the loop was constructed with, so an unpinned run is the pre-slice-4 loop
+exactly.
+Hardened after an independent review found the money paths were the weak ones:
+usage parsing is now **total** (a wrong *type* used to raise *after* the
+completion was billed, and `_with_retry` then paid for it again — the
+`_tool_name_repr` defect one layer earlier); the never-zero guard checks each
+field independently and falls back to `total_tokens`; pricing normalizes the
+**dated snapshot id** providers actually echo (`gpt-4o-mini-2024-07-18`) to its
+family, without which every new pricing row and the whole `CACHE_MULTIPLIERS`
+table were unreachable on real traffic; a permanent provider failure (missing
+key, 400/401/403/404) is a `RunnerConfigError` that escalates as a **config
+error** carrying the provider's own body, instead of three paid retries reported
+as `infra_error`; a `claude-*` model pinned to the OpenAI backend is refused
+before the call; the bearer token cannot follow a redirect and a non-loopback
+`base_url` must be https; and a degraded run (estimated usage) is recorded as a
+`runner_warning` event rather than printed to stdout where nothing can see it.
 
 ## Commands
 - Install: `pip install -e ".[dev]"` (add `.[claude]` for the real runner)
@@ -79,10 +106,42 @@ loop feeds back as revision feedback.
   worker's `context_budget_tokens`). Planner/parallel knobs:
   `plan_requires_approval` (default True), `max_plan_tasks` (20),
   `max_parallel_workers` (default 1 = sequential, unchanged).
+  `MODEL_PRICING` also carries the OpenAI-compatible models
+  `OpenAICompatRunner` emits (point-in-time list rates); `OPENAI_MODELS` names
+  them so a test can assert every one has a row — a missing model does not fail,
+  it silently prices at `DEFAULT_PRICING`. `CACHE_WRITE_MULTIPLIER` /
+  `CACHE_READ_MULTIPLIER` (1.25 / 0.10) turned out to encode **Anthropic's**
+  cache pricing, so slice 4 made them per-model overridable through
+  `CACHE_MULTIPLIERS` + `cache_multipliers(model)`: OpenAI charges nothing to
+  write a cache entry and discounts a cached read by a factor that varies per
+  family (0.10x on gpt-5, 0.25x on gpt-4.1/o3, 0.50x on gpt-4o), so left global
+  a cross-provider run would under-bill a gpt-4o cached read five-fold and the
+  budget cap is only as honest as the worst-priced attempt under it. Overrides
+  rather than a third element on the pricing tuple: `(input, output)` is what
+  the docs, the tests and the dashboard all read, and widening it would rewrite
+  all of them to express something only two providers care about. An absent
+  override is the Anthropic pair, so every pre-slice-4 model prices as it did.
+  **Both tables are keyed through `pricing_key(model)`**, not by exact match:
+  OpenAI echoes the resolved *snapshot* (`gpt-4o-mini-2024-07-18`,
+  `gpt-5-2025-08-07`), never the requested alias, so an exact lookup missed on
+  every real call — gpt-4o-mini priced at `DEFAULT_PRICING`'s 20x input rate and
+  took Anthropic's cache multipliers, which is precisely the five-fold cached
+  read under-bill `CACHE_MULTIPLIERS` was added to prevent. Both new tables were
+  therefore unreachable in production while the dashboard reported the
+  fabricated numbers as measured ones. `pricing_key` tries an exact hit, then
+  the id with a trailing `-YYYY-MM-DD` stripped, then the longest table key the
+  id extends at a `-` boundary (so `gpt-5-mini-…` prices as `gpt-5-mini`, not
+  `gpt-5`). It normalizes at the *pricing* boundary only — `RunResult.model`
+  keeps the serving snapshot, because which snapshot ran is provenance.
 - `models.py` — Task (incl. `kind` 'task'|'plan' and `plan_id`), TaskStatus,
   Verdict (incl. `findings`: what the validator checked, a *copy* of a slice of
-  `reasoning` and never a piece removed from it), VerdictKind, AgentSpec,
-  RunResult, PlannedTask (a planner-proposed
+  `reasoning` and never a piece removed from it), VerdictKind, AgentSpec (incl.
+  `runner`: which backend serves this role, `None` = the loop's default —
+  it sits beside `model` because provider and model are one decision, and a
+  `claude-sonnet-5` string means nothing to an OpenAI endpoint, so splitting the
+  pair across two files would let a config edit produce a combination that
+  cannot run; defaulted, so an agents.json predating it still loads through
+  `AgentSpec(**spec)`), RunResult, PlannedTask (a planner-proposed
   graph node, with a local `ref` that expresses edges before db ids exist).
 - `store.py` — SQLite source of truth. Tables: tasks (incl. a `control` column:
   run/pause/abort, written only by `set_control`; and a `claimed_by` lease
@@ -185,7 +244,8 @@ loop feeds back as revision feedback.
   not a hope about the planner. Also `dependencies`/`dependents`/`plan_tasks`/
   `set_plan_approved`/`is_plan_approved`.
 - `registry.py` — agent registry: role, model, system prompt, tools, context
-  budget, version. Defaults in code (`worker`, `validator`, `summarizer`
+  budget, version, and (slice 4) the `runner` a role is pinned to. Defaults in
+  code (`worker`, `validator`, `summarizer`
   for context handoffs, and `planner` for goal decomposition);
   `agentloop init-registry` → agents.json. A hand-edited
   agents.json predating `summarizer` degrades gracefully — `run_summarizer`
@@ -211,18 +271,94 @@ loop feeds back as revision feedback.
   absent charter leaves byte-for-byte unchanged.
 - `runner.py` — **ModelRunner protocol: the provider seam.** The loop never
   imports a vendor SDK directly. Backends: ClaudeSDKRunner (default),
-  MockRunner (scripted, for tests). New providers (litellm, Codex
-  cross-validator) = new implementations of `run()`. Usage is read from the
+  **OpenAICompatRunner** (slice 4) and MockRunner (scripted, for tests). Usage
+  is read from the
   terminal `ResultMessage` only (`extract_usage`) — all four fields, including
   prompt cache; summing per-message double-counts. Tool uses are the opposite:
   `extract_tool_calls` accumulates `ToolUseBlock`s *across* the stream into
   `RunResult.tool_calls` (duck-typed, so an SDK rename costs a record, not a
   run). `MockRunner` returns a scripted `RunResult` as-is, so a test can script
   tool calls without the SDK.
+  `OpenAICompatRunner` POSTs to `{base_url}/chat/completions` with
+  `urllib.request` — stdlib, so it is fully exercisable against a canned
+  response, which matters most for the usage parsing: that is what the budget
+  cap ultimately measures and the first thing a provider schema change breaks.
+  `extract_openai_usage` is the pure seam for it, and it exists because
+  OpenAI's `prompt_tokens` is **inclusive** of `prompt_tokens_details.
+  cached_tokens` while Anthropic reports the two disjointly — and
+  `RunResult.tokens_in` is *new* input only, so the cached share is subtracted
+  out rather than added on (adding would bill it twice, at the full rate on top
+  of the discounted one), clamped at zero so a provider over-reporting cache can
+  never *lower* a task's measured spend back under a cap it had passed. Cache
+  writes report 0: OpenAI's caching is automatic and carries no write charge, so
+  reporting the prompt as a cache write would invent spend. Every field goes
+  through `_int_or_zero`, which makes the function **total**: it cannot raise on
+  any input. That is a money rule, not tidiness — `agents._invoke` calls
+  `runner.run()` outside any transaction and reaches `finish_attempt` only on a
+  clean return, so a raise here discards the tokens and cost of a completion the
+  provider already billed and `loop.py`'s bare `except Exception` then re-pays
+  for it, up to `infra_max_retries + 1` times, for a deterministic parse
+  failure. `run()` wraps the whole usage block for the same reason: content is
+  extracted first and *may* raise, usage second and may not.
+  It **never returns zero tokens silently**, checked **per field** — missing
+  input and missing output are estimated independently at a rounded-up
+  ~4-chars-per-token, and `total_tokens - completion_tokens` is preferred over
+  an estimate when it is there. `tokens_in == 0` with `cache_read > 0` is a
+  legitimately fully-cached prompt and is *not* treated as missing; requiring
+  all three fields to be zero (the original guard) let a provider omitting
+  `prompt_tokens` record 0 input against a multi-KB validator prompt, where
+  input is the dominant cost. A run whose usage was estimated sets
+  `RunResult.usage_estimated` / `notes`, which `agents._invoke` records as a
+  **`runner_warning` event** in the same closing transaction as the attempt —
+  a `warnings.warn` alone never reaches `agentloop events`, the REST API or the
+  SSE feed, so the estimate would land in `attempts` indistinguishable from a
+  measured number and the dashboard would show a fabricated cost as a real one.
+  The note is coerced through `agents._runner_note_repr`, because telemetry must
+  never fail an attempt.
+  `extract_openai_tool_calls` reports a call only when the response carries one
+  (same "nothing recorded rather than a wrong record" contract as the SDK path)
+  and tags every one **`executed: False`** — this backend sends no `tools` and
+  has no execution loop, so what it sees is a call the model *asked for* and
+  nobody ran, which CLAUDE.md's "every tool an agent actually invokes" rule
+  distinguishes and slice 5's auto-approval policy must not conflate. The
+  `tool_call` event carries the flag (SDK calls default to `True`).
+  The API key is read from the environment at call time, checked *before* the
+  request so a missing one is a `RunnerConfigError` rather than a retried 401,
+  and used for exactly one thing — the Authorization header, on a request that
+  **cannot be redirected**: the runner builds its own opener with a `_NoRedirect`
+  handler, because urllib's stock handler strips only content-length/content-type
+  and forwards `Authorization` across hosts, and `_check_base_url` refuses a
+  non-`https` `base_url` unless its host is loopback. Neither is a live exploit
+  (`base_url` is operator config), but this project scrubs `ANTHROPIC_API_KEY`
+  out of the sandbox by construction rather than by trusting what runs there, and
+  the wire deserves the same. `_classify_http_error` reads the **body** of every
+  `HTTPError` into the message — that is the only place the provider says
+  `model_not_found` vs `invalid_api_key` vs a transient overload — and splits
+  400/401/403/404 (permanent → `RunnerConfigError`) from 408/429/5xx (transient →
+  `ProviderResponseError`, retried). `_extract_message` raises
+  `ProviderResponseError` rather than returning `output=""` for an `error`
+  envelope under HTTP 200 (what OpenRouter/vLLM/Azure gateways return for quota
+  and policy failures), a null `content`, or a `finish_reason` outside
+  stop/tool_calls (`length` = truncated). **Documented
+  residual limitation**, in the same register as `sandbox_isolation='strict'`:
+  a chat-completions call has no tool-execution loop, so a pinned role's
+  registry `tools` are **dropped with a warning** — the run degrades rather than
+  crashing (`run_summarizer`'s precedent) but says so at the moment the gap
+  opens. Forwarding them would be worse than dropping: the model would emit
+  calls nobody executes and then reason as though they had run. This is why the
+  role to pin is the **validator** — its prompt already carries the worker
+  output, the executed test results, the charter and memory, so it reviews what
+  it was given — and not the worker, whose whole job is writing files.
+  `get_runner` knows `claude` / `openai` / `mock`; the four `--runner`
+  `choices` lists in `cli.py` must be kept in step with it.
 - `eval.py` — validator calibration harness. Fixtures (task/output/gold verdict
   + a scripted mock line) run through `run_validator`; reports agreement,
   confusion matrix, calibration table. Mock path is deterministic (CI); the
-  claude path is a real measurement. Invocations run against a scratch
+  `claude` and `openai` paths are real measurements, each gated on its own
+  credential and *skipped by name* without it — `--runner openai` used to fall
+  through to the mock branch, printing scripted-fixture agreement numbers as a
+  calibration report at exit 0, and a calibration number that measured nothing
+  is worse than none. Invocations run against a scratch
   in-memory store so they don't pollute the task board.
 - `agents.py` — prompt building for worker/validator/summarizer/planner; verdict
   and plan parsing.
@@ -315,6 +451,31 @@ loop feeds back as revision feedback.
   what may run — and an idle worker *waits on a condition while any peer is
   busy* rather than exiting, because a plan usually has one root and exiting
   would collapse the rest of the graph back to serial.
+  `_runner_for(role)` is where provider selection lives (slice 4): it reads the
+  role's `AgentSpec.runner` and returns the pinned backend, or `self.runner`
+  itself — the same object, not an equivalent — when nothing is pinned, which is
+  what makes an unpinned run structurally identical to the pre-slice-4 loop
+  rather than identical by inspection. It is here and not in `agents.py` on
+  purpose: the `run_*` functions already take a runner and stay a pure "invoke
+  this runner" layer, which is what lets `eval` and anything else drive one
+  agent with a backend of its own; moving the lookup into them would hand every
+  caller the loop's registry policy and put a second job in the module that
+  builds prompts. Resolved names are cached in `Loop._runners` (also the
+  injection point: `Loop(..., runners={...})`), because `get_runner` builds a
+  *new* backend per call and a MockRunner's script is per instance. That
+  check-then-act is under `_runners_lock`, so the guarantee is exactly one
+  *construction* per name even at `max_parallel_workers > 1` — it does not make
+  a backend thread-safe, which is the backend's own contract (`ModelRunner.run`
+  states it; `MockRunner` explicitly does not meet it). `_runner_for` also
+  validates the pair: a `claude-*` model pinned to the OpenAI-compatible backend
+  is a `_ConfigError` naming role and model, since that request can only 404 —
+  the "set `runner: openai`, forget `model`" edit was the *default* first-use
+  outcome of the very failure `AgentSpec.runner`'s comment claims to design
+  away. An unrecognised (non-Anthropic) id only warns: a gateway, fine-tune or
+  self-hosted id is exactly what "second provider = second base_url" is for. A
+  role missing from the registry resolves to the default rather than raising, so
+  `run_summarizer`'s deliberate fallback for an older agents.json still degrades
+  instead of crashing.
 - `server.py` — REST + SSE dashboard backend, stdlib `http.server` only. The
   append-only `events` table *is* the change feed: SSE is a `WHERE id > cursor`
   query, so reconnects resume losslessly via `Last-Event-ID` and the dashboard
@@ -323,6 +484,9 @@ loop feeds back as revision feedback.
   history` is the human write surface for the project charter; a `ValueError`
   from `charter_set` renders through `main`'s handler as `error: ...`, which is
   the loud write-time refusal that pays for never truncating at inject time.
+  `--runner claude|openai|mock` appears on **four** subcommands (`plan`, `run`,
+  `serve`, `eval`) and sets only the loop's *default* backend; per-role pins are
+  an agents.json decision and are applied on top of it.
 - `web/` — Vite + React + TypeScript dashboard. `types.ts` mirrors the server's
   JSON shapes; keep them in sync when changing an endpoint.
 
@@ -340,6 +504,23 @@ loop feeds back as revision feedback.
   immediately (no revision loop on severe disagreement).
 - Worker output starting `ESCALATE:` → NEEDS_HUMAN (genuine ambiguity —
   agents ask instead of guessing).
+- **Empty worker output → NEEDS_HUMAN**, checked immediately after the
+  `ESCALATE:` test and before anything is stored or validated. An empty output
+  is the *absence* of work, and every downstream step treats it as the presence
+  of work: the validator would review a blank output against criteria it cannot
+  check, and an approve there marks the task DONE — which, under the slice-3
+  graph, is precisely what releases dependents to run against upstream output
+  that does not exist. `human_approve` refuses a `pending` task for the same
+  reason; this is that refusal one step earlier, where the loop rather than a
+  human is about to do it. **Escalate, not revise**: emptiness is not a quality
+  gap a worker can be told to fix, so re-prompting identically would spend the
+  revision budget on a call that already failed silently, and `max_revisions`
+  is not touched. A runner that knows *why* the reply is empty raises instead
+  (`OpenAICompatRunner` checks for an `error` envelope, null `content`, and a
+  `finish_reason` outside `{stop, tool_calls}`); this rule catches the backends
+  that cannot tell — `ClaudeSDKRunner` joins its chunks, so a stream carrying no
+  text is `""` with nothing to report. Pre-dates slice 4; slice 4's HTTP backend
+  made it reachable often enough to be worth a rule.
 - Budget cap (tokens or cost) exceeded → NEEDS_HUMAN. Cost and token totals
   include prompt-cache tokens (cache write ×1.25, read ×0.10 on the input rate);
   a cache-heavy run trips the cap that pre-fix it slipped past.
@@ -400,6 +581,33 @@ loop feeds back as revision feedback.
   check: `pause` → PAUSED (survives restart, no auto-resume), `abort` → ABORTED
   (terminal but output/audit preserved). `control` is written only by
   `set_control` so the loop's stale in-memory task can't clobber it.
+- **Which provider serves a role is not a gate either.** `AgentSpec.runner`
+  changes who is asked, never what the answer means: approve/revise/escalate,
+  the 0.70/0.40 thresholds, revision counting and the budget cap all read the
+  same fields regardless of which backend produced them. A cross-provider run
+  therefore takes the identical status transitions a single-provider run does —
+  that is the whole point of putting the second provider behind the existing
+  seam instead of beside it.
+- Both providers' spend lands in **one** task budget. `task_spend` sums every
+  attempt on the task whatever ran it, and cost is computed per attempt from the
+  *serving* model (`estimate_cost_usd(result.model, …)`, with that model's own
+  cache multipliers), so a worker at $3.00 on Anthropic and a validator at $1.25
+  on OpenAI trip a $4.00 cap together even though neither trips it alone. A cap
+  that only measured the loop's default runner would be a cap with a hole in it.
+- A pin naming a runner that does not exist is a **config error, not an infra
+  failure**: it escalates to NEEDS_HUMAN naming the bad backend, with no retry
+  and no `infra_error` event. Same rule as a missing `planner` role — retrying
+  with backoff only burns the clock to reach the same conclusion, and an
+  `infra_error` would point the human at the network instead of at agents.json.
+  The same classification applies to problems a backend can only discover when
+  called: a missing API key, a revoked one (401), a model the endpoint does not
+  serve (404), a malformed request (400). Those raise `RunnerConfigError` at the
+  seam and `_with_retry` converts them to `_ConfigError` **without** logging an
+  `infra_error` — `run()` is invoked *inside* the retry loop, so as ordinary
+  exceptions they were three paid round trips reported as a network failure.
+  408/429/5xx stay transient and are retried; the provider's own error body
+  travels with the message either way, since that is the only place the two are
+  distinguishable.
 - Validator findings are **evidence, not a gate**. `approve` + confidence ≥ 0.70
   + tests not failing → DONE regardless of what the findings say, and an empty
   findings section is recorded as "no findings recorded" rather than treated as
@@ -477,7 +685,11 @@ loop feeds back as revision feedback.
   once per agent per round, and worker and validator rank against different
   queries, so a task-only record could not tell them apart.
 - Every tool an agent actually invokes logs a `tool_call` event (attempt_id,
-  agent kind, tool, truncated input), sourced from `RunResult.tool_calls`.
+  agent kind, tool, truncated input, and `executed`), sourced from
+  `RunResult.tool_calls`. `executed` distinguishes a tool that *ran* from one
+  the model merely asked for: the SDK path executes what it reports and defaults
+  to True, while `OpenAICompatRunner` has no execution loop and reports False,
+  and slice 5's auto-approval policy must not read a request as an execution.
   Registry tools already reach the SDK, so this was happening unrecorded;
   slice 5's auto-approval policy layers on this record. **Both** fields are
   coerced to a bounded **string** — the input by `agents._tool_input_repr`
@@ -526,7 +738,10 @@ loop feeds back as revision feedback.
 3. ~~Planner agent producing a task graph; then parallel workers.~~
    **Done (Slice 3)** — `planner` role + `task_deps`; claimability predicate in
    `claim_next_task`; `max_parallel_workers` (default 1).
-4. Second-provider cross-validator via the ModelRunner seam.
+4. ~~Second-provider cross-validator via the ModelRunner seam.~~
+   **Done (Slice 4)** — stdlib `OpenAICompatRunner`, per-role pinning via
+   `AgentSpec.runner`, resolved in `loop._runner_for`; per-provider cache
+   pricing in `config.CACHE_MULTIPLIERS`.
 5. Agent-requested tools with an auto-approval policy for read-only ones.
 6. git-commit-per-task rollback; infra retry/backoff (distinct from "revise");
    batch whole-loop evaluation; coverage in test_runs.

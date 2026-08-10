@@ -96,6 +96,16 @@ class RunResult:
     # runners that cannot report them; a backend that stops reporting degrades
     # to "nothing recorded" rather than to a wrong record.
     tool_calls: list[dict] = field(default_factory=list)
+    # True when some part of the token counts above is this runner's estimate
+    # rather than the provider's measurement. Without it the estimate reaches
+    # `attempts` and the dashboard indistinguishable from a measured number, and
+    # a fabricated cost is displayed as a real one. `agents._invoke` turns the
+    # pair below into one `runner_warning` event on the attempt.
+    usage_estimated: bool = False
+    # Why, in one bounded line. Free text rather than an enum because it is read
+    # by a human debugging a run, and coerced (never trusted) at the logging
+    # boundary: telemetry must never fail an attempt.
+    notes: str = ""
 
 
 @dataclass
@@ -149,3 +159,18 @@ class AgentSpec:
     tools: list[str] = field(default_factory=list)
     context_budget_tokens: int = 100_000
     version: str = "1"
+    # Which ModelRunner backend serves this role (slice 4). None = the runner
+    # the loop was constructed with, which is what makes an unpinned run
+    # behaviorally identical to the pre-slice-4 loop.
+    #
+    # It lives here rather than in LoopConfig because model and provider are one
+    # decision, and `model` is already here: a `claude-sonnet-5` string means
+    # nothing to an OpenAI endpoint, so splitting the pair across two files
+    # would let a config edit produce a combination that cannot run. The
+    # registry is already the per-role surface for exactly this kind of choice
+    # (prompt, tools, context budget, version), and it grows no knob per role.
+    #
+    # Defaulted, so a hand-edited agents.json predating the field still loads:
+    # `Registry.load` splats `AgentSpec(**spec)`, and an absent key is the
+    # default rather than a TypeError.
+    runner: str | None = None
