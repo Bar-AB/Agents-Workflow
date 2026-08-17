@@ -462,3 +462,379 @@ def test_unbuilt_frontend_gives_a_helpful_hint(live, monkeypatch):
     except urllib.error.HTTPError as exc:
         assert exc.code == 503
         assert "npm" in json.loads(exc.read())["hint"]
+
+
+# -- tool requests (slice 5, Phase 7) ----------------------------------------
+
+
+def seed_tool_request(
+    store: Store,
+    tool: str = "shell",
+    *,
+    blocking: bool = True,
+    parked: bool = True,
+    role: str = "worker",
+    status: str = "pending",
+    task: Task | None = None,
+) -> tuple[Task, int]:
+    task = task if task is not None else seed(store, f"needs {tool}")
+    request_id = store.tool_request_add(
+        task.id,
+        role=role,
+        agent_kind=role,
+        tool=tool,
+        status=status,
+        source="marker",
+        reason="need to run the build",
+        blocking=blocking,
+    )
+    if parked:
+        task.status = TaskStatus.NEEDS_HUMAN
+        task.escalation_reason = (
+            f"Awaiting tool approval: {tool} (requested by worker)."
+        )
+        store.update_task(task)
+        store.tool_requests_mark_parked(task.id, [request_id])
+    return task, request_id
+
+
+def test_tool_requests_over_http(live):
+    base, store, _, _ = live
+    task, request_id = seed_tool_request(store)
+    status, body = get(base, "/api/tool_requests")
+    assert status == 200
+    row = body["tool_requests"][0]
+    assert row["id"] == request_id
+    assert row["task_id"] == task.id
+    assert row["tool"] == "shell"
+    assert row["status"] == "pending"
+    assert row["blocking"] is True
+    assert row["parked"] is True
+
+
+def test_tool_requests_filters_by_task_and_status(live):
+    base, store, _, _ = live
+    first_task, _ = seed_tool_request(store, "shell")
+    second_task, second_id = seed_tool_request(
+        store, "web", blocking=False, parked=False
+    )
+
+    _, body = get(base, f"/api/tool_requests?task_id={second_task.id}")
+    assert [r["id"] for r in body["tool_requests"]] == [second_id]
+    assert first_task.id != second_task.id
+
+    _, body = get(base, "/api/tool_requests?status=approved")
+    assert body["tool_requests"] == []
+
+
+def test_tool_request_json_exposes_every_column(live):
+    """A column stored but not served is "stored, exposed nowhere, and looks
+    implemented" — the trap `task_metrics`' `findings` documents. Asserted
+    against the dataclass's own field names, so a column added later cannot be
+    silently unexposed."""
+    import dataclasses
+
+    from agentloop.models import ToolRequest
+
+    base, store, _, _ = live
+    seed_tool_request(store)
+    _, body = get(base, "/api/tool_requests")
+    row = body["tool_requests"][0]
+
+    fields = {f.name for f in dataclasses.fields(ToolRequest)}
+    assert fields <= set(row), fields - set(row)
+    # Enums serve as their `.value`, and both timestamps as JSON numbers, not
+    # date strings — the columns are REAL.
+    assert row["status"] == "pending" and row["source"] == "marker"
+    assert isinstance(row["created_at"], (int, float))
+    assert row["decided_at"] is None
+
+
+def test_tool_request_json_renders_the_collateral_consequence(live):
+    """The carried E3 item, at the REST surface the dashboard decides through.
+
+    `LOGICAL_TOOL_MAP` is not injective, so a decision on `shell` also decides
+    `git`, and a logical name understates what it grants. Both are derived here
+    rather than duplicated in the frontend, which would be a second source of
+    truth for the map."""
+    base, store, _, _ = live
+    seed_tool_request(store, "shell")
+    _, body = get(base, "/api/tool_requests")
+    row = body["tool_requests"][0]
+    assert row["resolved"] == ["Bash"]
+    assert row["also_decides"] == {"git": ["Bash"]}
+
+    seed_tool_request(store, "web", blocking=False, parked=False)
+    _, body = get(base, "/api/tool_requests?task_id=2")
+    shares_nothing = body["tool_requests"][0]
+    assert shares_nothing["resolved"] == ["WebFetch", "WebSearch"]
+    assert shares_nothing["also_decides"] == {}
+
+
+def test_the_panels_consequence_is_computed_not_asserted(live):
+    """E4/F1 state 2: a *pending* ask already costs the role the sibling name.
+
+    `also_decides` alone says "rejecting stops git working", which implies `git`
+    works today. It does not: a pending `shell` row is withheld (the worker does
+    not hold `shell`), so its `Bash` is already subtracted and `git` went with
+    it. So rejecting takes nothing away, approving is what restores it — the
+    opposite of what the sharing map alone can say."""
+    base, store, _, _ = live
+    seed_tool_request(store, "shell")
+    _, body = get(base, "/api/tool_requests")
+    effect = body["tool_requests"][0]["effect"]
+    assert effect["approve_grants"] == ["Bash"]
+    assert effect["approve_enables"] == ["git"]
+    # The load-bearing half: nothing is lost by rejecting, because nothing works.
+    assert effect["reject_removes"] == []
+    assert effect["reject_loses"] == []
+    # ...and the panel can say so: `git` is already gone while this row stands.
+    assert effect["costs_now"] == ["git"]
+    assert effect["in_effect"] is False
+
+
+def test_a_grant_that_grants_nothing_says_so(live):
+    """E4/F1 state 1, the state the router re-verified: `git` rejected and
+    `shell` pending. Approving `shell` yields no `Bash` at all —
+    `subtract_withheld` removes it on account of the rejected `git` — so the
+    screen must not promise the capability, and after the approve it must not
+    claim the grant is in force."""
+    base, store, loop, _ = live
+    task, _ = seed_tool_request(
+        store, "git", blocking=False, parked=False, status="rejected"
+    )
+    _, shell_id = seed_tool_request(store, "shell", parked=True, task=task)
+
+    _, body = get(base, "/api/tool_requests")
+    shell = next(r for r in body["tool_requests"] if r["id"] == shell_id)
+    assert shell["effect"]["approve_grants"] == []
+    assert shell["effect"]["approve_enables"] == []
+
+    # And the consequence stays true one click later: the row is `approved`, and
+    # the capability is still withheld.
+    loop.approve_tool_request(shell_id, "ok")
+    _, body = get(base, "/api/tool_requests")
+    shell = next(r for r in body["tool_requests"] if r["id"] == shell_id)
+    assert shell["status"] == "approved"
+    assert shell["effect"]["in_effect"] is False
+
+
+def test_a_role_that_cannot_lose_the_sibling_is_not_told_it_can(live):
+    """E4/F1 state 3: the same ask on the **validator**, which declares no `git`.
+
+    Rejecting changes nothing for it, and an invented cost attached to *denial*
+    pushes a human toward granting — the one direction a permission screen must
+    not lean."""
+    base, store, _, _ = live
+    seed_tool_request(store, "shell", role="validator")
+    _, body = get(base, "/api/tool_requests")
+    effect = body["tool_requests"][0]["effect"]
+    assert effect["reject_removes"] == []
+    assert effect["costs_now"] == []
+    # Non-vacuity: the ask itself is still worth something to this role.
+    assert effect["approve_grants"] == ["Bash"]
+
+
+def test_a_tool_outside_the_map_is_not_called_in_process(live):
+    """E4/F2: `resolved == []` has two causes and the panel branched on neither.
+    `task_state` really is served in-process; `docker` is not a tool at all."""
+    base, store, _, _ = live
+    task, _ = seed_tool_request(store, "task_state", blocking=False, parked=False)
+    _, body = get(base, "/api/tool_requests")
+    assert body["tool_requests"][0]["known"] is True
+
+    seed_tool_request(store, "docker", blocking=False, parked=False)
+    _, body = get(base, f"/api/tool_requests?task_id={task.id + 1}")
+    row = body["tool_requests"][0]
+    assert row["resolved"] == []
+    assert row["known"] is False
+
+
+def test_approve_tool_request_over_http(live):
+    base, store, _, _ = live
+    task, request_id = seed_tool_request(store)
+    status, body = post(
+        base, f"/api/tool_requests/{request_id}/approve", {"note": "ok"}
+    )
+    assert status == 200
+    # Mirrors /api/memory: a POST returns the refreshed list.
+    row = next(r for r in body["tool_requests"] if r["id"] == request_id)
+    assert row["status"] == "approved"
+    assert row["decided_by"] == "human"
+    assert row["decided_note"] == "ok"
+    assert row["parked"] is False
+    assert store.get_task(task.id).status == TaskStatus.PENDING
+
+
+def test_reject_tool_request_over_http(live):
+    """Rejection is recorded and the task stays parked — no release path."""
+    base, store, _, _ = live
+    task, request_id = seed_tool_request(store)
+    _, body = post(base, f"/api/tool_requests/{request_id}/reject", {"note": "no"})
+    row = next(r for r in body["tool_requests"] if r["id"] == request_id)
+    assert row["status"] == "rejected"
+    assert row["parked"] is True
+    assert store.get_task(task.id).status == TaskStatus.NEEDS_HUMAN
+
+
+def test_deciding_twice_over_http_is_a_400(live):
+    """A decided row is final. Two humans, or one double-click: the store's
+    compare-and-swap picks the winner and the loser is told."""
+    base, store, _, _ = live
+    _, request_id = seed_tool_request(store)
+    # Control: the first decision succeeds, so the 400 below is the *second*
+    # decision being refused and not the endpoint being absent.
+    first_status, _ = post(base, f"/api/tool_requests/{request_id}/approve")
+    assert first_status == 200
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        post(base, f"/api/tool_requests/{request_id}/reject")
+    assert exc.value.code == 400
+
+
+def test_deciding_a_missing_tool_request_is_a_404(live):
+    base, _, _, _ = live
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        post(base, "/api/tool_requests/9999/approve")
+    assert exc.value.code == 404
+
+
+def test_a_non_numeric_task_id_filter_is_a_400(live):
+    """Dropping it would serve the whole queue as though it had been filtered."""
+    base, _, _, _ = live
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        get(base, "/api/tool_requests?task_id=abc")
+    assert exc.value.code == 400
+
+
+@pytest.mark.parametrize("raw", ["--5", "%C2%B2"])
+def test_a_task_id_the_guard_admitted_but_int_refuses_is_a_400(live, raw):
+    """E4/F4: the guard re-implemented `int()` and got it wrong twice.
+
+    `lstrip('-')` strips *every* leading hyphen, and `'²'.isdigit()` is True.
+    Both passed the guard and raised in `int()`, and `do_GET` has no `ValueError`
+    branch — so a bad filter came back a 500. Letting the converter decide is
+    total."""
+    base, _, _, _ = live
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        get(base, f"/api/tool_requests?task_id={raw}")
+    assert exc.value.code == 400
+
+
+def test_a_negative_task_id_filter_is_still_accepted(live):
+    """Non-vacuity control for the guard above: `int()` is the only judge, so a
+    genuinely numeric id (no row matches it) is a 200 with an empty list, not a
+    400."""
+    base, _, _, _ = live
+    status, body = get(base, "/api/tool_requests?task_id=-5")
+    assert status == 200
+    assert body["tool_requests"] == []
+
+
+def test_an_unrecognised_status_filter_is_a_400(live):
+    """E4/F5: the filter bound `status` verbatim, so `?status=Pending` or
+    `?status=granted` returned 200 with an empty list — indistinguishable from an
+    empty queue. On a permission API that reads as "nothing is waiting on you"
+    while rows are pending."""
+    base, store, _, _ = live
+    seed_tool_request(store)
+    for bad in ("Pending", "granted"):
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            get(base, f"/api/tool_requests?status={bad}")
+        assert exc.value.code == 400, bad
+    # Non-vacuity: the valid value the pre-existing test uses still filters.
+    status, body = get(base, "/api/tool_requests?status=pending")
+    assert status == 200
+    assert len(body["tool_requests"]) == 1
+
+
+def test_config_endpoint_exposes_the_tool_policy_knobs(live):
+    """The panel has to be able to explain *why* something is gated."""
+    base, _, _, config = live
+    _, body = get(base, "/api/config")
+    assert body["gate_declared_tools"] == config.gate_declared_tools
+    assert body["tool_readonly_allowlist"] == config.tool_readonly_allowlist
+
+
+def test_metrics_endpoint_counts_waiting_tool_requests(live):
+    base, store, _, _ = live
+    seed_tool_request(store)
+    _, body = get(base, "/api/metrics")
+    assert body["pending_tool_requests"] == 1
+
+
+def test_tool_request_events_reach_the_sse_feed(live):
+    """`events` *is* the change feed, so the new kinds need no server change —
+    checked rather than assumed."""
+    base, store, _, _ = live
+    cursor = store.latest_event_id()
+    _, request_id = seed_tool_request(store)
+    store.tool_request_decide(request_id, approved=True, by="human", released=False)
+    # Three event rows land: task_added, tool_requested, tool_request_decided.
+    frames = read_frames(base, since=cursor, count=3)
+    kinds = [f[2]["kind"] for f in frames if f[1] == "event"]
+    assert "tool_requested" in kinds
+    assert "tool_request_decided" in kinds
+
+
+# -- E4 cycle 2: the rendered claim is served, not derived on the screen -------
+
+
+def test_a_cap_refused_row_serves_the_capability_that_is_still_live(live):
+    """H1 over HTTP. `withheld_tools` never sees `refused`, so a row refused over
+    the per-task cap subtracts nothing, while its logical name is still absent
+    from `allowed`. The panel branched on that logical test and rendered "Bash is
+    not available to this role" about a `Bash` the gate hands the runner through
+    the worker's declared `git`. The concrete answer has to come from the server:
+    `web/` has no test runner, so a verb or an availability claim computed in TSX
+    is an assertion no gate covers."""
+    base, store, _, _ = live
+    task, _ = seed_tool_request(store, "web", blocking=False, parked=False)
+    assert (
+        store.tool_request_add(
+            task.id,
+            role="worker",
+            agent_kind="worker",
+            tool="shell",
+            status="pending",
+            source="marker",
+            max_per_task=1,
+        )
+        is None
+    )
+    _, body = get(base, f"/api/tool_requests?task_id={task.id}")
+    shell = next(r for r in body["tool_requests"] if r["tool"] == "shell")
+    assert shell["status"] == "refused"
+    assert shell["effect"]["in_effect"] is False  # the logical name is absent
+    assert shell["effect"]["capability_live"] == ["Bash"]  # the capability is not
+    assert shell["effect"]["verb"] == "does not withhold"
+
+
+def test_the_headline_verb_never_contradicts_the_body_over_http(live):
+    """H2 state 2. `test_an_approved_request_that_is_not_in_force_says_so` pins
+    `in_effect is False` for this row as an API fact; the headline above the body
+    was never checked and read `grants [Bash]` over `NOT in force`."""
+    base, store, loop, _ = live
+    task, _ = seed_tool_request(
+        store, "git", blocking=False, parked=False, status="rejected"
+    )
+    _, shell_id = seed_tool_request(store, "shell", parked=True, task=task)
+    loop.approve_tool_request(shell_id, "ok")
+
+    _, body = get(base, "/api/tool_requests")
+    shell = next(r for r in body["tool_requests"] if r["id"] == shell_id)
+    assert shell["status"] == "approved"
+    assert shell["effect"]["verb"] == "does not deliver"
+    assert shell["effect"]["capability_live"] == []
+
+
+def test_a_bad_since_cursor_is_a_400_and_not_a_500(live):
+    """The same class as E4's two new query params, one file over and
+    pre-existing: `int()` escaping `do_GET` maps to a 500, which reads as "the
+    server is broken" for what is a malformed request."""
+    base, _, _, _ = live
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        get(base, "/api/events?since=abc")
+    assert exc.value.code == 400
+    # Control: a well-formed cursor is still served, so the 400 is the input.
+    status, _ = get(base, "/api/events?since=0")
+    assert status == 200
