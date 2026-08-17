@@ -57,6 +57,70 @@ class Task:
     plan_id: int | None = None
 
 
+class ToolRequestStatus(str, Enum):
+    """What has been decided about one tool request.
+
+    `auto` and `approved` are the two that *are* a grant — there is no separate
+    grant object, so a permission can never exist with no request behind it.
+    `refused` is terminal and machine-made (an unknown logical name, or the
+    per-task cap), never a human's decision: a human's are `approved` and
+    `rejected`.
+    """
+
+    AUTO = "auto"
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    REFUSED = "refused"
+
+
+class ToolRequestSource(str, Enum):
+    """Who asked. `marker` is an agent-authored `TOOL_REQUEST:` line in its own
+    reply; `declared` is the role's registry `tools` list, gated at invoke time
+    behind `gate_declared_tools`. The distinction is load-bearing: the agent
+    never asked for a declared tool, so it cannot have called it load-bearing,
+    and a declared-source request is therefore never blocking."""
+
+    MARKER = "marker"
+    DECLARED = "declared"
+
+
+@dataclass
+class ToolRequest:
+    """One ask for one logical tool, for one task, by one role.
+
+    Task-scoped and role-scoped by construction: a grant is approval of *this*
+    capability on *this* task, in the same register as approving a memory value
+    or a plan, and never a standing permission. A standing grant is already
+    expressible by editing agents.json — a deliberate act with a diff.
+    """
+
+    id: int | None
+    task_id: int
+    role: str
+    agent_kind: str
+    tool: str
+    status: ToolRequestStatus = ToolRequestStatus.PENDING
+    source: ToolRequestSource = ToolRequestSource.MARKER
+    reason: str = ""
+    # What the agent asked for: a blocking request parks its task rather than
+    # letting it continue without the tool.
+    blocking: bool = False
+    # What the loop did about it: "this task is being held at NEEDS_HUMAN right
+    # now, on this row". A *live* fact, not a historical one — the audit log
+    # keeps the history — so every exit from the parked state clears it, and a
+    # tool decision can never revert an escalation the tool queue did not cause.
+    # It sits beside `blocking` because the pair is one fact in two tenses.
+    parked: bool = False
+    attempt_id: int | None = None
+    decided_by: str = ""
+    decided_note: str = ""
+    # Floats, matching the REAL columns and `time.time()`, like every other
+    # timestamp in the store.
+    created_at: float = 0.0
+    decided_at: float | None = None
+
+
 @dataclass
 class PlannedTask:
     """One node of a planner-proposed task graph, before it becomes a row.
