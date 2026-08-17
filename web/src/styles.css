@@ -289,3 +289,9 @@ label { font-size: 11px; color: var(--muted); display: block; margin-bottom: 3px
        border: 1px solid transparent; background: none; color: var(--muted); }
 .tab.on { background: var(--panel-2); border-color: var(--line);
           color: var(--text); }
+
+/* The collateral-loss line in the tool queue. Deliberately not `.val`'s muted
+   grey: a decision on `shell` also decides `git`, and that has to read as a
+   consequence the human is about to accept, not as metadata. */
+.consequence { color: var(--needs-human); font-size: 11px; margin-top: 3px; }
+.consequence code { font-family: var(--mono); }

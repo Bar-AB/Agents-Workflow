@@ -11,6 +11,7 @@ agentloop redo TASK_ID [--note ...]
 agentloop events TASK_ID
 agentloop serve [--host H] [--port P]   # live dashboard (spec §8)
 agentloop memory list|approve|reject|add
+agentloop tools list|approve|reject   # the agent-requested tool queue
 agentloop charter show|set|clear|history   # project-wide rules for every agent
 agentloop init-registry          # write default agents.json for editing
 """
@@ -26,11 +27,17 @@ from pathlib import Path
 
 from .config import LoopConfig
 from .loop import Loop
-from .models import Task, TaskStatus
+from .models import Task, TaskStatus, ToolRequestStatus
 from .registry import DEFAULT_AGENTS, Registry
-from .runner import RunnerConfigError, get_runner
+from .runner import (
+    RunnerConfigError,
+    get_runner,
+    resolve_tools,
+    tools_sharing_capability,
+)
 from .server import serve_forever
 from .store import Store
+from .toolpolicy import declared_tools, decision_effect
 
 
 def _memory_cmd(store: Store, args) -> int:
@@ -60,6 +67,229 @@ def _memory_cmd(store: Store, args) -> int:
     elif args.mem_cmd in ("pin", "unpin"):
         store.memory_set_pinned(args.memory_id, args.mem_cmd == "pin")
         print(f"Memory {args.memory_id} {args.mem_cmd}ned.")
+    return 0
+
+
+def _tool_consequence(tool: str) -> str:
+    """What one logical tool *is*, in one line — the map's half of the story.
+
+    Two facts a bare logical name hides, both of them the reason this renders at
+    all rather than printing `req.tool`:
+
+    - `resolve_tools` expands the label, so `git` grants `Bash` — the label
+      understates the capability.
+    - `LOGICAL_TOOL_MAP` is not injective, so the *concrete* list is what the
+      gate enforces and a decision on `shell` lands on `git` too.
+
+    That second line is a statement about the **map**, and it is all this function
+    is allowed to say. Whether the sharing actually costs or gains anything here
+    depends on the row's role and on its sibling rows' statuses, neither of which
+    the map knows — so "approving grants it too; rejecting stops it working" was
+    false in three reachable states. The outcome is `_tool_outcome`'s job, and it
+    comes from `toolpolicy.decision_effect`.
+
+    Derived from `runner`'s pure map on every read rather than stored: the map is
+    the single source of truth for it, and a copy in a column would be a second
+    one that drifts the first time a logical name gains a concrete tool.
+    """
+    resolved = resolve_tools([tool])
+    text = f"{tool} -> {', '.join(resolved) if resolved else '(nothing)'}"
+    shared = tools_sharing_capability(tool)
+    if shared:
+        also = "; ".join(f"{n} -> {', '.join(c)}" for n, c in sorted(shared.items()))
+        text += f"  [also decides: {also}]"
+    return text
+
+
+def _and_list(names: list[str]) -> str:
+    if len(names) > 1:
+        return f"{', '.join(names[:-1])} and {names[-1]}"
+    return "".join(names)
+
+
+def _agrees(names: list[str], singular: str, plural: str) -> str:
+    """The verb that agrees with an `_and_list` of `names`.
+
+    `web` resolves to two concrete names and `file_io` to three, so every one of
+    these sentences is reachable in the plural — `WebFetch and WebSearch is not
+    available to this role` was the read. Cheap, and it is the line a human reads
+    immediately before granting a capability.
+    """
+    return plural if len(names) > 1 else singular
+
+
+def _tool_outcome(request, effect) -> str:
+    """What deciding *this row* would really do — the half the map cannot supply.
+
+    Every branch is a statement about a field of `DecisionEffect`, and each of
+    those is a difference between two evaluations of the list the gate enforces.
+    So this cannot promise a grant that will not happen, or warn of a loss that
+    cannot occur — the two failure directions of the sentence it replaces, the
+    second of which pushed a human toward granting.
+    """
+    resolved = resolve_tools([request.tool])
+    if request.status is ToolRequestStatus.PENDING:
+        if effect.approve_grants:
+            approving = f"approving grants {_and_list(effect.approve_grants)}"
+            if effect.approve_enables:
+                works = _agrees(effect.approve_enables, "works", "work")
+                approving += f", and {_and_list(effect.approve_enables)} {works} again"
+        elif effect.capability_live:
+            approving = (
+                f"approving changes nothing — this role already has "
+                f"{_and_list(effect.capability_live)}"
+            )
+        elif not resolved:
+            approving = "approving grants no capability — this name confers none"
+        else:
+            # Not granted, not already held, and the name does confer something:
+            # the only remaining cause is another withheld row on this task
+            # conferring the same concrete tool and still subtracting it.
+            approving = (
+                f"approving does not deliver {_and_list(resolved)} — another "
+                f"withheld request on this task confers it too"
+            )
+        if effect.reject_removes:
+            # No agreement to fix here or on `approving grants …`: the subject of
+            # both is the gerund, not the list.
+            rejecting = (
+                f"rejecting also stops {_and_list(effect.reject_removes)} working"
+            )
+        elif effect.reject_loses:
+            rejecting = f"rejecting withdraws {_and_list(effect.reject_loses)}"
+        else:
+            rejecting = "rejecting takes nothing further away"
+        already = (
+            f" ({_and_list(effect.costs_now)} "
+            f"{_agrees(effect.costs_now, 'is', 'are')} already withheld "
+            f"while this stands)"
+            if effect.costs_now
+            else ""
+        )
+        return f"{approving}; {rejecting}{already}"
+    if request.status in (ToolRequestStatus.APPROVED, ToolRequestStatus.AUTO):
+        if effect.in_effect:
+            return (
+                f"in force: the role has {_and_list(resolved)}"
+                if resolved
+                else "in force"
+            )
+        # An empty `resolved` is not a withheld capability, it is no capability:
+        # a name in `tool_readonly_allowlist` that `LOGICAL_TOOL_MAP` lacks is an
+        # `auto` row conferring nothing, and this branch rendered it as
+        # `NOT in force:  is withheld on account of another request on this task`
+        # — an empty list and a withholding that never happened, in one sentence.
+        if not resolved:
+            return "confers no capability — nothing to be in force"
+        # "another *request*", not "another decision": the sibling that subtracts
+        # the capability may be `pending`, which is nobody's decision.
+        return (
+            f"NOT in force: {_and_list(resolved)} is withheld on account of "
+            f"another request on this task"
+        )
+    if not resolved:
+        return "nothing to withhold — this name confers no capability"
+    # `capability_live`, never `in_effect`: the sentence below is about the
+    # *concrete* capability, and for a `refused` row the two disagree —
+    # `withheld_tools` never sees `refused`, so the row subtracts nothing while its
+    # logical name is still absent from `allowed`. Branching on the logical test
+    # told a human `Bash is not available to this role` about a `Bash` the gate was
+    # handing to the runner through the worker's declared `git`.
+    missing = effect.capability_missing
+    if not missing:
+        return f"no effect: the role has {_and_list(effect.capability_live)} regardless"
+    still = (
+        f"; it still has {_and_list(effect.capability_live)}"
+        if effect.capability_live
+        else (
+            f"; {_and_list(effect.costs_now)} "
+            f"{_agrees(effect.costs_now, 'is', 'are')} withheld with it"
+            if effect.costs_now
+            else ""
+        )
+    )
+    # "not available", not "withheld by this": a `refused` row (an unknown name, or
+    # the per-task cap) subtracts nothing at all — `withheld_tools` never sees it —
+    # so this states the outcome without claiming this row caused it.
+    return (
+        f"{_and_list(missing)} {_agrees(missing, 'is', 'are')} "
+        f"not available to this role{still}"
+    )
+
+
+def _tool_effect(store: Store, loop: Loop, request) -> str:
+    """`_tool_outcome` for one row, against the role's own declared list."""
+    return _tool_outcome(
+        request,
+        decision_effect(
+            store,
+            loop.config,
+            request.role,
+            declared_tools(loop.registry, request.role),
+            request,
+        ),
+    )
+
+
+def _tools_cmd(store: Store, loop: Loop, args) -> int:
+    """The human decision surface for the tool queue.
+
+    `list` is the decision *point*: the consequence has to be readable here,
+    before an `approve`/`reject` is typed, so each row carries the resolved
+    concrete tools and the logical names that share them. The two decisions echo
+    the same line, because "what did I just grant/deny" is the same question one
+    moment later.
+    """
+    if args.tools_cmd == "list":
+        rows = store.tool_requests(
+            task_id=args.task, status="pending" if args.pending else None
+        )
+        if not rows:
+            print("(no tool requests)")
+        for r in rows:
+            flags = "blocking" if r.blocking else "optional"
+            if r.parked:
+                flags += " PARKED"
+            print(
+                f"[{r.id:3d}] {r.status.value:8s} {flags:16s} task={r.task_id}"
+                f" {r.agent_kind}/{r.role}  {_tool_consequence(r.tool)}"
+            )
+            # The map's sharing statement above says what a decision *touches*;
+            # this says what it would actually do to this role on this task.
+            print(f"        effect: {_tool_effect(store, loop, r)}")
+            if r.reason:
+                print(f"        reason: {r.reason}")
+            if r.decided_by:
+                note = f" — {r.decided_note}" if r.decided_note else ""
+                print(f"        decided by {r.decided_by}{note}")
+        return 0
+
+    # A bad id raises KeyError, and an already-decided row raises ValueError;
+    # both reach main()'s handler as `error: ...` with exit 1. Two humans (or one
+    # double-click) racing is exactly that ValueError — the store's
+    # compare-and-swap picks the winner and the loser is told, rather than being
+    # guarded against here and silently reported as a success.
+    request = store.tool_request_get(args.request_id)
+    if request is None:
+        raise KeyError(f"No tool request {args.request_id}")
+    if args.tools_cmd == "approve":
+        task = loop.approve_tool_request(args.request_id, args.note)
+        verb = "approved"
+    else:
+        task = loop.reject_tool_request(args.request_id, args.note)
+        verb = "rejected"
+    print(f"Tool request {args.request_id} {verb}: {_tool_consequence(request.tool)}")
+    # Read `parked` back rather than reusing the pre-decision row: a release
+    # clears it, so the pre-decision value would report a lifted park as still
+    # holding the task.
+    decided = store.tool_request_get(args.request_id)
+    if decided is not None:
+        # The outcome of the decision just made, computed against the rows as they
+        # now stand — so an approve that granted nothing (a rejected sibling still
+        # withholds the capability) says so instead of echoing the request.
+        print(f"        effect: {_tool_effect(store, loop, decided)}")
+    parked = " (still parked on this request)" if decided and decided.parked else ""
+    print(f"Task {task.id} -> {task.status.value}{parked}")
     return 0
 
 
@@ -231,6 +461,18 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Pin: always injected, ahead of the cap (still needs approval to be read)",
     )
+
+    tl = sub.add_parser("tools", help="The agent-requested tool queue")
+    tlsub = tl.add_subparsers(dest="tools_cmd", required=True)
+    tlist = tlsub.add_parser("list", help="Show requests, oldest first")
+    tlist.add_argument("--task", type=int, default=None, help="One task only")
+    tlist.add_argument(
+        "--pending", action="store_true", help="Only requests awaiting a human"
+    )
+    for name in ("approve", "reject"):
+        tc = tlsub.add_parser(name, help=f"{name} one tool request")
+        tc.add_argument("request_id", type=int)
+        tc.add_argument("--note", default="", help="Why, for the audit trail")
 
     ch = sub.add_parser("charter", help="Project-wide rules injected into agents")
     chsub = ch.add_subparsers(dest="charter_cmd", required=True)
@@ -409,6 +651,9 @@ def _dispatch(args, store: Store, loop: Loop) -> int:
 
     elif args.cmd == "memory":
         return _memory_cmd(store, args)
+
+    elif args.cmd == "tools":
+        return _tools_cmd(store, loop, args)
 
     elif args.cmd == "charter":
         return _charter_cmd(store, args)

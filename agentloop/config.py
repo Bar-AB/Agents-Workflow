@@ -20,8 +20,71 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
+
+
+def _coerced(name: str, declared: str, value: object) -> object:
+    """One config field, normalized to its declared type or refused loudly.
+
+    `LoopConfig.load` does `cls(**data)` on hand-edited JSON, and nothing used to
+    check what came back. That is not a tidiness problem: `toolpolicy.classify`
+    reads `tool in config.tool_readonly_allowlist` **inside `agents._invoke`'s
+    closing transaction**, over an already-paid `finish_attempt`. A `null` there
+    raised `TypeError: argument of type 'NoneType' is not a container`, the
+    transaction rolled the paid attempt back, and `_with_retry` bought the same
+    completion twice more — three billed completions, zero attempt rows, and a
+    budget cap that cannot see spend that happened. So the refusal is here, at
+    write time, in the register of `Store.charter_set`: loud where a human is
+    editing, which is what pays for a total read path everywhere downstream.
+    `cli.main` already renders `ValueError` as `error: …`.
+
+    `None` on a list field is the one wrong type with an unambiguous reading —
+    "off" — so it normalizes to `[]` instead of raising. A bare **string** is the
+    case that must not: `tool in "file_read"` is a *substring* test, so the gate
+    would silently auto-approve every tool whose name is a substring of it, which
+    is failing open on a plausible typo.
+
+    Fields whose annotation is none of these fall through unchecked rather than
+    being rejected by a validator that has not been taught about them yet: this
+    normalizes what it understands, and refusing an unknown shape would make
+    adding a knob a two-place edit with a crash as the reminder.
+    """
+    if declared == "list[str]":
+        if value is None:
+            return []
+        if isinstance(value, (list, tuple)):
+            bad = [v for v in value if not isinstance(v, str)]
+            if bad:
+                raise ValueError(
+                    f"{name} must contain only strings; got {bad[0]!r} "
+                    f"({type(bad[0]).__name__})."
+                )
+            return list(value)
+        raise ValueError(
+            f"{name} must be a list of strings, not "
+            f"{type(value).__name__} ({value!r}). A bare string here is a "
+            f"substring test, not a list of names."
+        )
+    # bool before int: `bool` is a subclass of `int`, so an unguarded int check
+    # would accept `True` for a count and a float check would price at 1.0.
+    if declared == "bool":
+        if isinstance(value, bool):
+            return value
+    elif declared == "int":
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    elif declared == "float":
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+    elif declared == "str":
+        if isinstance(value, str):
+            return value
+    else:
+        return value
+    raise ValueError(
+        f"{name} must be a {declared}, not {type(value).__name__} ({value!r})."
+    )
 
 
 @dataclass
@@ -104,10 +167,70 @@ class LoopConfig:
     infra_max_retries: int = 2
     infra_retry_backoff_s: float = 0.0
 
+    # Agent-requested tools (roadmap slice 5). Which *logical* tool names this
+    # project judges safe to hand over without a human, so a request for one is
+    # auto-approved (still audited — the trail must show the decision, not the
+    # absence of a gate).
+    #
+    # Config rather than a constant in `runner.py`: what counts as read-only is
+    # a project's own risk judgment, and a project whose sandbox is wired
+    # differently will draw the line elsewhere.
+    #
+    # `web` is deliberately absent. WebFetch/WebSearch read remotely but egress
+    # the prompt, and this project scrubs ANTHROPIC_API_KEY out of the sandbox
+    # rather than trusting what runs there (`_check_base_url`'s reasoning) — the
+    # wire gets the same standard. `task_state` maps to no SDK tool at all, and
+    # is listed anyway so the allowlist stays a statement about logical names
+    # rather than about what happens to resolve today.
+    tool_readonly_allowlist: list[str] = field(
+        default_factory=lambda: ["file_read", "search", "task_state"]
+    )
+    # Whether a role's *declared* `AgentSpec.tools` are gated too. Off by
+    # default: the shipped worker declares `file_io` and `git`, neither of them
+    # read-only, so gating declared tools on a fresh install would gut it. Turned
+    # on, a declared tool outside the read-only allowlist and outside the role's
+    # shipped baseline needs a grant.
+    gate_declared_tools: bool = False
+    # Bound on a task's *undecided* request queue: `pending` rows, and nothing
+    # else. That is the queue a human has to clear, and it is the only thing here
+    # worth bounding — `auto` and `refused` were answered by the machine and
+    # `approved`/`rejected` by a human, and no count of answered questions makes
+    # the next one more expensive. Over the cap is refused *and audited*, never
+    # silently dropped — a request that vanished without a trace is worse than one
+    # denied.
+    #
+    # Stated precisely because the obvious reading is wrong: this is **not** a
+    # bound on rows. `UNIQUE(task_id, role, tool)` absorbs repeats of one name, so
+    # an agent emitting 500 markers for `shell` creates one row and one event —
+    # but 500 *distinct* names create 500 refused rows and 500 refusal events,
+    # because each is a different ask that has to be answered somewhere. Decided
+    # rows are excluded from the count on purpose: counting them made the bound
+    # self-fulfilling, and a task holding this many answers could then record
+    # nothing at all, not even an auto-approved read-only request.
+    #
+    # A true row bound would have to drop an ask silently or collapse distinct
+    # names into one row, and both hide from the human the thing the ledger is
+    # for. Bounding the *queue* is the promise this knob can actually keep.
+    max_tool_requests_per_task: int = 10
+
     # Phase 2 dashboard server.
     server_host: str = "127.0.0.1"
     server_port: int = 8765
     stream_poll_seconds: float = 0.5
+
+    def __post_init__(self) -> None:
+        """Normalize every field to its declared type, or refuse (see `_coerced`).
+
+        On the dataclass rather than only in `load` because `load`'s own
+        `cls(**data)` runs through here, so one implementation covers both the
+        JSON path and a programmatic `LoopConfig(...)` — and the downstream
+        promise ("`classify` cannot raise on config") is then a property of the
+        type, not of one constructor. Driven by the declared annotation rather
+        than a hand-listed set of fields, which would be a second source of truth
+        that drifts silently the first time a knob is added.
+        """
+        for f in fields(self):
+            setattr(self, f.name, _coerced(f.name, f.type, getattr(self, f.name)))
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2)

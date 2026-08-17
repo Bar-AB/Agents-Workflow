@@ -46,6 +46,105 @@ export interface Task {
   plan_approved: boolean | null
 }
 
+// Mirrors models.ToolRequestStatus. `auto` and `approved` *are* the grant —
+// there is no separate grant object. `refused` is machine-made (an unknown
+// logical name, or the per-task cap) and never a human's to decide.
+export type ToolRequestStatus =
+  | 'auto'
+  | 'pending'
+  | 'approved'
+  | 'rejected'
+  | 'refused'
+
+// Who asked. A `declared` request is the role's registry list gated at invoke
+// time, so the agent never asked for it and it is never blocking.
+export type ToolRequestSource = 'marker' | 'declared'
+
+// Mirrors models.ToolRequest plus the two fields server.py derives per read.
+export interface ToolRequest {
+  id: number
+  task_id: number
+  attempt_id: number | null
+  role: string
+  // Which agent asked, as the loop's own literal. NOT the same field as `role`:
+  // a custom worker_role makes the two differ.
+  agent_kind: string
+  tool: string
+  reason: string
+  // What the agent asked for: blocking means "I cannot finish without this".
+  blocking: boolean
+  // What the loop did about it: this request is holding its task at
+  // needs_human right now. A live fact, cleared by every exit from the park.
+  parked: boolean
+  source: ToolRequestSource
+  status: ToolRequestStatus
+  decided_by: string
+  decided_note: string
+  // REAL columns, so numbers — not date strings.
+  created_at: number
+  decided_at: number | null
+  // Derived by the server from runner.LOGICAL_TOOL_MAP, never stored: what this
+  // logical name actually confers...
+  resolved: string[]
+  // ...and the other logical names that share those concrete tools. The map is
+  // not injective, so deciding `shell` also decides `git`. Note this is a
+  // statement about the *map* only: whether that sharing actually costs or gains
+  // this row's role anything depends on the role's declared list and on its
+  // sibling rows' statuses, which the map knows nothing about. That is what
+  // `effect` is for — do not render a consequence from `also_decides` alone.
+  also_decides: Record<string, string[]>
+  // Why `resolved` may be empty, which has two causes the panel must not
+  // conflate: `task_state` is genuinely served in-process, while a name outside
+  // LOGICAL_TOOL_MAP (the whole `refused` population) is not a tool at all.
+  known: boolean
+  // The computed consequence of deciding this row, from toolpolicy.decision_effect
+  // — the same function the gate itself enforces.
+  effect: ToolRequestEffect
+}
+
+// Every field is a difference between two evaluations of the effective tool list,
+// so none of them can promise something the gate would not do. All three states
+// that falsified the old `also_decides`-derived text are one of these being empty:
+// approving that grants nothing, and rejecting that costs nothing (either because
+// a pending row already withholds the sibling, or because this role never
+// declared it).
+export interface ToolRequestEffect {
+  // Is this row's own tool available to the role right now? An `approved` row
+  // whose capability another denial still subtracts is not in force.
+  //
+  // This is a **logical-name** membership test, so no sentence about the
+  // *concrete* capability may be branched on it. The two diverge on the whole
+  // `refused` population: such a row subtracts nothing, yet its logical name is
+  // absent from the enforced list — and the panel read "Bash is not available to
+  // this role" off this flag while the gate handed `Bash` over.
+  in_effect: boolean
+  // The concrete capability of this row's own tool that the role really has right
+  // now. Empty is the only honest basis for calling a capability unavailable.
+  capability_live: string[]
+  // Its complement over the same footprint: this row's own concrete capability the
+  // role does not have. Served because it is the *subject* of the sentence a human
+  // reads as a closed gate, and the gate's coarse subtraction makes a partial split
+  // reachable — so it may not be re-derived from `resolved` on each surface.
+  capability_missing: string[]
+  // The headline claim, computed server-side by `toolpolicy._verb` out of these
+  // same fields and rendered verbatim above the consequence. Never re-derived
+  // here from `status`: a verb keyed on the status alone contradicted the body two
+  // lines below it in three reachable states, and `web/` has no test runner, so a
+  // claim decided in this file is the one permission-screen assertion no gate
+  // covers. It reads directly into the row's `resolved` chip ("would grant" Bash).
+  verb: string
+  // Other logical names not working *because* this row stands as it does.
+  costs_now: string[]
+  // Concrete capability approving would add...
+  approve_grants: string[]
+  // ...and the other logical names that would start working again with it.
+  approve_enables: string[]
+  // Other logical names rejecting would stop working...
+  reject_removes: string[]
+  // ...and the concrete capability that would go with them.
+  reject_loses: string[]
+}
+
 export interface VerdictRow {
   kind: VerdictKind
   confidence: number
@@ -66,6 +165,9 @@ export interface TaskMetrics {
   // approved under the old rules" is answerable next to the approve button.
   // Empty when no charter was in effect.
   charter_versions: number[]
+  // Every tool request on this task, oldest first — raw rows, as task_metrics
+  // serves them.
+  tool_requests: Record<string, unknown>[]
 }
 
 // One version of the project charter. The table is append-only and `id` *is*
@@ -142,6 +244,9 @@ export interface RunMetrics {
   attempts: number
   wall_seconds: number
   revisions: number
+  // Run-wide count of requests awaiting a human: the queue is only useful if it
+  // is visible without opening a task.
+  pending_tool_requests: number
   tasks_by_status: Partial<Record<TaskStatus, number>>
   by_model: ModelRollup[]
 }
@@ -185,4 +290,8 @@ export interface LoopConfigView {
   max_cost_usd_per_task: number
   human_review_risk_level: number
   test_command: string
+  // Why a request is gated rather than merely that it is: a tool outside this
+  // allowlist is side-effecting and needs a human.
+  tool_readonly_allowlist: string[]
+  gate_declared_tools: boolean
 }

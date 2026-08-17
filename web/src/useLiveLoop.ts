@@ -7,7 +7,14 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api } from './api'
-import type { Agent, EventRow, MemoryFact, RunMetrics, Task } from './types'
+import type {
+  Agent,
+  EventRow,
+  MemoryFact,
+  RunMetrics,
+  Task,
+  ToolRequest,
+} from './types'
 
 export type Connection = 'connecting' | 'live' | 'offline'
 
@@ -18,22 +25,25 @@ export function useLiveLoop() {
   const [metrics, setMetrics] = useState<RunMetrics | null>(null)
   const [agents, setAgents] = useState<Agent[]>([])
   const [memory, setMemory] = useState<MemoryFact[]>([])
+  const [toolRequests, setToolRequests] = useState<ToolRequest[]>([])
   const [events, setEvents] = useState<EventRow[]>([])
   const [connection, setConnection] = useState<Connection>('connecting')
   const [error, setError] = useState<string | null>(null)
 
-  // Tasks and memory aren't pushed field-by-field; an event just tells us
-  // they may have changed, and we re-read the source of truth.
+  // Tasks, memory and the tool queue aren't pushed field-by-field; an event
+  // just tells us they may have changed, and we re-read the source of truth.
   const refresh = useCallback(async () => {
     try {
-      const [t, m, mem] = await Promise.all([
+      const [t, m, mem, tools] = await Promise.all([
         api.tasks(),
         api.metrics(),
         api.memory(),
+        api.toolRequests(),
       ])
       setTasks(t)
       setMetrics(m)
       setMemory(mem)
+      setToolRequests(tools)
       setError(null)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -89,10 +99,12 @@ export function useLiveLoop() {
     metrics,
     agents,
     memory,
+    toolRequests,
     events,
     connection,
     error,
     refresh,
     setMemory,
+    setToolRequests,
   }
 }

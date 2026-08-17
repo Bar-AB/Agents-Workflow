@@ -62,6 +62,9 @@ agentloop redo 1                 # full redo: fresh start, no carried context
 agentloop pause 1                # steer a running loop: pause / resume / abort
 agentloop memory add k v --pinned --approved   # a fact that always injects
 agentloop charter set --file RULES.md          # rules every agent prompt carries
+agentloop tools list --pending   # tool requests awaiting a human (--task N for one task)
+agentloop tools approve <id>     # grant a requested tool (applies to the next invocation)
+agentloop tools reject <id>      # deny it — and every name sharing its capability
 agentloop eval --runner mock     # validator calibration (mock, claude, or openai)
 ```
 
@@ -74,8 +77,10 @@ agentloop serve                          # http://127.0.0.1:8765
 
 Task board, agent state, cost/token tiles, verdict history with the validator's
 findings, executed test runs, a live audit feed, memory gating, the project
-charter panel, and approve/reject/redo — all reading the same store the loop
-writes to. `npm run dev` proxies the API for hot reload.
+charter panel, tool-request approval panel (showing which capabilities the agents
+are asking for, whether they auto-approve, and what approving or rejecting would
+deliver), and approve/reject/redo — all reading the same store the loop writes to.
+`npm run dev` proxies the API for hot reload.
 
 ## Decision rules (spec §4–§5)
 
@@ -97,6 +102,11 @@ Validator returns `VERDICT: <kind> CONFIDENCE: <0-1> TESTS: <pass|fail|na>`:
 | task has an unfinished dependency, or an unapproved plan | not claimable; it waits as `pending` rather than failing |
 | human approves a task that never ran (`pending`) | refused — approval signs off reviewed work, and `done` is what releases dependents |
 | human approves a plan that produced no tasks | refused — a failed plan stays escalated with its diagnosis intact |
+| agent requests a read-only tool | auto-approved and audited (`tool_auto_approved`); reaches the next invocation |
+| agent requests a side-effecting tool (optional) | queued for a human (`tool_requested`); the task continues without the tool |
+| agent requests a side-effecting tool (blocking) | needs_human (`tool_requested`), parking the task with partial output kept and revisions untouched |
+| human approves a blocked tool request | task returned to `pending`, decision audited (`tool_request_decided`); the grant applies on next invocation |
+| human rejects a tool request | decision audited (`tool_request_decided`); the capability and any sibling names resolving to it are withheld on next invocation |
 
 **"Tests not failing" means the executed result.** Tests really run in the
 task's workspace between worker and validator; the validator sees the real
@@ -435,10 +445,14 @@ update match zero rows and it moves on to the next candidate.
 work to its exact owner, so retiring a claim id (going from 4 workers back to 1)
 hides whatever those ids held from every claimer. That is reported rather than
 repaired: each orphan logs a `claim_stranded` event, and `agentloop redo <id>`
-recovers it. It is deliberately not auto-reclaimed — with the default worker id,
-a second `agentloop run` process is indistinguishable from a retired worker, and
-stealing its live task is worse than leaving one stranded. A real lease with an
-expiry is the proper fix and belongs with the durability slice.
+recovers it by clearing the lease (a **live bug in shipped `main`** was that nothing
+ever cleared `tasks.claimed_by`, so `redo` and `resume` left the lease set, the
+CAS (`WHERE claimed_by IS NULL`) failed on that row forever, and it **starved every
+pending task behind it**; `Store.release_claim` is the sole writer of lease
+releases and makes that promise true). It is deliberately not auto-reclaimed — with
+the default worker id, a second `agentloop run` process is indistinguishable from
+a retired worker, and stealing its live task is worse than leaving one stranded. A
+real lease with an expiry is the proper fix and belongs with the durability slice.
 
 ## Validator calibration harness
 
@@ -451,6 +465,73 @@ is deterministic and runs in CI to exercise the harness mechanics; `--runner
 claude` and `--runner openai` (both opt-in, skipped when their respective
 `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` is unset) produce genuine calibration
 measurements. Results persist to the `eval_runs` table.
+
+## Agent-requested tools (Slice 5)
+
+An agent may request a tool at run time by writing a `TOOL_REQUEST: <tool>
+(blocking|optional) - reason` marker in its output. **Read-only requests are
+auto-approved** (e.g., `file_read`, `search`, `task_state`), logged as events and
+reaching the next invocation. **Side-effecting requests queue for human approval**.
+
+- **Optional requests** — the agent can proceed without the tool; the task
+  continues running and the request sits in the queue until a human approves,
+  rejects or closes the task.
+- **Blocking requests** — the agent cannot finish without the tool; the task
+  parks at `needs_human`, keeping its partial output and revision count. A human
+  can then:
+  - **Approve** — the task returns to `pending` with the row, workspace and audit
+    trail intact, not a redo (which would throw away the work done so far).
+    The grant applies on the next invocation.
+  - **Reject** — the capability is withheld. On the next invocation, the tool
+    (and any other logical name resolving to the same capability) is removed
+    from the allowed list. This is **fail-closed**: a gate a human believes is
+    shut must be shut. If rejecting also disables other tools the role holds
+    (e.g., rejecting `shell` disables `git` because both resolve to the Bash
+    capability), that side effect is audited (`tool_capability_withheld`) so a
+    human knows what else stopped working.
+  - **Redo** — the task starts fresh from its original goal (no carried context,
+    revision count reset, workspace wiped) and the request stays **undecided**.
+
+  Only **approve** releases a parked task. The other routes look symmetrical and
+  are not: rejecting records the denial and leaves the task parked, and `redo` or
+  `pause`+`resume` return it to the queue with the blocking request still
+  standing — so the next round pays for a worker call and parks on the same
+  request. `pause`+`resume` is neutral about *state* (nothing is decided, the
+  output and revision count survive), which is not the same as being a way
+  forward.
+
+The gate is enforced in `agents.run_worker`, `agents.run_validator` and
+`agents.run_planner` before the model call, and is therefore invisible when
+both `gate_declared_tools` is off (the default) and the agent writes no marker.
+
+**Configuration:** `tool_readonly_allowlist` names the read-only tools
+(`["file_read", "search", "task_state"]` by default; `web` is deliberately
+absent). `gate_declared_tools` (default False) applies the gate to tools
+declared in `agents.json` when the loop runs. `max_tool_requests_per_task` (10)
+bounds the queue by counting **pending** rows only; an ask over the cap is
+`refused` and audited rather than queued. A **blocking** ask is exempt from the
+cap — it is the one an agent says it cannot finish without, so letting the cap
+silently drop it would turn "I need this" into "continue without it and tell no
+human". A machine `refused` row is **not** a human denial and withholds nothing:
+nobody was shown a closed gate, and letting refusals subtract would let an
+agent's own chattiness strip its role's shipped baseline with no human involved.
+
+**Limitations and residual risks:**
+
+- **The two capability-granting POST routes are unauthenticated.** They inherit
+  the existing memory-approve pattern and the server binds `127.0.0.1` by
+  default, so as shipped this is not exposed — but serving on `0.0.0.0` now hands
+  a LAN peer a permission-**grant** button rather than a memory-approval one.
+- A marker inside a **fenced code block is a live request**: the parser does not
+  understand markdown fences, and teaching it to would mean a second, lossy model
+  of the reply. A quoted `(blocking)` example will therefore stall a task for a
+  human. Stated here rather than discovered.
+- The guarantee is over the `tools` list **passed** to the runner, not over what a
+  provider honours. A backend that ignores the argument cannot be checked from
+  this seam; `OpenAICompatRunner` drops tools with a `RuntimeWarning` because a
+  chat-completions call has no tool-execution loop.
+- Every request is a request for a *logical* name, and the gate subtracts the
+  *concrete* capability, so denial is coarser than the name: see **Reject** above.
 
 ## Sandboxing
 
@@ -551,5 +632,5 @@ problem. That's different from transient HTTP errors (408, 429, 5xx), which retr
 - [x] Planner agent + task graph; parallel workers
 - [x] Second-provider cross-validator (stdlib `OpenAICompatRunner`, per-role
       pinning via `AgentSpec.runner`)
-- [ ] Agent-requested tools with an auto-approval policy
+- [x] Agent-requested tools with an auto-approval policy
 - [ ] git-commit-per-task rollback; infra retry/backoff; batch evaluation

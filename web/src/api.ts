@@ -10,6 +10,7 @@ import type {
   RunMetrics,
   Task,
   TaskDetail,
+  ToolRequest,
 } from './types'
 
 async function get<T>(path: string): Promise<T> {
@@ -47,6 +48,17 @@ export const api = {
     ),
   config: () => get<LoopConfigView>('/api/config'),
 
+  // `taskId` narrows to one task's rows, which is what `TaskDetail` shows inline
+  // when a task is parked awaiting a decision. Server-side filtering rather than
+  // fetching everything and filtering here: the route already validates
+  // `task_id` (a non-integer is a 400), and the queue is unbounded.
+  toolRequests: (taskId?: number) =>
+    get<{ tool_requests: ToolRequest[] }>(
+      taskId === undefined
+        ? '/api/tool_requests'
+        : `/api/tool_requests?task_id=${taskId}`,
+    ).then((r) => r.tool_requests),
+
   createTask: (body: {
     title: string
     goal: string
@@ -71,6 +83,17 @@ export const api = {
   // An oversize or empty body is refused with a 400 rather than trimmed.
   setCharter: (body: string, note = '') =>
     post<CharterView>('/api/charter', { body, note }),
+
+  // A decision on one request can change other rows (a release clears every
+  // `parked` flag on the task), so the server returns the refreshed list —
+  // /api/memory's precedent. An already-decided row is a 400, surfaced as an
+  // error rather than swallowed: the store's compare-and-swap lets exactly one
+  // of two humans win, and the loser has to be told.
+  decideToolRequest: (id: number, action: 'approve' | 'reject', note = '') =>
+    post<{ tool_requests: ToolRequest[] }>(
+      `/api/tool_requests/${id}/${action}`,
+      { note },
+    ).then((r) => r.tool_requests),
 
   gateMemory: (id: number, action: 'approve' | 'reject' | 'pin' | 'unpin') =>
     post<{ memory: MemoryFact[] }>(`/api/memory/${id}/${action}`).then(

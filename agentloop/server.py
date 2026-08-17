@@ -26,9 +26,11 @@ from urllib.parse import parse_qs, urlparse
 
 from .config import LoopConfig
 from .loop import Loop
-from .models import Task
+from .models import Task, ToolRequest, ToolRequestStatus
 from .registry import Registry
+from .runner import LOGICAL_TOOL_MAP, resolve_tools, tools_sharing_capability
 from .store import Store
+from .toolpolicy import declared_tools, decision_effect
 
 # Where the built frontend lands (`npm run build` in web/).
 _WEB_DIST = Path(__file__).resolve().parent.parent / "web" / "dist"
@@ -123,7 +125,17 @@ class _Handler(BaseHTTPRequestHandler):
             elif path.startswith("/api/tasks/"):
                 self._task_detail(path)
             elif path == "/api/events":
-                since = int((query.get("since") or ["0"])[0])
+                # A malformed cursor is a 400, not the 500 an `int()` escaping
+                # `do_GET` produced — the same class as `_tool_requests_list`'s two
+                # filters, and for the same reason: a 500 reads as "the server is
+                # broken" for what is a bad request, and the caller cannot tell
+                # which it was.
+                raw = (query.get("since") or ["0"])[0]
+                try:
+                    since = int(raw)
+                except (TypeError, ValueError):
+                    self._error(400, f"Bad since: {raw!r}")
+                    return
                 self._send_json({"events": self.store.events_since(since)})
             elif path == "/api/agents":
                 self._send_json(
@@ -142,6 +154,8 @@ class _Handler(BaseHTTPRequestHandler):
                 )
             elif path == "/api/memory":
                 self._send_json({"memory": self.store.memory_list()})
+            elif path == "/api/tool_requests":
+                self._tool_requests_list(query)
             elif path == "/api/charter":
                 self._send_json(self._charter_json())
             elif path == "/api/metrics":
@@ -157,6 +171,10 @@ class _Handler(BaseHTTPRequestHandler):
                         "max_cost_usd_per_task": cfg.max_cost_usd_per_task,
                         "human_review_risk_level": cfg.human_review_risk_level,
                         "test_command": cfg.test_command,
+                        # The two knobs the tool panel needs to explain *why* a
+                        # request is gated rather than just that it is.
+                        "tool_readonly_allowlist": list(cfg.tool_readonly_allowlist),
+                        "gate_declared_tools": cfg.gate_declared_tools,
                     }
                 )
             elif path == "/api/stream":
@@ -221,6 +239,29 @@ class _Handler(BaseHTTPRequestHandler):
                 else:
                     self.store.memory_set_pinned(mem_id, parts[3] == "pin")
                 self._send_json({"memory": self.store.memory_list()})
+            # /api/tool_requests/{id}/{approve|reject} — the human decision on an
+            # agent-requested tool. A missing id raises KeyError -> 404, and an
+            # already-decided row raises ValueError -> 400, both through
+            # `do_POST`'s existing handlers. This server is threading and a CLI
+            # invocation is a second process, so two humans can arrive at once;
+            # the store's compare-and-swap already lets exactly one win, and the
+            # loser's error is surfaced rather than guarded against here.
+            elif (
+                len(parts) == 4
+                and parts[0] == "api"
+                and parts[1] == "tool_requests"
+                and parts[3] in ("approve", "reject")
+            ):
+                loop = self.server.loop
+                verb = "approve" if parts[3] == "approve" else "reject"
+                getattr(loop, f"{verb}_tool_request")(
+                    int(parts[2]), body.get("note", "")
+                )
+                # The refreshed list, mirroring /api/memory: a decision can
+                # change more rows than the one named (a release clears every
+                # `parked` flag on the task), so returning the single row would
+                # leave the panel showing state the decision already changed.
+                self._send_json(self._tool_requests_json())
             else:
                 self._error(404, f"No such endpoint: {url.path}")
         except ConnectionError:  # client gone; nothing to send back
@@ -254,6 +295,134 @@ class _Handler(BaseHTTPRequestHandler):
         )
         self.store.add_task(task)
         self._send_json({"task": self._task_json(task)}, status=201)
+
+    def _tool_request_json(self, req: ToolRequest) -> dict:
+        """One request, with every column served plus the two derived facts a
+        human needs *before* deciding.
+
+        Every column, because a column stored but exposed nowhere looks
+        implemented and is not — the trap `task_metrics`' `findings` documents.
+        Enums as `.value`; both timestamps as numbers, matching the `REAL`
+        columns.
+
+        `resolved` and `also_decides` are **derived on every read, never stored**:
+
+        - `resolved` is what the label actually confers. `git` grants `Bash`, so
+          the logical name understates the grant.
+        - `also_decides` is the collateral. `LOGICAL_TOOL_MAP` is not injective
+          and the gate enforces the *concrete* list, so approving `shell` hands
+          over `git`'s capability and — the case the release rule turns on —
+          rejecting `shell` stops `git` working. Without this at the decision
+          point that consequence is legible only from the audit trail.
+
+        Derived rather than mirrored in the frontend, because `LOGICAL_TOOL_MAP`
+        is the single source of truth for both and a copy in `types.ts` would
+        drift the first time a logical name gains a concrete tool. Derived rather
+        than stored for the same reason, one layer down: the ledger's columns are
+        provider-neutral by rule, and concrete vendor names belong in event
+        payloads and this view only.
+
+        `also_decides` states that a decision on `shell` also lands on `git`. What
+        it cannot state is whether that *matters here*, because the effect depends
+        on the row's **role** and on the **statuses of its sibling rows** — both of
+        which this layer has and the map does not. So `effect` carries the computed
+        consequence from `toolpolicy.decision_effect`, which evaluates the same
+        `effective_tools` the gate itself enforces: approving may grant nothing
+        (another denial still subtracts the capability), and rejecting may cost
+        nothing (a pending row already withholds it, or the role never declared the
+        sibling). A permission screen that invents a cost for *denial* pushes a
+        human toward granting, so the field is a difference between two evaluations
+        rather than a sentence about the map.
+
+        `known` splits the two causes of an empty `resolved`: `task_state` is
+        genuinely served in-process, while a name outside `LOGICAL_TOOL_MAP` — the
+        whole `refused` population — is not a tool at all.
+        """
+        role = req.role
+        declared = declared_tools(self.server.registry, role)
+        effect = decision_effect(self.store, self.server.config, role, declared, req)
+        return {
+            "id": req.id,
+            "task_id": req.task_id,
+            "attempt_id": req.attempt_id,
+            "role": req.role,
+            "agent_kind": req.agent_kind,
+            "tool": req.tool,
+            "reason": req.reason,
+            "blocking": req.blocking,
+            "parked": req.parked,
+            "source": req.source.value,
+            "status": req.status.value,
+            "decided_by": req.decided_by,
+            "decided_note": req.decided_note,
+            "created_at": req.created_at,
+            "decided_at": req.decided_at,
+            "resolved": resolve_tools([req.tool]),
+            "also_decides": tools_sharing_capability(req.tool),
+            "known": req.tool in LOGICAL_TOOL_MAP,
+            "effect": {
+                "in_effect": effect.in_effect,
+                # The concrete counterpart of `in_effect`, and the only honest
+                # basis for saying a capability is unavailable: the two diverge on
+                # the whole `refused` population, which subtracts nothing while
+                # its logical name is still absent from `allowed`.
+                "capability_live": effect.capability_live,
+                "capability_missing": effect.capability_missing,
+                # The headline claim, computed rather than keyed on `status`. It is
+                # served because `web/` has no test runner: a verb decided in TSX
+                # is a permission-screen assertion no gate covers, and it read
+                # `grants [Bash]` over a body saying `NOT in force`.
+                "verb": effect.verb,
+                "costs_now": effect.costs_now,
+                "approve_grants": effect.approve_grants,
+                "approve_enables": effect.approve_enables,
+                "reject_removes": effect.reject_removes,
+                "reject_loses": effect.reject_loses,
+            },
+        }
+
+    def _tool_requests_json(self, task_id: int | None = None, status=None) -> dict:
+        """The list shape both the GET and the two POSTs return."""
+        return {
+            "tool_requests": [
+                self._tool_request_json(r)
+                for r in self.store.tool_requests(task_id=task_id, status=status)
+            ]
+        }
+
+    def _tool_requests_list(self, query: dict) -> None:
+        """GET /api/tool_requests[?task_id=&status=].
+
+        Both filters arrive as query strings and both are refused with a 400
+        rather than dropped, because dropping either serves a queue that was not
+        filtered as though it had been — and on a *permission* API the failure
+        direction is "nothing is waiting on you" while rows are pending.
+        `do_GET` has no `ValueError` branch to fall back on (it maps every escape
+        to a 500), which is why each is checked here.
+
+        The `task_id` check is `int()` itself rather than a hand-rolled predicate.
+        The predicate that stood here (`str(raw).lstrip('-').isdigit()`) admitted
+        two inputs that then raised inside `int()`: `--5`, because `lstrip`
+        strips *every* leading hyphen, and `²`, because `'²'.isdigit()` is True.
+        Letting the converter decide is total — there is no input it accepts and
+        `int()` rejects — and it is strictly less code than the guard it replaces.
+
+        `status` is validated against `ToolRequestStatus`, not passed through:
+        `store.tool_requests` binds it verbatim, so `?status=Pending` (wrong case)
+        or `?status=granted` (a status this domain does not have) came back 200
+        with an empty list, indistinguishable from an empty queue.
+        """
+        raw = (query.get("task_id") or [None])[0]
+        try:
+            task_id = None if raw is None else int(raw)
+        except (TypeError, ValueError):
+            self._error(400, f"Bad task_id: {raw!r}")
+            return
+        status = (query.get("status") or [None])[0]
+        if status is not None and status not in {s.value for s in ToolRequestStatus}:
+            self._error(400, f"Bad status: {status!r}")
+            return
+        self._send_json(self._tool_requests_json(task_id=task_id, status=status))
 
     def _charter_json(self) -> dict:
         # One transaction so the two reads are a consistent snapshot: taken
