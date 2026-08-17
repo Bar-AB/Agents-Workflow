@@ -106,6 +106,15 @@ before the call; the bearer token cannot follow a redirect and a non-loopback
   worker's `context_budget_tokens`). Planner/parallel knobs:
   `plan_requires_approval` (default True), `max_plan_tasks` (20),
   `max_parallel_workers` (default 1 = sequential, unchanged).
+  Tool-request knobs (slice 5): `tool_readonly_allowlist` (`["file_read",
+  "search", "task_state"]` by default — read-only requests auto-approve; `web`
+  deliberately excluded because it egresses the prompt), `gate_declared_tools`
+  (default False), and `max_tool_requests_per_task` (10, counting **pending**
+  rows only, with a blocking ask exempt). Knob validation: `LoopConfig.__post_init__`
+  normalizes field types by declared annotation, so a `null` list becomes `[]`,
+  but a bare string raises, because `x in "string"` is a substring test that
+  fails **open** on a permission allowlist — this is the layer that catches a
+  misconfigured `loopconfig.json` before it reaches a paid attempt.
   `MODEL_PRICING` also carries the OpenAI-compatible models
   `OpenAICompatRunner` emits (point-in-time list rates); `OPENAI_MODELS` names
   them so a test can assert every one has a row — a missing model does not fail,
@@ -148,13 +157,19 @@ before the call; the bearer token cannot follow a redirect and a non-loopback
   column, written only by `claim_next_task`), attempts (per-invocation
   metrics: tokens/cost/wall time, incl. `cache_creation_tokens`/
   `cache_read_tokens`, plus `charter_version`), verdicts (incl. `findings`),
-  events (append-only audit log — never
-  UPDATE/DELETE), memory (two tiers project/loop; reads gated on `approved`,
-  which a value change revokes; `pinned` flag; `last_used_at` set by
-  `memory_read`), memory_hits, charter, test_runs, eval_runs. Schema is plain SQL so
-  Postgres migration isn't a rewrite; `_migrate()` adds later columns to
-  existing dbs (a whole new table needs no entry — `CREATE TABLE IF NOT EXISTS`
-  covers it).
+  events (append-only audit log — never UPDATE/DELETE), memory (two tiers
+  project/loop; reads gated on `approved`, which a value change revokes; `pinned`
+  flag; `last_used_at` set by `memory_read`), memory_hits, charter, test_runs,
+  eval_runs, tool_requests (the capability ledger: one row per ask for one logical
+  tool, for one task, by one role; `UNIQUE(task_id, role, tool)` and deliberately
+  no foreign keys — an FK would raise inside a paid transaction; an `auto`/`approved`
+  row *is* the grant — no separate grant table, so a permission never exists without
+  the request that justifies it). Schema is plain SQL so Postgres migration isn't a
+  rewrite; `_migrate()` adds later columns to existing dbs (a whole new table needs
+  no entry — `CREATE TABLE IF NOT EXISTS` covers it). `release_claim` — written
+  only by `set_status` when returning to `pending` — clears the `claimed_by` lease,
+  fixing the pre-slice-5 bug where `human_redo` and `resume` left the lease set,
+  making the task unclaimable forever and **starving every pending task behind it**.
   `memory_promote(id)` **moves** a project row to `loop`
   (`UPDATE ... SET tier='loop'`) rather than copying it: the row keeps its id,
   so approval, pin, `hit_count` and its `memory_hits` follow it and there is no
@@ -257,18 +272,35 @@ before the call; the bearer token cannot follow a redirect and a non-loopback
   cannot fix and `infra_error` would point the human at the network instead.
   Its tools are `file_read` (Read only), not `file_io` — a planner proposes
   work, it does not do the work.
-  `worker`, `validator` and `planner` are at **version "2"**: each is now told
-  that a `## Project charter` block states rules holding across every task, and
-  the validator additionally emits a `FINDINGS:` section. That prompt change is
-  load-bearing, not cosmetic — the old `VALIDATOR_SYSTEM` said "judge it
-  strictly against the task's acceptance criteria", which instructs a validator
-  to *disregard* a charter, so injection alone would have been inert. A
-  hand-edited `agents.json` predating the change degrades cleanly: the charter
-  is still injected, the agent is simply not told to weigh it. Note this is the
-  one part of the slice that is *not* inert on an unchartered project: the
-  system prompts changed for everyone, so an unchartered project's validator now
-  emits a `FINDINGS:` section it did not before. The **user** prompt is what an
-  absent charter leaves byte-for-byte unchanged.
+  `worker`, `validator` and `planner` were put at **version "2"** by slice 3c:
+  each is told that a `## Project charter` block states rules holding across
+  every task, and the validator additionally emits a `FINDINGS:` section. That
+  prompt change is load-bearing, not cosmetic — the old `VALIDATOR_SYSTEM` said
+  "judge it strictly against the task's acceptance criteria", which instructs a
+  validator to *disregard* a charter, so injection alone would have been inert.
+  A hand-edited `agents.json` predating the change degrades cleanly: the charter
+  is still injected, the agent is simply not told to weigh it. That was the one
+  part of slice 3c that is *not* inert on an unchartered project: the system
+  prompts changed for everyone, so an unchartered project's validator now emits
+  a `FINDINGS:` section it did not before. The **user** prompt is what an absent
+  charter leaves byte-for-byte unchanged.
+  Slice 5 takes the same three roles to **version "3"**, teaching them the
+  `TOOL_REQUEST: <tool> (blocking|optional) - reason` marker grammar so an agent
+  that discovers mid-task it needs a capability can ask for one.
+  `summarizer` stays at version "1" and is never taught — its output is consumed
+  by a worker that rebuilds its own prompt fresh.
+  **The inertness claim here is narrower than slice 3c's, and in a way worth
+  stating precisely, because the obvious phrasing is false.** It is conditional
+  on **no marker being emitted**, *not* on a config knob: an unconfigured run is
+  byte-for-byte the pre-slice-5 loop only while no agent writes a marker, because
+  `tools_for` then returns the declared list untouched and no row exists to
+  subtract. A marker **does** write a pending row and log `tool_requested` with
+  `gate_declared_tools` off — that knob decides whether a *declared* tool needs a
+  grant, never whether a marker is honoured (see `tools_for`, and the
+  self-revocation defect that turned on exactly this distinction). And since the
+  system prompts now *teach* the grammar, an agent may emit one where it
+  previously would not have. So "off by default" is true of the **gate** and
+  false of the **request path**, and the two must not be collapsed.
 - `runner.py` — **ModelRunner protocol: the provider seam.** The loop never
   imports a vendor SDK directly. Backends: ClaudeSDKRunner (default),
   **OpenAICompatRunner** (slice 4) and MockRunner (scripted, for tests). Usage
@@ -436,6 +468,28 @@ before the call; the bearer token cannot follow a redirect and a non-loopback
   so no backend can surface an unvetted fact — a future index may only re-rank
   rows the store already handed over, making it a derived cache and never a
   second source of truth.
+- `toolpolicy.py` — **tool capability gate (slice 5).** agentloop never executes
+  an agent's tools: the Claude SDK runs them *inside* `runner.run()` and
+  `OpenAICompatRunner` runs none — so the only place a gate can bite is the
+  `tools` list handed to the runner. `tools_for` is the single enforcement point,
+  called from `agents.run_worker/run_validator/run_planner` before the model call,
+  with no post-hoc check on observed `tool_calls` and no use of the SDK's live
+  `can_use_tool` callback (which would block a paid call waiting on a human).
+  `classify(tool, config)` answers which tier a *marker-named* tool falls in: auto
+  (allowlisted read-only), gated (needs a human), or unknown (not a tool). `parse_tool_requests`
+  extracts every `TOOL_REQUEST: <tool> (blocking|optional) - reason` marker an agent
+  wrote in its output — total and never raises, even inside a paid transaction.
+  `effective_tools` computes what one role would actually get given a set of rows,
+  pure over its arguments (no store, no writes). `decision_effect` evaluates that
+  computation four times (now, if approved, if rejected, if absent) to render what
+  approving or rejecting would *really* do — read-only, so a GET built on it does
+  not mutate. A grant adds; the gate removes: a request for a tool puts it in the
+  list even when the role never declared it, and only withholding removes a declared
+  tool — which means withholding one concrete capability disables *every* logical
+  tool name that overlaps it (e.g., rejecting `shell` also disables `git`), because
+  a gate a human believes is closed but is not is worse than an inconvenient one.
+  Fail closed, and the surprising side effect is audited (`tool_capability_withheld`)
+  rather than left to be discovered.
 - `loop.py` — orchestration state machine + human decision methods.
   `_maybe_handoff` runs at the iteration boundary (next to the budget/control
   checks): if the worker's context since the last handoff clears the ratio, it
@@ -709,6 +763,90 @@ before the call; the bearer token cannot follow a redirect and a non-loopback
   the enclosing block decrement to -1, after which every `commit()` saw a
   non-zero depth and silently stopped committing. Unreachable until something
   nests a `try` around an inner transaction; slices 5-6 do.
+- Agent-requested tool gate (slice 5): an agent may request a tool via a
+  `TOOL_REQUEST: <tool> (blocking|optional) - reason` marker in its output.
+  **Read-only requests are auto-approved**, matching the memory approval
+  philosophy — a tool the project judges safe to hand over without a human is
+  auto-approved and audited (`tool_auto_approved` event), reaching the next
+  invocation's tools list. **Side-effecting requests queue for human sign-off**
+  (`tool_request_decided` with human approval or rejection). An **optional**
+  request queues the row and the task continues without the tool; a **blocking**
+  request parks the task at NEEDS_HUMAN, with partial output kept and
+  `max_revisions` untouched — not revise/escalate — so the gate is not an
+  escalation engine. The escalation reason is prose beginning
+  `Awaiting tool approval: ` and names the tools, the request ids and the asking
+  agent; there is no reason *code*, and no event kind called `tool_request`
+  (the five are `tool_requested`, `tool_auto_approved`, `tool_request_refused`,
+  `tool_request_decided`, `tool_capability_withheld`).
+  Worker and validator rounds are park-qualified;
+  the planner never parks on a tool request (planning is not production work).
+  **Approving the pending request returns the task to `pending`** with the row,
+  the audit trail and the workspace intact — not a redo, which would throw away
+  the work already done and reset the revision count. **A human's rejection
+  subtracts the capability**, not just records the denial — so rejecting `shell`
+  also disables `git` (they both resolve to the Bash capability) — **which is the
+  fail-closed direction**: a human who believes they closed a gate must find it
+  closed. The side effect is audited (`tool_capability_withheld`).
+- An **undecided** (pending) request for a capability the role already holds —
+  via the allowlist, the registry baseline, or `gate_declared_tools` off — is a
+  no-op for the *subtraction*: the row is still written and still audited
+  (`tool_requested` fires regardless of the knob), it simply takes nothing away,
+  because nobody was ever asked. A **rejected**
+  row subtracts unconditionally, baseline or not. That distinction keeps an agent
+  from revoking its own baseline simply by asking for it (`TOOL_REQUEST: file_read`),
+  which would be silent and worse than blocking it. A **machine-refused** row
+  (unknown tool name, or over the per-task cap) subtracts nothing: nobody was
+  shown a closed gate, and letting refusals subtract would let an agent's own
+  chattiness strip its role's baseline with no human in the loop.
+- **The gate is not a new decision axis.** No threshold, revision count or budget
+  rule reads a tool request. Same register as Slice 4: the capability either
+  reaches the next invocation's tools list or it does not, and every downstream
+  rule — approve/revise/escalate, the 0.70/0.40 thresholds, revision counting,
+  the budget cap — reads the same fields regardless. Same register as Slice 4's
+  provider rule: the gate changes *what an agent can do*, never *what its answer
+  means*, so a gated run takes the identical status transitions an ungated one
+  does. (The requests' own spend is not exempt from the budget cap — a parked
+  task's paid worker round counts like any other.)
+- **Approving the request is the only decision that releases a parked task**, and
+  the three routes that look symmetrical are not. `reject_tool_request`
+  deliberately does **not** release: the `parked` flag stays set and the task stays
+  NEEDS_HUMAN, because a denial must never silently restart a paid worker run
+  against a gap the human just confirmed will not be filled. `pause`+`resume` and
+  `human_redo` both requeue the task with the request still **undecided**, so the
+  next round pays for a worker call and parks on the same request — `pause`+
+  `resume` is neutral about *state* (nothing decided, output and revision count
+  intact), which is not the same as being a way forward. The park's escalation
+  reason says exactly this, rather than offering "approve or reject" as two
+  symmetrical exits; it used to, and rejection was a dead end the reason kept
+  recommending.
+- **`human_approve` on a parked task is *not* refused — it marks the task DONE**,
+  and `human_reject` fails it; both leave the request **undecided** and clear the
+  `parked` flag. Kept, not changed: the human is signing off the *partial output*
+  the park preserved, which is real reviewed work (unlike the `pending` case
+  `human_approve` does refuse), so it is allowed by the same rule that allows
+  approving any NEEDS_HUMAN task, and under the slice-3 graph that DONE releases
+  dependents as a statement that the partial output is enough for them.
+  **What that costs on the dashboard is a UI obligation, not a rule change.** The
+  task screen showed the park's own reason — "approving the request is the only
+  decision that releases the task" — directly above a task-level **Approve**
+  button meaning something else entirely, while the control the sentence asks for
+  lived on another tab. Same word, different decision, and the safe one out of
+  reach. `TaskDetail` therefore renders the task's own requests inline, through
+  the *same* `ToolRequestRow` the queue uses (never a second copy — that drift is
+  what four phases of this slice were spent removing), with a banner naming the
+  difference whenever a `pending` row carries `parked`. Found by a human looking
+  at the screen after every automated pass had cleared it: each reviewer audited
+  the *new* panel, and this was the interaction between the new reason text and
+  the *old* buttons.
+  The same review found the last place on that screen where a **colour** asserted
+  something the gate does not do: the status chip went green for `approved`/`auto`
+  on the status alone, so an `approved` row whose capability another withheld
+  request still subtracts rendered a green chip directly above its own body text
+  reading "NOT in force". Green now requires `effect.in_effect` as well — a grant
+  that is *live*, not merely one that was *made*. `in_effect` and not
+  `capability_live`, because a granted in-process tool (`task_state`) confers no
+  concrete capability and is still genuinely in force, so the concrete list would
+  strip the green off a real grant.
 
 ## Conventions
 - Python ≥ 3.10, stdlib-only core (no runtime deps); claude-agent-sdk and
@@ -725,6 +863,16 @@ before the call; the bearer token cannot follow a redirect and a non-loopback
 - **Always run `ruff format .` before any commit and push** — the whole tree
   must be ruff-clean, so formatting never rides along in an unrelated diff.
   `ruff` is a `[dev]` extra.
+- **Telemetry and human-facing text must never fail an attempt, and must never
+  assert more than their inputs prove.** Telemetry is logged inside a paid
+  transaction (one `json.dumps` at `log_event` time), so a value the encoder
+  rejects rolls back the `finish_attempt` and the retry buys the completion
+  again. Every string rendered on the screen (`RunMetrics` fields, event
+  payloads, decision effects in the dashboard) must be computed from the gate's
+  actual outputs, never from a map or heuristic that knows only part of the
+  state. Slice 5 found multiple claims the code could not back: a screen that
+  renders "this would grant X" where the gate would not deliver X is a gate a
+  human believes is closed but is not, and that is the worse direction.
 - CLAUDE.md, *.db, and local config (loopconfig.json, agents.json) are
   gitignored.
 
@@ -742,7 +890,12 @@ before the call; the bearer token cannot follow a redirect and a non-loopback
    **Done (Slice 4)** — stdlib `OpenAICompatRunner`, per-role pinning via
    `AgentSpec.runner`, resolved in `loop._runner_for`; per-provider cache
    pricing in `config.CACHE_MULTIPLIERS`.
-5. Agent-requested tools with an auto-approval policy for read-only ones.
+5. ~~Agent-requested tools with an auto-approval policy for read-only ones.~~
+   **Done (Slice 5)** — `TOOL_REQUEST: <tool> (blocking|optional)` marker parsing
+   in `agents.py`, policy in `toolpolicy.py`, the `tool_requests` ledger table,
+   CLI `agentloop tools` surface, dashboard tools panel, and the fixed
+   `Store.release_claim` that makes `agentloop redo <id>` recover stranded
+   claims in `main`.
 6. git-commit-per-task rollback; infra retry/backoff (distinct from "revise");
    batch whole-loop evaluation; coverage in test_runs.
 7. Office-metaphor visualization layered on the existing dashboard data.
