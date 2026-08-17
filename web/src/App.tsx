@@ -5,11 +5,12 @@ import { EventFeed } from './components/EventFeed'
 import { MemoryPanel } from './components/MemoryPanel'
 import { NewTaskForm } from './components/NewTaskForm'
 import { StatBar } from './components/StatBar'
+import { ToolRequestPanel } from './components/ToolRequestPanel'
 import { TaskBoard } from './components/TaskBoard'
 import { TaskDetail } from './components/TaskDetail'
 import { useLiveLoop } from './useLiveLoop'
 
-type Tab = 'detail' | 'new' | 'memory' | 'charter'
+type Tab = 'detail' | 'new' | 'memory' | 'tools' | 'charter'
 
 export default function App() {
   const {
@@ -17,11 +18,13 @@ export default function App() {
     metrics,
     agents,
     memory,
+    toolRequests,
     events,
     connection,
     error,
     refresh,
     setMemory,
+    setToolRequests,
   } = useLiveLoop()
   const [selected, setSelected] = useState<number | null>(null)
   const [tab, setTab] = useState<Tab>('new')
@@ -32,6 +35,9 @@ export default function App() {
   }
 
   const pendingFacts = memory.filter((m) => !m.approved).length
+  // A pending request may be holding a task at NEEDS_HUMAN right now, so the
+  // count belongs on the tab label rather than one click away.
+  const pendingTools = toolRequests.filter((r) => r.status === 'pending').length
 
   return (
     <div className="app">
@@ -89,6 +95,12 @@ export default function App() {
               Memory{pendingFacts > 0 ? ` (${pendingFacts})` : ''}
             </button>
             <button
+              className={`tab ${tab === 'tools' ? 'on' : ''}`}
+              onClick={() => setTab('tools')}
+            >
+              Tools{pendingTools > 0 ? ` (${pendingTools})` : ''}
+            </button>
+            <button
               className={`tab ${tab === 'charter' ? 'on' : ''}`}
               onClick={() => setTab('charter')}
             >
@@ -99,6 +111,12 @@ export default function App() {
           {tab === 'new' && <NewTaskForm onCreated={() => void refresh()} />}
           {tab === 'memory' && (
             <MemoryPanel memory={memory} onChanged={setMemory} />
+          )}
+          {tab === 'tools' && (
+            <ToolRequestPanel
+              requests={toolRequests}
+              onChanged={setToolRequests}
+            />
           )}
           {tab === 'charter' && <CharterPanel />}
 

@@ -18,6 +18,11 @@ export function StatBar({ metrics }: { metrics: RunMetrics | null }) {
   const done = byStatus.done ?? 0
   const needsHuman = byStatus.needs_human ?? 0
   const total = Object.values(byStatus).reduce((a, b) => a + (b ?? 0), 0)
+  // No `?? 0`: the field is non-nullable and the server always sends it. A
+  // default here would render "none waiting" if it ever stopped arriving, which
+  // is the one direction `_tool_requests_list`'s own docstring rules out for this
+  // API — a permission queue must not read as empty while rows are pending.
+  const toolsWaiting = metrics.pending_tool_requests
 
   return (
     <div className="stats">
@@ -52,6 +57,13 @@ export function StatBar({ metrics }: { metrics: RunMetrics | null }) {
         </div>
         <div className="sub">
           {needsHuman > 0 ? `${needsHuman} awaiting you` : 'none blocked'}
+        </div>
+      </div>
+      <div className="stat">
+        <div className="label">Tool requests</div>
+        <div className="value">{toolsWaiting}</div>
+        <div className="sub">
+          {toolsWaiting > 0 ? 'waiting on you' : 'none waiting'}
         </div>
       </div>
     </div>

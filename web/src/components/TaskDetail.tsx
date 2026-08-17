@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api'
-import type { TaskDetail as Detail } from '../types'
+import type { TaskDetail as Detail, ToolRequest } from '../types'
+import { ToolRequestRow, sortRequests } from './ToolRequestPanel'
 
 export function TaskDetail({
   taskId,
@@ -14,7 +15,9 @@ export function TaskDetail({
   onChanged: () => void
 }) {
   const [detail, setDetail] = useState<Detail | null>(null)
+  const [requests, setRequests] = useState<ToolRequest[]>([])
   const [busy, setBusy] = useState(false)
+  const [toolBusy, setToolBusy] = useState<number | null>(null)
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
@@ -22,6 +25,13 @@ export function TaskDetail({
     api
       .task(taskId)
       .then((d) => !cancelled && setDetail(d))
+      .catch((e) => !cancelled && setError(String(e)))
+    // A separate request rather than a field on the task payload: the rows carry
+    // a `DecisionEffect` computed per read, so they cannot be cached alongside a
+    // task whose other fields change on a different schedule.
+    api
+      .toolRequests(taskId)
+      .then((r) => !cancelled && setRequests(r))
       .catch((e) => !cancelled && setError(String(e)))
     return () => {
       cancelled = true
@@ -45,6 +55,28 @@ export function TaskDetail({
     }
   }
 
+  // Deciding a request can change this task's status (approving the last blocking
+  // one releases it to `pending`), so the detail is refetched too — and
+  // `onChanged` so the board and the tools tab move with it. The server returns
+  // the whole refreshed list because one decision can clear `parked` on sibling
+  // rows; this narrows it back to the task on screen.
+  const decideTool = async (id: number, action: 'approve' | 'reject') => {
+    setToolBusy(id)
+    setError(null)
+    try {
+      const all = await api.decideToolRequest(id, action)
+      setRequests(all.filter((r) => r.task_id === task.id))
+      onChanged()
+      setDetail(await api.task(task.id))
+    } catch (e) {
+      // A decided row is final (400). Two humans, or one double-click: the loser
+      // is told rather than shown a success.
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setToolBusy(null)
+    }
+  }
+
   const control = async (action: 'pause' | 'resume' | 'abort') => {
     setBusy(true)
     try {
@@ -64,6 +96,12 @@ export function TaskDetail({
   const inFlight = ['pending', 'in_progress', 'testing', 'validating',
     'revising'].includes(task.status)
   const terminal = ['done', 'failed', 'aborted'].includes(task.status)
+  const pendingTools = requests.filter((r) => r.status === 'pending').length
+  // `parked` is the store's own flag for "this row is holding its task right
+  // now", so the warning below appears exactly when it is true — never inferred
+  // from the status text, which cannot distinguish this park from any other
+  // escalation.
+  const parkedHere = requests.some((r) => r.parked && r.status === 'pending')
 
   return (
     <div className="panel detail">
@@ -149,6 +187,44 @@ export function TaskDetail({
         <>
           <h2>Latest output</h2>
           <pre>{task.output}</pre>
+        </>
+      )}
+
+      {/* A task parked awaiting tool approval used to show its escalation reason
+          — "approving the request is the only decision that releases the task" —
+          above the task-level Approve button, which does something else entirely:
+          it marks the task DONE on partial output and, under the slice-3 graph,
+          releases its dependents. The instruction and the nearest button shared a
+          word and not a meaning, and the control the reason asks for was on a
+          different tab. Rendering the rows here puts the asked-for decision within
+          reach of the sentence that asks for it. The rows come from
+          `ToolRequestRow`, not a copy of it: two renderings of one permission
+          claim is the drift this slice spent four phases removing. */}
+      {requests.length > 0 && (
+        <>
+          <h2 style={{ marginTop: 16 }}>
+            Tool requests{' '}
+            {pendingTools > 0 && (
+              <span className="pending-flag">· {pendingTools} awaiting you</span>
+            )}
+          </h2>
+          {parkedHere && (
+            <div className="banner">
+              This task is held at <code>needs_human</code> by the request marked
+              PARKED. Approving it here releases the task. The{' '}
+              <strong>Approve</strong> button at the bottom of this page is a
+              different decision — it signs off the partial output above and marks
+              the whole task done, leaving the request undecided.
+            </div>
+          )}
+          {sortRequests(requests).map((r) => (
+            <ToolRequestRow
+              key={r.id}
+              request={r}
+              busy={toolBusy === r.id}
+              onDecide={decideTool}
+            />
+          ))}
         </>
       )}
 
