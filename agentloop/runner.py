@@ -244,6 +244,42 @@ class ModelRunner(Protocol):
         `tools` is the agent's allowlist from the registry (spec §3): the
         shared baseline plus its role-specific tools.
 
+        **An implementation must honor `tools`, and this seam cannot check that
+        it did.** Since slice 5 the list is not merely a registry preference but
+        the *entire* enforcement surface of the tool-approval gate: the policy
+        decides what a role may use, `agents._gated_tools` computes the list, and
+        this argument is where that decision either binds or does not. Nothing
+        downstream can withhold a capability, because an SDK backend executes
+        tools *inside* this call. So a backend that ignored the argument — or
+        passed a superset, or a cached list from an earlier call — would
+        **silently** grant a capability no policy allowed and no human approved,
+        with the audit log recording the withheld list as though it had held.
+
+        The guarantee is over the **concrete** capability, not the logical name,
+        and it has to be: `LOGICAL_TOOL_MAP` is not injective, so withholding
+        `shell` while passing the `git` a role already declared would hand the SDK
+        the same `Bash` and close nothing. `toolpolicy.tools_for` therefore
+        subtracts a withheld tool's concrete footprint from the whole resolved
+        list, and does it coarsely: *any* overlap drops the **whole logical name**,
+        so the blast radius is wider than the footprint — denying `shell` stops
+        `git` working, and denying a single concrete `Read` would take `Write` and
+        `Edit` with it through `file_io`. That over-removal errs closed, which is
+        the direction this gate is allowed to be wrong in, but it is **collateral**
+        loss and the note that exists to state the blast radius must state it —
+        audited as a
+        `tool_capability_withheld` event, because a surprise a human meets in the
+        ledger is a different thing from one they meet in the source.
+        `ClaudeSDKRunner` passes it through as the SDK's `allowed_tools`;
+        `OpenAICompatRunner` has no execution loop and therefore *drops* it with
+        a `RuntimeWarning`, which is the safe direction (the model may ask, and
+        nothing runs). This is a documented residual risk in the same register as
+        `sandbox_isolation='strict'` degrading to an env scrub with a warning: the
+        threat model here is arbitrary AI-generated code, and a gate is only as
+        good as the backend under it. Rejected: asserting compliance at runtime —
+        the only observable is `RunResult.tool_calls`, which a backend fills in
+        itself, so the check would trust exactly the component it is meant to
+        verify, and it would fire *after* the tool had already run.
+
         **An implementation must hold no per-call state.** `Loop._runner_for`
         resolves one backend instance per pinned name and hands that same object
         to every role and every thread, so with `max_parallel_workers > 1` a
@@ -333,6 +369,33 @@ def resolve_tools(logical: list[str] | None) -> list[str]:
             if concrete not in resolved:
                 resolved.append(concrete)
     return resolved
+
+
+def tools_sharing_capability(tool: str) -> dict[str, list[str]]:
+    """Other logical names that confer a concrete tool `tool` also confers.
+
+    The map is not injective — `git` and `shell` both resolve to `Bash` — and the
+    enforcement surface is the *concrete* list, so deciding one of a sharing pair
+    decides the other's capability too. That fact is a property of this table
+    alone, so it is computed here rather than in the policy: no store read, no
+    config, nothing to raise, which is what lets `store.tool_request_add` put it
+    in an event payload from inside a transaction holding a paid attempt.
+
+    Returns `{logical_name: [shared concrete tools]}`, empty for a name that
+    shares nothing (`web`) or resolves to nothing at all (`task_state`, or a name
+    outside the map).
+    """
+    mine = set(LOGICAL_TOOL_MAP.get(tool, []))
+    if not mine:
+        return {}
+    shared = {}
+    for name, concrete in LOGICAL_TOOL_MAP.items():
+        if name == tool:
+            continue
+        overlap = [c for c in concrete if c in mine]
+        if overlap:
+            shared[name] = overlap
+    return shared
 
 
 class ClaudeSDKRunner:

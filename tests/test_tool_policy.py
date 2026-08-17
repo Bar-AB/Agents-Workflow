@@ -8,7 +8,7 @@ repair fixes (phase 2b), and the `toolpolicy` seam itself (phase 3).
 import json
 import threading
 import time
-from dataclasses import replace
+from dataclasses import asdict, replace
 
 import pytest
 
@@ -22,13 +22,15 @@ from agentloop.models import (
     ToolRequestStatus,
 )
 from agentloop.registry import DEFAULT_AGENTS, Registry
-from agentloop.runner import MockRunner
+from agentloop.runner import MockRunner, resolve_tools, tools_sharing_capability
 from agentloop.store import Store
 from agentloop.toolpolicy import (
     ParsedToolRequest,
     ToolClass,
     baseline_tools,
     classify,
+    decision_effect,
+    effective_tools,
     parse_tool_requests,
     tools_for,
 )
@@ -2328,6 +2330,15 @@ def test_a_stale_parked_flag_cannot_release_a_pre_park_escalation(store, gate):
     blank the very diagnosis the human was being asked to act on. `severe` and
     `exhausted` cannot substitute: both are only reachable *after* the park check,
     so a parked row cannot coexist with them inside one round.
+
+    **The flag is forced back on after the escalation**, the way
+    `test_a_stale_parked_flag_cannot_release_a_terminal_task` already does for the
+    terminal case. Without that this test passed through condition 1 — `human_redo`
+    clears `parked`, so the release was refused for having no parked row at all and
+    the pre-park escalation in the name was never exercised. Condition 2 defends
+    only *terminal* statuses, and a pre-park escalation leaves the task at
+    NEEDS_HUMAN, which it accepts; so this fails until the predicate can tell a
+    park from another escalation holding the same status.
     """
     loop, runner, task, row = _parked(store)
     loop.human_redo(task.id)
@@ -2353,6 +2364,10 @@ def test_a_stale_parked_flag_cannot_release_a_pre_park_escalation(store, gate):
     assert stored.status is TaskStatus.NEEDS_HUMAN
     assert expected.lower() in stored.escalation_reason.lower()
     reason = stored.escalation_reason
+    # The state the docstring names, which no live path reaches on its own: a
+    # parked row standing against an escalation that is not the park.
+    store.tool_requests_mark_parked(task.id, [row.id])
+    assert store.tool_request_get(row.id).parked is True
     events_before = len(store.events(task.id))
 
     loop.approve_tool_request(row.id)
@@ -2565,3 +2580,1250 @@ def test_an_upgraded_request_still_says_what_it_resolves_to(store):
         if e["kind"] == "tool_requested" and e["payload"]["upgraded"]
     ]
     assert [p["resolved"] for p in upgrade] == [["Bash"]]
+
+
+# -- E2 remediation cycle 2 ---------------------------------------------------
+
+
+@pytest.mark.parametrize("exit_", ["approve", "reject", "abort"])
+def test_a_human_exit_that_does_not_land_leaves_no_stale_parked_flag(store, exit_):
+    """D1: the sibling hole `update_task` becoming lease-predicated opened.
+
+    `set_status` is conditional; `tool_requests_clear_parked` was not. With the
+    lease released between the human path's read and its write, all three exits
+    left `status=needs_human` with `parked=0` — the transition never happened, and
+    condition 1 of the release predicate then failed, so the task was stuck with
+    no route back. The park site was already gated; these three were not.
+
+    The lease is real here, not synthetic: the task is claimed and then genuinely
+    parked by the loop, so the CAS in `update_task` matches until the hook fires.
+    """
+    task = add_task(store)
+    loop, runner = _loop(store, [MARK_BLOCKING, APPROVE])
+    claimed = store.claim_next_task("worker-1")
+    assert claimed is not None and claimed.claimed_by == "worker-1"
+    loop.run_task(claimed)
+    (row,) = store.tool_requests(task_id=task.id)
+    assert row.parked and store.get_task(task.id).claimed_by == "worker-1"
+
+    # The window: a lease release landing between the human path's `_require`
+    # and its status write, which is what makes the write no-op.
+    original_get_task = store.get_task
+
+    def release_the_lease_after_the_read(task_id):
+        loaded = original_get_task(task_id)
+        if loaded is not None and loaded.claimed_by:
+            store.release_claim(task_id)
+        return loaded
+
+    store.get_task = release_the_lease_after_the_read
+    try:
+        getattr(
+            loop,
+            {"approve": "human_approve", "reject": "human_reject"}.get(exit_, "abort"),
+        )(task.id)
+    finally:
+        store.get_task = original_get_task
+
+    # Fail-closed: the transition did not land, so the park is still the truth.
+    stored = store.get_task(task.id)
+    assert stored.status is TaskStatus.NEEDS_HUMAN
+    assert store.tool_request_get(row.id).parked is True
+    # And the route back still exists — the flag is what condition 1 reads.
+    loop.approve_tool_request(row.id)
+    assert store.get_task(task.id).status is TaskStatus.PENDING
+
+
+def _hostile(**overrides):
+    """A `RunResult` a provider could plausibly hand across the seam, with one
+    field of a type nothing on the `ModelRunner` seam promises."""
+    from agentloop.runner import RunResult
+
+    fields = dict(output="worker out", tokens_in=11, tokens_out=7, model="mock")
+    fields.update(overrides)
+    return RunResult(**fields)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param({"output": object()}, id="non_str_output"),
+        pytest.param({"tool_calls": None}, id="tool_calls_none"),
+        pytest.param({"tool_calls": ["Read"]}, id="tool_calls_of_strings"),
+        pytest.param({"tokens_in": "lots"}, id="non_numeric_tokens"),
+        pytest.param({"model": {"name": "gpt"}}, id="non_str_model"),
+        # E3/C1: the *type* was bounded, the *magnitude* was not. A 400-digit
+        # `int` is exactly what `json.loads` yields for a provider body carrying
+        # one, passes `_token_count`'s type guard, and then makes
+        # `estimate_cost_usd`'s `tokens_in * pin` an `OverflowError` — above the
+        # closing transaction, so still three paid calls and `$0.00` recorded.
+        pytest.param({"tokens_in": 10**400}, id="astronomical_tokens_in"),
+        pytest.param({"tokens_out": 10**400}, id="astronomical_tokens_out"),
+        pytest.param({"cache_read_tokens": 10**400}, id="astronomical_cache_read"),
+        # E3/C2: `isinstance(str)` does not imply utf-8-encodable. A lone
+        # surrogate is what `json.loads` produces from a truncated emoji's high
+        # half, so slice 4's shipped HTTP backend reaches this; sqlite then
+        # raises *inside* the closing transaction, on `finish_attempt` itself.
+        pytest.param({"output": "worker out \ud83d ok"}, id="lone_surrogate_output"),
+        pytest.param({"model": "mock\ud83d"}, id="lone_surrogate_model"),
+    ],
+)
+def test_a_hostile_run_result_never_rolls_back_a_paid_attempt(store, overrides):
+    """D3: the five remaining raise-sources over an already-paid completion.
+
+    `notes` and the tool *name* are coerced at this seam precisely because the
+    `ModelRunner` protocol is a promise and not a guarantee; `output`, the shape
+    of `tool_calls` and the cost call's own arguments were trusted at the same
+    seam, in the same transaction, for the same money. Each of these five was
+    three paid calls, zero attempt rows and an `infra_error` pointing the human
+    at the network.
+    """
+    task = add_task(store)
+    loop, runner = _loop(store, [_hostile(**overrides), APPROVE])
+    loop.run_task(task)
+
+    # Paid once, recorded once. Three worker prompts is the defect.
+    prompts = [e for e in store.events(task.id) if e["kind"] == "worker_prompt"]
+    assert len(prompts) == 1
+    outputs = [e for e in store.events(task.id) if e["kind"] == "worker_output"]
+    assert len(outputs) == 1  # the closing transaction committed
+    m = store.task_metrics(task.id)
+    assert m["attempts"] >= 1
+    assert m["tokens"] > 0
+    assert [e for e in store.events(task.id) if e["kind"] == "infra_error"] == []
+
+
+def test_a_non_str_output_is_not_work_and_is_audited(store):
+    """The direction the `output` coercion takes, stated rather than implied: a
+    reply that is not text is not work, so it takes the empty-output rule to
+    NEEDS_HUMAN instead of being `str()`-ed into a work product a validator would
+    review. Not silent — it rides the `runner_warning` event that already exists
+    for a degraded run rather than inventing a second event kind."""
+    task = add_task(store)
+    loop, _ = _loop(store, [_hostile(output=object())])
+    loop.run_task(task)
+
+    stored = store.get_task(task.id)
+    assert stored.status is TaskStatus.NEEDS_HUMAN
+    assert "empty output" in stored.escalation_reason
+    (warning,) = [e for e in store.events(task.id) if e["kind"] == "runner_warning"]
+    assert "object" in warning["payload"]["note"]
+    assert store.task_metrics(task.id)["tokens"] > 0  # the money still landed
+
+
+def test_an_astronomical_token_count_is_clamped_toward_the_budget_cap(store):
+    """E3/C1's *direction*, not merely its totality.
+
+    A count too large to price could be zeroed or clamped, and the two are not
+    symmetric: zeroing reports an unbounded number as free and lets the budget
+    cap through, clamping overstates the spend and trips it toward NEEDS_HUMAN.
+    So the expected values are stated per case rather than asserted as "does not
+    raise" — a totality assertion with no expected value is what hid a CRLF bug
+    here for a whole review cycle.
+    """
+    from agentloop.agents import _MAX_TOKEN_COUNT, _token_count
+
+    assert _token_count(10**400) == _MAX_TOKEN_COUNT == 2**53
+    assert _token_count(7) == 7  # an ordinary count is untouched
+    assert _token_count(-3) == 0  # the existing floor still holds
+    assert _token_count(float("inf")) == 0  # nan/inf are still garbage, not a cap
+
+    task = add_task(store)
+    # A revise round, so the run reaches a second iteration boundary — where the
+    # budget check lives. On a single approving round there is no boundary left to
+    # read the spend at, which is the pre-existing rule and not this fix's business.
+    loop, _ = _loop(store, [_hostile(tokens_in=10**400), REVISE, "out 2", APPROVE])
+    loop.run_task(task)
+
+    out = [e for e in store.events(task.id) if e["kind"] == "worker_output"][0]
+    assert out["payload"]["tokens_in"] == 2**53  # the recorded number is the clamp
+    # Priced without raising, at the zero rate the mock model carries — the
+    # token cap is what a clamped count trips, and it is the honest one to assert
+    # here: inventing a nonzero cost would need a priced model and would test the
+    # pricing table rather than the clamp.
+    assert out["payload"]["cost_usd"] == 0.0
+    stored = store.get_task(task.id)
+    assert stored.status is TaskStatus.NEEDS_HUMAN
+    assert "budget" in stored.escalation_reason.lower()
+
+
+def test_a_lone_surrogate_output_is_escaped_rather_than_discarded(store):
+    """E3/C2's direction. A lone surrogate is a real work product carrying one
+    character sqlite cannot write, not a non-text reply, so the escape keeps the
+    work where blanking it would escalate a task whose worker did the job. Not
+    silent: it rides the `runner_warning` event the non-`str` case already uses.
+    """
+    task = add_task(store)
+    loop, _ = _loop(store, [_hostile(output="worker out \ud83d ok"), APPROVE])
+    loop.run_task(task)
+
+    stored = store.get_task(task.id)
+    assert stored.output == "worker out \\ud83d ok"  # escaped, and still the work
+    assert stored.status is TaskStatus.DONE  # not the empty-output escalation
+    (warning,) = [e for e in store.events(task.id) if e["kind"] == "runner_warning"]
+    assert "surrogate" in warning["payload"]["note"]
+    # And the served model gets the same pass, since it lands in a column too.
+    other = add_task(store)
+    loop2, _ = _loop(store, [_hostile(model="mock\ud83d"), APPROVE])
+    loop2.run_task(other)
+    assert store.task_metrics(other.id)["attempts"] >= 1
+
+
+def test_a_tool_call_that_is_not_a_record_is_not_recorded(store):
+    """The seam's existing contract — "nothing recorded rather than a wrong
+    record" — applied to the *shape* of `tool_calls`, not just to the values in
+    it. Non-vacuous by contrast: a well-formed call on the same path is still
+    recorded, so this is not "the loop stopped logging tool calls"."""
+    task = add_task(store)
+    good = _hostile(tool_calls=[{"tool": "Read", "input": {"path": "x"}}])
+    loop, _ = _loop(store, [_hostile(tool_calls=["Read"]), APPROVE])
+    loop.run_task(task)
+    assert [e for e in store.events(task.id) if e["kind"] == "tool_call"] == []
+
+    other = add_task(store)
+    loop2, _ = _loop(store, [good, APPROVE])
+    loop2.run_task(other)
+    (call,) = [e for e in store.events(other.id) if e["kind"] == "tool_call"]
+    assert call["payload"]["tool"] == "Read"
+
+
+# -- phase 6: the inertness differential + the `ModelRunner` contract note ------
+#
+# Columns whose value is a wall clock rather than a decision. A differential that
+# kept them would report a difference between any two runs of anything and prove
+# nothing — which is the failure mode P1-control-a exists to rule out from the
+# other side (a harness that compares nothing at all).
+_VOLATILE_COLUMNS = frozenset({"created_at", "decided_at", "started_at", "finished_at"})
+
+# Marker-free and marker-bearing versions of one script: the same task, the same
+# revise-then-approve shape, differing only in the marker line. Both sides of
+# every comparison below run one of these two.
+_CLEAN_SCRIPT = ["worker out", REVISE, "worker out v2", APPROVE]
+_MARKER_SCRIPT = [MARK_BLOCKING, REVISE, "worker out v2", APPROVE]
+
+
+def _stable_rows(store, table, task_id):
+    """Every column of `table` for one task, in id order, minus the clocks."""
+    return [
+        {k: r[k] for k in r.keys() if k not in _VOLATILE_COLUMNS}
+        for r in store._conn.execute(
+            f"SELECT * FROM {table} WHERE task_id=? ORDER BY id", (task_id,)
+        ).fetchall()
+    ]
+
+
+def _observable_state(store, runner) -> dict:
+    """Everything a run leaves behind that anything downstream can act on.
+
+    A state *diff*, not a list of mirrored assertions: an assertion per field
+    only proves the fields somebody thought to name, and the inertness claim is
+    about the fields nobody thought of. So this captures whole rows (`SELECT *`
+    minus the clocks) rather than a hand-picked projection, and the two dicts are
+    compared with `==`.
+
+    **What it deliberately leaves out, and why: the system prompt.** Slice 5's
+    E2 taught the `TOOL_REQUEST` grammar to the `worker`, `validator` and
+    `planner` system prompts and moved those three roles to version "3" — without
+    it nothing ever told an agent it could ask for a tool, so the marker half of
+    the slice was dead code that still passed every test. That is the same
+    disclosed change slice 4's charter made at version "2", and it means the
+    system prompt is **not** byte-for-byte the pre-slice-5 one and is not claimed
+    to be. Measuring it here would also be tautological: both sides of every
+    comparison below read the same registry, so the field can only ever be equal,
+    and a reader would take its presence as proof of something that is false.
+    The system prompt's content is pinned deliberately instead, by
+    `test_the_shipped_prompt_teaches_the_marker_grammar` and
+    `test_the_summarizer_is_never_taught_the_grammar`.
+
+    What *is* measured is the surface an unconfigured project can observe: the
+    task row, every verdict and attempt column, the spend, the ordered event-kind
+    sequence, every **user** prompt, every `tools` list **with its order**, and
+    the `tool_requests` ledger itself.
+    """
+    state = {"calls": [], "tasks": []}
+    for call in runner.calls:
+        state["calls"].append(
+            {
+                "prompt": call["prompt"],
+                "model": call["model"],
+                # Order, not membership: the `{kind}_prompt` event records the
+                # list as a list, so a reordering is a visible change.
+                "tools": list(call["tools"]),
+            }
+        )
+    for task in store.list_tasks():
+        metrics = store.task_metrics(task.id)
+        events = store.events(task.id)
+        state["tasks"].append(
+            {
+                "task": {
+                    **{k: v for k, v in asdict(task).items() if k != "status"},
+                    "status": task.status.value,
+                },
+                "attempts": metrics["attempts"],
+                "tokens": metrics["tokens"],
+                "cost_usd": metrics["cost_usd"],
+                "verdicts": _stable_rows(store, "verdicts", task.id),
+                "attempt_rows": _stable_rows(store, "attempts", task.id),
+                "tool_requests": _stable_rows(store, "tool_requests", task.id),
+                "event_kinds": [e["kind"] for e in events],
+                "prompt_events": [
+                    (
+                        e["kind"],
+                        e["payload"]["role"],
+                        e["payload"]["prompt"],
+                        tuple(e["payload"]["tools"]),
+                    )
+                    for e in events
+                    if e["kind"].endswith("_prompt")
+                ],
+                "output_events": [
+                    (e["kind"], e["payload"]["role"], e["payload"]["output"])
+                    for e in events
+                    if e["kind"].endswith("_output")
+                ],
+            }
+        )
+    return state
+
+
+def _run_and_observe(tmp_path, tag, script, *, neutered, monkeypatch):
+    """One task through the `Loop` in its own db, sharing one `workspace_root`.
+
+    Two fresh dbs mean both tasks are id 1, so every input to every prompt is
+    identical by construction and only the script and the patch can differ — the
+    `tests/test_charter.py:96` construction.
+
+    The neutering patches **`agentloop.agents`**, not `agentloop.toolpolicy`:
+    `agents.py` binds its imports as names, so the live call resolves
+    `agents.tools_for`, and a patch on the `toolpolicy` module object would be
+    inert. That is not a stylistic preference — an inert patch would make the
+    "neutered" run *be* the live run, and P1 would pass by comparing a run to
+    itself. `test_the_neutering_patch_provably_takes_effect` is what detects it.
+    """
+    from agentloop import agents
+
+    store = Store(tmp_path / f"{tag}.db")
+    try:
+        task = add_task(store)
+        loop, runner = _loop(store, list(script), workspace_root=str(tmp_path / "ws"))
+        if neutered:
+            with monkeypatch.context() as mp:
+                mp.setattr(
+                    agents,
+                    "tools_for",
+                    lambda store, config, spec, task_id, agent_kind: list(spec.tools),
+                )
+                mp.setattr(agents, "parse_tool_requests", lambda text: [])
+                loop.run_task(task)
+        else:
+            loop.run_task(task)
+        return _observable_state(store, runner)
+    finally:
+        store.close()
+
+
+def test_the_neutering_patch_targets_the_names_the_live_path_resolves():
+    """The mechanical half of ADVISORY 6, checked rather than trusted.
+
+    Both hooks must be attributes *of `agentloop.agents`* and must be the
+    `toolpolicy` functions themselves, because that is what makes patching the
+    consumer's namespace equivalent to removing the slice. If a later refactor
+    changed `agents.py` to `import toolpolicy` and call `toolpolicy.tools_for`,
+    every patch below would go silently inert — so this asserts the import style
+    the differential depends on, at the one place that depends on it.
+    """
+    from agentloop import agents, toolpolicy
+
+    assert agents.tools_for is toolpolicy.tools_for
+    assert agents.parse_tool_requests is toolpolicy.parse_tool_requests
+
+
+def test_marker_free_default_run_is_byte_for_byte_the_pre_slice_5_run(
+    tmp_path, monkeypatch
+):
+    """P1. On default config with a marker-free reply, slice 5 is not merely
+    quiet — it is absent, measured by neutering it and comparing the whole
+    observable state of the two runs.
+
+    **Scope, narrowed deliberately — do not "fix" this back to comparing system
+    prompts.** The claim is about the *user* prompt, the `tools` lists and the
+    persisted state. The three agent system prompts *did* change for every
+    project, chartered or not: E2 taught them the `TOOL_REQUEST` grammar and
+    moved `worker`/`validator`/`planner` to version "3", because injecting a
+    marker parser while telling no agent the marker exists is a feature that
+    cannot fire. Slice 4 made the same disclosed change at version "2". See
+    `_observable_state`'s docstring for why measuring it here would also be
+    tautological.
+
+    A revise round is used rather than a single approving one so the differential
+    covers a second worker invocation, a verdict row and the iteration boundary
+    where the park check sits.
+    """
+    live = _run_and_observe(
+        tmp_path, "live", _CLEAN_SCRIPT, neutered=False, monkeypatch=monkeypatch
+    )
+    neutered = _run_and_observe(
+        tmp_path, "neutered", _CLEAN_SCRIPT, neutered=True, monkeypatch=monkeypatch
+    )
+
+    assert live == neutered
+    # And the run really exercised something: an empty state would compare equal.
+    assert live["tasks"][0]["task"]["status"] == TaskStatus.DONE.value
+    assert len(live["calls"]) == 4  # worker, validator, worker, validator
+    assert live["tasks"][0]["tool_requests"] == []
+    assert live["tasks"][0]["verdicts"]  # a verdict row was written and compared
+
+
+def test_the_differential_harness_detects_a_difference_when_one_exists(
+    tmp_path, monkeypatch
+):
+    """P1-control-a: the harness compares something. Live on both sides, the only
+    difference the *script* — so a harness that captured an empty or constant
+    state would fail here while letting P1 pass on nothing."""
+    clean = _run_and_observe(
+        tmp_path, "clean", _CLEAN_SCRIPT, neutered=False, monkeypatch=monkeypatch
+    )
+    marked = _run_and_observe(
+        tmp_path, "marked", _MARKER_SCRIPT, neutered=False, monkeypatch=monkeypatch
+    )
+
+    assert clean != marked
+    # Named, not just "different": the marker parks the task on a queued request.
+    assert marked["tasks"][0]["task"]["status"] == TaskStatus.NEEDS_HUMAN.value
+    assert len(marked["tasks"][0]["tool_requests"]) == 1
+    assert clean["tasks"][0]["tool_requests"] == []
+
+
+def test_the_neutering_patch_provably_takes_effect(tmp_path, monkeypatch):
+    """P1-control-b: the *patch* is what varies, on one fixed marker-bearing
+    script. It is the only one of the three that can catch an inert
+    `parse_tool_requests` patch — P1-control-a varies the script, so it would
+    still pass with both runs live, and P1 itself would then be comparing a run
+    to itself and passing for the wrong reason.
+
+    Measured limit, stated rather than implied: it does **not** catch an inert
+    `tools_for` patch. On the marker-free script there is no request row, so a
+    live `tools_for` already returns `spec.tools` and the two runs agree either
+    way; on the marker script the task parks before a second worker invocation,
+    so no invocation ever sees a granted tool. What pins that half is
+    `test_the_neutering_patch_targets_the_names_the_live_path_resolves` (the
+    patch target is the identity `agents.tools_for is toolpolicy.tools_for`) plus
+    P1's own reliance on a `tools_for` that would fail P1 if it reversed its
+    output. The guarantee holds; this test is not what holds it.
+
+    The project's own non-vacuity rule (the seam AST walk proved by also running
+    without its exclusion: 0 hits vs 7) applied to this slice's flagship proof.
+    """
+    live = _run_and_observe(
+        tmp_path, "live", _MARKER_SCRIPT, neutered=False, monkeypatch=monkeypatch
+    )
+    neutered = _run_and_observe(
+        tmp_path, "neutered", _MARKER_SCRIPT, neutered=True, monkeypatch=monkeypatch
+    )
+
+    assert live != neutered
+    # The specific difference the patch removes: the marker became a row and a
+    # park when live, and nothing at all when neutered.
+    assert len(live["tasks"][0]["tool_requests"]) == 1
+    assert neutered["tasks"][0]["tool_requests"] == []
+    assert live["tasks"][0]["task"]["status"] == TaskStatus.NEEDS_HUMAN.value
+    assert neutered["tasks"][0]["task"]["status"] == TaskStatus.DONE.value
+
+
+def test_model_runner_documents_the_tools_contract():
+    """Enforcement is only as good as a backend honoring its `tools` argument.
+
+    The gate's entire bite is the list handed to `runner.run`, and the seam
+    cannot check that an implementation obeyed it — so the requirement is stated
+    at the seam that owns it, in the same register as `sandbox_isolation='strict'`
+    degrading with a warning: a documented residual risk, recorded where an
+    implementer reads it rather than in a plan nobody will open.
+    """
+    from agentloop.runner import ModelRunner
+
+    doc = ModelRunner.run.__doc__ or ""
+    assert "must honor" in doc
+    # Both shipped backends' actual behavior is named, so "honor" is not abstract.
+    assert "allowed_tools" in doc  # ClaudeSDKRunner passes it through
+    assert "OpenAICompatRunner" in doc  # drops it with a warning, executes none
+    # And the consequence of ignoring it, which is the reason the note exists.
+    assert "silently" in doc
+
+
+# -- E3/G1: a denial removes the concrete capability, not merely the name -------
+#
+# The gate's currency is the logical name, but what reaches the SDK is
+# `resolve_tools(tools)`. Two logical names share one concrete tool (`git` and
+# `shell` both resolve to `Bash`), and the shipped worker declares `git` — so a
+# human rejecting `shell` used to leave `Bash` in the SDK's `allowed_tools` while
+# the ledger and the `worker_prompt` event both recorded `shell` as withheld.
+# That is a gate a human believes is closed and is not. The decision was to fail
+# closed: the denial removes the concrete capability, even when that also disables
+# another logical tool the role already held.
+
+
+def test_a_rejected_tool_takes_down_the_capability_it_shares(store):
+    """The design fix, at the enforcement seam. A rejected `shell` removes `Bash`,
+    so the `git` the role declared stops working — and the *control* is the same
+    row approved, which leaves `git` in place. Asserted through `resolve_tools` as
+    well as the logical list, because the SDK sees only the former."""
+    from agentloop.runner import resolve_tools
+
+    task = add_task(store)
+    spec = _spec(["git", "search", "task_state"])
+    request_id = _add(store, task.id, "shell")
+    store.tool_request_decide(request_id, approved=False, by="human")
+
+    assert tools_for(store, LoopConfig(), spec, task.id, "worker") == [
+        "search",
+        "task_state",
+    ]
+    assert "Bash" not in resolve_tools(
+        tools_for(store, LoopConfig(), spec, task.id, "worker")
+    )
+
+    # Control: the identical row, approved, subtracts nothing at all.
+    other = add_task(store)
+    approved = _add(store, other.id, "shell")
+    store.tool_request_decide(approved, approved=True, by="human")
+    assert tools_for(store, LoopConfig(), spec, other.id, "worker") == [
+        "git",
+        "search",
+        "task_state",
+        "shell",
+    ]
+
+
+def test_a_pending_tool_request_withholds_the_capability_too(store):
+    """A withheld ask subtracts exactly as a rejected one does. The audit trail
+    records a pending row as withheld, so leaving the capability in place would be
+    the same lie one status earlier."""
+    task = add_task(store)
+    _add(store, task.id, "shell")
+    spec = _spec(["git", "search"])
+
+    assert tools_for(store, LoopConfig(), spec, task.id, "worker") == ["search"]
+
+
+def test_an_auto_row_never_subtracts_anything(store):
+    """`auto` is a grant, and a grant adds. Non-vacuous next to the two above: the
+    same `shell` name, the same shared `Bash`, the opposite outcome."""
+    task = add_task(store)
+    _add(store, task.id, "shell", status=ToolRequestStatus.AUTO.value)
+
+    assert tools_for(store, LoopConfig(), _spec(["git"]), task.id, "worker") == [
+        "git",
+        "shell",
+    ]
+
+
+def test_a_machine_refused_row_does_not_subtract(store):
+    """The line the denial set is drawn at, stated rather than left to be found.
+
+    The set is the asks a *human's* decision governs — `pending` (awaiting one)
+    and `rejected` (made). A `refused` row is the machine declining to queue: an
+    unknown name confers nothing concrete anyway, and an over-cap refusal would
+    otherwise let an agent's own chattiness strip its role's shipped baseline with
+    no human in the loop, which is a capability loss nobody decided.
+    """
+    task = add_task(store)
+    _add(store, task.id, "shell", status=ToolRequestStatus.REFUSED.value)
+
+    assert tools_for(store, LoopConfig(), _spec(["git"]), task.id, "worker") == ["git"]
+
+
+def test_a_tool_sharing_nothing_concrete_is_untouched(store):
+    """The subtraction is over the concrete set, so it is exactly as narrow as that
+    set is. A rejected `web` (WebFetch/WebSearch) takes down nothing else, and
+    `task_state` — which resolves to no SDK tool at all — can never be collateral.
+    """
+    task = add_task(store)
+    rejected = _add(store, task.id, "web")
+    store.tool_request_decide(rejected, approved=False, by="human")
+    spec = _spec(["git", "file_io", "task_state"])
+
+    assert tools_for(store, LoopConfig(), spec, task.id, "worker") == [
+        "git",
+        "file_io",
+        "task_state",
+    ]
+
+
+def test_the_collateral_loss_is_audited_where_a_human_will_read_it(store):
+    """The surprising half of the design, made visible rather than discovered.
+
+    End-to-end: the worker asks for `shell`, the row sits `pending`, and the
+    *next* invocation's `tools` has lost the `git` the shipped role declares. A
+    human reading the audit trail — with no access to the source — must be able to
+    learn that `git` stopped working and why.
+    """
+    task = add_task(store)
+    loop, runner = _loop(store, [MARK_OPTIONAL_SHELL, REVISE, "worker out v2", APPROVE])
+    loop.run_task(task)
+
+    worker_calls = [c for c in runner.calls if "# Task:" in c["prompt"]]
+    assert "git" in worker_calls[0]["tools"]  # round 1: no row existed yet
+    assert "git" not in worker_calls[1]["tools"]  # round 2: shell is withheld
+    assert "shell" not in worker_calls[1]["tools"]
+
+    (event,) = [
+        e for e in store.events(task.id) if e["kind"] == "tool_capability_withheld"
+    ]
+    payload = event["payload"]
+    assert payload["withheld"] == ["shell"]
+    assert payload["also_lost"] == ["git"]
+    assert payload["capability"] == ["Bash"]
+    # And as a sentence, so the fact does not depend on a reader joining two lists.
+    assert "git" in payload["message"] and "shell" in payload["message"]
+    # The prompt event tells the truth about what was handed over: the `tools` it
+    # records is the subtracted list, not the one the policy started from.
+    prompts = [e for e in store.events(task.id) if e["kind"] == "worker_prompt"]
+    assert "git" not in prompts[1]["payload"]["tools"]
+
+
+def test_the_queued_request_says_what_deciding_it_also_decides(store):
+    """The second surface: the row a human is shown when they approve or reject.
+
+    Which other logical names a decision on this one also settles is a pure fact
+    about the tool map, so it is recorded on the request's own event at creation —
+    the text an approve prompt is built from — rather than left to be joined out of
+    a later withholding event.
+    """
+    task = add_task(store)
+    loop, _ = _loop(store, [MARK_BLOCKING, APPROVE])
+    loop.run_task(task)
+
+    (event,) = [e for e in store.events(task.id) if e["kind"] == "tool_requested"]
+    assert event["payload"]["also_decides"] == {"git": ["Bash"]}
+    # The decision event carries it too, so "what did this click actually do" is
+    # answerable from the decision alone.
+    (row,) = store.tool_requests(task_id=task.id)
+    loop.reject_tool_request(row.id)
+    (decided,) = [
+        e for e in store.events(task.id) if e["kind"] == "tool_request_decided"
+    ]
+    assert decided["payload"]["also_decides"] == {"git": ["Bash"]}
+
+
+def test_the_subtraction_is_a_property_of_the_whole_resolution(store):
+    """Per-request, or once over the final list? Once.
+
+    A grant is appended *after* the declared loop, so subtracting per request would
+    let a later grant re-introduce a concrete capability an earlier denial removed
+    — and the answer would depend on which loop ran last. Here `git` is granted
+    (which adds `Bash`) while `shell` is rejected (which removes it): fail closed,
+    in either order.
+    """
+    task = add_task(store)
+    granted = _add(store, task.id, "git")
+    store.tool_request_decide(granted, approved=True, by="human")
+    rejected = _add(store, task.id, "shell")
+    store.tool_request_decide(rejected, approved=False, by="human")
+
+    assert tools_for(store, LoopConfig(), _spec(["search"]), task.id, "worker") == [
+        "search"
+    ]
+
+
+def test_the_denial_survives_the_gate_being_off(store):
+    """`gate_declared_tools` decides whether a *declared* tool needs a grant. It
+    has nothing to do with honoring a decision already made, so a rejected tool
+    subtracts on the default config too — the marker path creates rows with the
+    knob off, which is the shipped configuration."""
+    task = add_task(store)
+    rejected = _add(store, task.id, "shell")
+    store.tool_request_decide(rejected, approved=False, by="human")
+    cfg = LoopConfig()
+
+    assert cfg.gate_declared_tools is False
+    assert tools_for(store, cfg, _spec(["git", "search"]), task.id, "worker") == [
+        "search"
+    ]
+
+
+def test_the_model_runner_note_names_the_residual_it_still_carries():
+    """The note claims the `tools` list is the entire enforcement surface. After
+    the fix that is true of the *concrete* capability, so the note must say which
+    set the guarantee is over — and name the residual it keeps (a backend that
+    ignores the argument) rather than dropping the claim."""
+    from agentloop.runner import ModelRunner
+
+    doc = ModelRunner.run.__doc__ or ""
+    assert "concrete" in doc
+    assert "collateral" in doc  # the surprising consequence, stated at the seam
+
+
+# -- E3/G2: a clamped count is a substitution, and says so ---------------------
+
+
+def test_a_clamped_token_count_is_audited_as_a_substitution(store):
+    """A degraded number must not land in `attempts` indistinguishable from a
+    measured one — slice 4's whole reason for `runner_warning`. The surrogate
+    branch in the same diff fires it; the clamp did not, so a single approving
+    round reached DONE carrying 9.0e15 tokens with an empty warning feed.
+    """
+    from agentloop.agents import _MAX_TOKEN_COUNT, _clamped_count
+
+    assert _clamped_count(10**400) is True
+    assert _clamped_count(_MAX_TOKEN_COUNT) is False  # the ceiling itself is a number
+    assert _clamped_count(7) is False
+    assert _clamped_count("lots") is False  # not a count at all; the type guard owns it
+    assert _clamped_count(float("nan")) is False  # garbage, zeroed rather than clamped
+
+    task = add_task(store)
+    # One approving round: the task reaches DONE, so nothing about the escalation
+    # direction rescues this — the audit event is the only signal there is.
+    loop, _ = _loop(store, [_hostile(tokens_in=10**400), APPROVE])
+    loop.run_task(task)
+
+    assert store.get_task(task.id).status is TaskStatus.DONE
+    (warning,) = [e for e in store.events(task.id) if e["kind"] == "runner_warning"]
+    assert "tokens_in" in warning["payload"]["note"]
+    assert "ceiling" in warning["payload"]["note"]
+    # The substituted number really is what landed, so the warning is the only
+    # thing distinguishing it from a measurement. Read off the worker's own event
+    # rather than `task_metrics`, which sums the validator's real tokens on top.
+    out = [e for e in store.events(task.id) if e["kind"] == "worker_output"][0]
+    assert out["payload"]["tokens_in"] == 2**53
+    assert store.task_metrics(task.id)["tokens"] >= 2**53
+
+
+def test_the_clamp_docstring_states_the_caveat_its_test_does():
+    """The docstring claimed the clamp "trips the budget cap toward NEEDS_HUMAN".
+    That holds only when a later iteration boundary is reached; on an approving
+    single round the task reaches DONE carrying the ceiling. The test named the
+    caveat honestly and the docstring stated the guarantee without it."""
+    from agentloop.agents import _token_count
+
+    doc = _token_count.__doc__ or ""
+    assert "iteration boundary" in doc
+
+
+# -- E3/G4: the neutering must cover every `toolpolicy` name `agents` binds -----
+
+
+def test_the_neutering_covers_every_toolpolicy_name_agents_binds():
+    """The patch-target guard pins the import *style* of two names; this pins the
+    *set*.
+
+    `agents` also binds `classify` and `ToolClass` and calls `classify` live in
+    `_invoke` — harmless today only because the patched `parse_tool_requests`
+    returns `[]`, which makes that call dead in the neutered arm. A future entry
+    point not downstream of those two would stay live in **both** arms, and the
+    differential would compare live-to-live across it. Read from the source rather
+    than from the module namespace, so a rebinding cannot hide from it.
+    """
+    import ast
+    from pathlib import Path
+
+    from agentloop import agents
+
+    tree = ast.parse(Path(agents.__file__).read_text(encoding="utf-8"))
+    bound = {
+        alias.asname or alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module == "toolpolicy"
+        for alias in node.names
+    }
+    assert bound == {
+        # Patched by the differential.
+        "tools_for",
+        "parse_tool_requests",
+        # Reachable only through `parse_tool_requests`' output, so neutering that
+        # one neuters these: `classify` runs over the parsed list, `ToolClass` keys
+        # `_TOOL_CLASS_STATUS`, and `MAX_TOOL_REASON_CHARS` bounds a parsed reason.
+        # Adding a name here forces a decision about whether the neutering has to
+        # cover it too.
+        "classify",
+        "ToolClass",
+        "MAX_TOOL_REASON_CHARS",
+    }
+
+
+# -- E3/G1 remediation: asking for what you already hold must be neutral --------
+#
+# G1 made a withheld tool's *concrete* capability subtract from the whole resolved
+# list, and `withheld_tools` is `pending` + `rejected`. The marker path queues a
+# `pending` row for **any** gated logical name, including one the role already
+# holds — so a worker writing `TOOL_REQUEST: file_io` revoked its own baseline
+# `Read`/`Write`/`Edit`, and did it unauditably (the requested tool never entered
+# `lost`, so the withholding event's guard never fired).
+#
+# The distinction is *who decided*: a `pending` row is nobody's decision, so on a
+# tool the role already holds it is a no-op; a `rejected` row is a human's denial
+# and still subtracts, which is the whole point of G1.
+
+
+def test_a_pending_row_for_a_tool_the_role_already_holds_is_a_no_op(store):
+    """Nobody decided anything: the row is non-blocking, no human is ever prompted
+    (`pending_blocking_tool_requests` cannot see it), and `classify` promises the
+    ask is harmless. So the resolution is exactly what it was without the row."""
+    task = add_task(store)
+    spec = _spec(["file_io", "git", "search", "task_state"])
+    before = tools_for(store, LoopConfig(), spec, task.id, "worker")
+
+    _add(store, task.id, "file_io")  # the agent asks for what it already has
+
+    assert tools_for(store, LoopConfig(), spec, task.id, "worker") == before
+    assert before == ["file_io", "git", "search", "task_state"]
+    # ...and a second baseline name behaves the same way, including the one that
+    # shares `Bash` with `shell`.
+    _add(store, task.id, "git")
+    assert tools_for(store, LoopConfig(), spec, task.id, "worker") == before
+
+
+def test_a_rejected_row_for_a_tool_the_role_already_holds_still_subtracts(store):
+    """The other direction, and the control for the test above: a human said no.
+    Making the baseline exempt from *that* would re-open the cosmetic-denial hole
+    G1 closed — rejecting `file_io` would achieve nothing."""
+    task = add_task(store)
+    spec = _spec(["file_io", "git", "search", "task_state"])
+    rid = _add(store, task.id, "file_io")
+    store.tool_request_decide(rid, approved=False, by="human")
+
+    assert tools_for(store, LoopConfig(), spec, task.id, "worker") == [
+        "git",
+        "search",
+        "task_state",
+    ]
+
+
+def test_a_denied_baseline_tool_is_audited_even_with_no_collateral(store):
+    """The audit gap, independent of the no-op rule. `lost` is *collateral* only,
+    so a denial that removes nothing but the requested tool itself fired no event
+    — the one case with no other signal. The guard is now "a capability was
+    actually lost", not "somebody else lost one"."""
+    task = add_task(store)
+    rid = _add(store, task.id, "file_io")
+    store.tool_request_decide(rid, approved=False, by="human")
+
+    tools_for(store, LoopConfig(), _spec(["file_io", "search"]), task.id, "worker")
+
+    (event,) = [
+        e for e in store.events(task.id) if e["kind"] == "tool_capability_withheld"
+    ]
+    payload = event["payload"]
+    assert payload["removed"] == ["file_io"]
+    assert payload["also_lost"] == []  # nothing collateral: it was the ask itself
+    assert "Read" in payload["capability"]
+    assert "file_io" in payload["message"]
+
+
+def test_asking_for_a_declared_tool_changes_nothing_end_to_end(store):
+    """The blind spot the suite had, closed deliberately: every marker-path test
+    used `web` (shares no concrete tool) or `shell` (never declared), so none
+    exercised a marker naming a tool the role already holds. Two arms, identical
+    scripts but for the marker line — the tools the runner is handed must match."""
+    marker = "worker out\nTOOL_REQUEST: file_io (optional) - want to write files"
+    script = [REVISE, "worker out v2", APPROVE]
+
+    def worker_tools(r):
+        return [c["tools"] for c in r.calls if "# Task:" in c["prompt"]]
+
+    control = add_task(store)
+    loop_c, runner_c = _loop(store, ["worker out", *script])
+    loop_c.run_task(control)
+
+    task = add_task(store)
+    loop, runner = _loop(store, [marker, *script])
+    loop.run_task(task)
+
+    assert worker_tools(runner) == worker_tools(runner_c)
+    assert "file_io" in worker_tools(runner)[1]
+    # And the ask itself is still audited — neutral is not silent.
+    assert any(e["kind"] == "tool_requested" for e in store.events(task.id))
+
+
+def test_a_non_string_declared_tool_never_raises_with_the_gate_off(store):
+    """`agents.json` loads unvalidated through `AgentSpec(**spec)`, and with the
+    gate off `allowed` carried raw `spec.tools` entries into a `set` membership
+    test. `tools: [["file_io"]]` raised `TypeError: unhashable type` — during
+    prompt construction, inside `_with_retry`, so three retries reported as
+    `infra_error` pointing the human at the network instead of at the registry."""
+    task = add_task(store)
+    _add(store, task.id, "shell")  # a withheld row: what made the branch reachable
+
+    assert tools_for(
+        store, LoopConfig(), _spec([["file_io"], "search"]), task.id, "worker"
+    ) == ["['file_io']", "search"]
+
+
+def test_the_withholding_message_names_only_the_tools_that_withheld(store):
+    """`task_state` resolves to no concrete tool, so it confers nothing and cannot
+    withhold anything. Interpolating the whole withheld list read "…the same
+    capability task_state and shell confers", naming a tool that did nothing."""
+    task = add_task(store)
+    for tool in ("task_state", "shell"):
+        store.tool_request_decide(
+            _add(store, task.id, tool), approved=False, by="human"
+        )
+
+    tools_for(store, LoopConfig(), _spec(["git"]), task.id, "worker")
+
+    (event,) = [
+        e for e in store.events(task.id) if e["kind"] == "tool_capability_withheld"
+    ]
+    message = event["payload"]["message"]
+    assert "shell" in message
+    assert "task_state" not in message
+
+
+def test_the_classify_docstring_no_longer_promises_a_harmless_row():
+    """H1. `classify`'s rationale for not consulting `baseline_tools` was that a
+    marker naming a baseline tool "reaches the runner anyway — audited, harmless".
+    G1 invalidated that premise; the premise is a code dependency, not prose."""
+    doc = classify.__doc__ or ""
+    assert "harmless" not in doc
+    assert "tools_for" in doc  # it says where the distinction actually lives
+
+
+def test_the_tools_for_docstring_states_what_the_gate_off_path_really_does():
+    """H1, second half. It claimed that with the gate off "every declared tool
+    passes through untouched and this returns `spec.tools`' content and order,
+    writing nothing". Both halves are false since G1: it can return less, and it
+    can write (the withholding event)."""
+    doc = tools_for.__doc__ or ""
+    assert "untouched" not in doc
+    assert "no `tool_requests` row" in doc
+
+
+def test_the_model_runner_note_states_the_real_blast_radius():
+    """L2. The note said the subtraction removes "a withheld or rejected tool's
+    concrete footprint". The code is coarser: *any* overlap drops the whole logical
+    name, so a denied `Read` also removes `Write` and `Edit` via `file_io`."""
+    from agentloop.runner import ModelRunner
+
+    doc = ModelRunner.run.__doc__ or ""
+    assert "whole logical name" in doc
+
+
+# -- E4/F1: the previewed consequence is the enforced one --------------------
+#
+# The read-only surfaces (CLI `tools list`, the dashboard panel) used to state the
+# consequence of a decision from `LOGICAL_TOOL_MAP` alone, which knows neither the
+# row's role nor its siblings' statuses. These tests pin the two halves of the fix:
+# the preview is computed by the *same* function the gate enforces, and computing
+# it writes nothing.
+
+
+def _effect(store, tool, spec, config=None):
+    """`decision_effect` for the row named `tool`, against `spec`'s declared list."""
+    request = next(
+        r for r in store.tool_requests() if r.tool == tool and r.role == spec.role
+    )
+    return decision_effect(
+        store, config or LoopConfig(), spec.role, list(spec.tools), request
+    )
+
+
+def test_a_previewed_grant_of_nothing_is_what_the_gate_then_enforces(store):
+    """F1 state 1 — and the anti-drift proof, which is the point of the extraction.
+
+    `git` rejected, `shell` pending: the preview says approving grants no
+    capability. The assertion is not that the preview says so, but that
+    `tools_for` — the gate — then agrees, having been given the approval. Two
+    implementations of "what would this role get" could not both be checked by one
+    test; one implementation is why this test is possible at all.
+    """
+    task = add_task(store)
+    spec = _spec(["file_io", "git", "search", "task_state"])
+    store.tool_request_decide(_add(store, task.id, "git"), approved=False, by="human")
+    shell = _add(store, task.id, "shell")
+
+    effect = _effect(store, "shell", spec)
+    assert effect.approve_grants == []  # what the screen promises
+    assert effect.approve_enables == []
+
+    store.tool_request_decide(shell, approved=True, by="human")
+    enforced = tools_for(store, LoopConfig(), spec, task.id, "worker")
+    # ...and what the gate does. `Bash` is still gone, on account of the rejected
+    # `git`, exactly as the preview said.
+    assert "Bash" not in resolve_tools(enforced)
+
+
+def test_a_previewed_grant_of_bash_is_also_what_the_gate_enforces(store):
+    """The non-vacuity control for the test above: same shape, no rejected sibling,
+    and now the preview promises `Bash` and the gate delivers it. Without this,
+    the pair above would pass on a preview that always promised nothing."""
+    task = add_task(store)
+    spec = _spec(["file_io", "git", "search", "task_state"])
+    shell = _add(store, task.id, "shell")
+
+    effect = _effect(store, "shell", spec)
+    assert effect.approve_grants == ["Bash"]
+    # And the sibling the role declares starts working again with it: while the ask
+    # is pending, its own withheld `Bash` has already taken `git` down.
+    assert effect.approve_enables == ["git"]
+    assert effect.costs_now == ["git"]
+    assert effect.reject_removes == []  # nothing left to lose
+
+    store.tool_request_decide(shell, approved=True, by="human")
+    assert "Bash" in resolve_tools(tools_for(store, LoopConfig(), spec, task.id, "w"))
+
+
+def test_the_sharing_map_alone_gets_every_one_of_the_three_states_wrong(store):
+    """The targeted-revert control, in-suite. `tools_sharing_capability` is
+    non-empty in all three states, so the text it alone can produce — "approving
+    grants it too; rejecting stops it working" — is false in each: no grant in the
+    first, nothing lost in the second (`git` is already withheld) and nothing lost
+    in the third (the validator never declared `git`)."""
+    worker = _spec(["file_io", "git", "search", "task_state"])
+    validator = _spec(["file_io", "search", "task_state"], role="validator")
+
+    # The map's answer is the same in all three states — that is the defect.
+    assert tools_sharing_capability("shell") == {"git": ["Bash"]}
+
+    task = add_task(store)
+    store.tool_request_decide(_add(store, task.id, "git"), approved=False, by="human")
+    _add(store, task.id, "shell")
+    state_1 = _effect(store, "shell", worker)
+
+    other = add_task(store)
+    _add(store, other.id, "shell")
+    state_2 = _effect(store, "shell", worker)
+
+    third = add_task(store)
+    _add(store, third.id, "shell", role="validator", agent_kind="validator")
+    state_3 = _effect(store, "shell", validator)
+
+    assert state_1.approve_grants == []  # "approving grants it too" — false
+    assert state_2.reject_removes == []  # "rejecting stops it working" — false
+    assert state_3.reject_removes == []  # ...and false for a different reason
+    assert state_3.costs_now == []  # this role never held `git` at all
+
+
+def test_previewing_a_decision_writes_nothing(store):
+    """`tools_for` writes rows and logs events, so the preview could not be built
+    on it: a GET would become a mutation, which would be the fourth time this
+    slice fixed a hole by opening one. `decision_effect` is read-only, and that is
+    asserted rather than intended."""
+    task = add_task(store)
+    _add(store, task.id, "shell")
+    spec = _spec(["file_io", "git", "search", "task_state"])
+    rows_before = [asdict(r) for r in store.tool_requests()]
+    events_before = store.latest_event_id()
+
+    # Gate on, which is the configuration under which `tools_for` writes most.
+    _effect(store, "shell", spec, LoopConfig(gate_declared_tools=True))
+
+    assert [asdict(r) for r in store.tool_requests()] == rows_before
+    assert store.latest_event_id() == events_before
+
+
+def test_effective_tools_is_pure_over_its_arguments(store):
+    """The seam's own contract: given the same rows it returns the same answer, and
+    it takes no store at all — which is what lets the read paths call it."""
+    config = LoopConfig()
+    args = (config, "worker", ["file_io", "git"], [], ["shell"], ["shell"])
+    first = effective_tools(*args)
+    assert first == effective_tools(*args)
+    assert first.allowed == ["file_io"]  # git lost its Bash to the pending shell
+    assert first.removed == ["git"]
+
+
+# -- E4 cycle 2 / H1 + H2: the rendered claim is computed, not narrated --------
+#
+# Two HIGH findings, one root cause: the surfaces stated something about the
+# *concrete* capability while branching on `in_effect`, which is a **logical-name**
+# membership test (`tool in now.allowed`). For a `refused` row the two diverge —
+# `withheld_tools` deliberately never sees `refused`, so the row subtracts
+# nothing, yet its logical name is absent from `allowed`. The screen then read
+# "Bash is not available to this role" while the gate handed `Bash` over through
+# the worker's declared `git`, which is the exact direction this module's own
+# docstring rules out. `capability_live` is that concrete truth, and `verb` moves
+# the headline claim into Python where these tests can pin it: `web/` has no test
+# runner, so a fix landing its logic here and its text in TSX would move the
+# defect to the one surface no gate covers.
+
+
+def _cap_refused(store, tool="shell"):
+    """A `refused`-over-the-per-task-cap row: the half of the `refused`
+    population that carries a real capability. One `pending` row fills a cap of
+    one, so the second ask is refused by the machine rather than queued."""
+    task = add_task(store)
+    assert _add(store, task.id, "web", max_per_task=1) is not None
+    assert _add(store, task.id, tool, max_per_task=1) is None  # over the cap
+    return task
+
+
+def test_a_cap_refused_row_reports_the_capability_the_role_still_holds(store):
+    """H1. The row is `refused`, so it subtracts nothing; the worker declares
+    `git`, so `Bash` is fully live. The concrete claim must say so, and the
+    logical-name test cannot: `shell` is genuinely absent from `allowed`."""
+    spec = _spec(["file_io", "git", "search", "task_state"])
+    task = _cap_refused(store)
+
+    effect = _effect(store, "shell", spec)
+    # What the gate actually hands the runner.
+    assert "Bash" in resolve_tools(tools_for(store, LoopConfig(), spec, task.id, "w"))
+    assert effect.capability_live == ["Bash"]  # ...and the screen's basis for it
+    assert effect.in_effect is False  # the logical name really is absent
+    assert effect.verb == "does not withhold"
+
+
+def test_a_genuine_denial_still_reads_as_a_denial(store):
+    """The non-vacuity control for the test above: same tool, same role, but a
+    human's `rejected` row — which `withheld_tools` does see. `Bash` is gone,
+    `capability_live` is empty, and the verb is a denial."""
+    spec = _spec(["file_io", "git", "search", "task_state"])
+    task = add_task(store)
+    store.tool_request_decide(_add(store, task.id, "shell"), approved=False, by="human")
+
+    effect = _effect(store, "shell", spec)
+    assert "Bash" not in resolve_tools(
+        tools_for(store, LoopConfig(), spec, task.id, "w")
+    )
+    assert effect.capability_live == []
+    assert effect.verb == "denied"
+
+
+def test_a_pending_row_that_can_deliver_nothing_does_not_promise_a_grant(store):
+    """H2 state 1 — F1's exact state, at the headline. `git` rejected and `shell`
+    pending: `approve_grants` is empty, the body says approving does not deliver
+    `Bash`, and the verb above it must not still be making that promise."""
+    spec = _spec(["file_io", "git", "search", "task_state"])
+    task = add_task(store)
+    store.tool_request_decide(_add(store, task.id, "git"), approved=False, by="human")
+    _add(store, task.id, "shell")
+
+    effect = _effect(store, "shell", spec)
+    assert effect.approve_grants == []
+    assert effect.verb == "would not deliver"
+
+
+def test_a_pending_row_that_can_deliver_something_says_it_would(store):
+    """The non-vacuity control: no rejected sibling, so approving really does
+    grant `Bash` and the verb is allowed to promise it."""
+    spec = _spec(["file_io", "git", "search", "task_state"])
+    task = add_task(store)
+    _add(store, task.id, "shell")
+    assert _effect(store, "shell", spec).verb == "would grant"
+
+
+def test_an_approved_row_not_in_force_does_not_claim_to_grant(store):
+    """H2 state 2, pinned as an API fact by `tests/test_server.py` and never
+    checked at the headline: the row is `approved` and the body reads "NOT in
+    force", so the verb cannot read "grants"."""
+    spec = _spec(["file_io", "git", "search", "task_state"])
+    task = add_task(store)
+    store.tool_request_decide(_add(store, task.id, "git"), approved=False, by="human")
+    shell = _add(store, task.id, "shell")
+    store.tool_request_decide(shell, approved=True, by="human")
+
+    effect = _effect(store, "shell", spec)
+    assert effect.in_effect is False
+    assert effect.capability_live == []
+    assert effect.verb == "does not deliver"
+
+
+def test_an_approved_row_in_force_does_claim_to_grant(store):
+    """The control for the pair above."""
+    spec = _spec(["file_io", "git", "search", "task_state"])
+    task = add_task(store)
+    store.tool_request_decide(_add(store, task.id, "shell"), approved=True, by="human")
+    effect = _effect(store, "shell", spec)
+    assert effect.capability_live == ["Bash"]
+    assert effect.verb == "grants"
+
+
+def test_a_row_that_confers_no_capability_says_only_that(store):
+    """M2's row, at the seam. `classify` consults the read-only allowlist before
+    the map, so a name in the allowlist that `LOGICAL_TOOL_MAP` lacks is an
+    `auto` row conferring nothing. Neither "grants" nor "not in force" is a true
+    headline for it, and the empty resolved list must not be rendered into a
+    sentence about a withheld capability."""
+    spec = _spec(["file_io", "git", "search", "task_state"])
+    task = add_task(store)
+    _add(store, task.id, "kubectl", status=ToolRequestStatus.AUTO.value)
+    effect = _effect(
+        store,
+        "kubectl",
+        spec,
+        LoopConfig(tool_readonly_allowlist=["file_read", "search", "kubectl"]),
+    )
+    assert effect.in_effect is False  # the granted loop drops an unmapped name
+    assert effect.capability_live == []
+    assert effect.verb == "confers"
+
+
+def test_the_rejection_fields_are_empty_for_a_row_that_cannot_be_rejected(store):
+    """LOW. `tool_request_decide` accepts a rejection only for a `pending` row, so
+    `reject_removes`/`reject_loses` on any other status describe a decision that
+    can never be taken — dead today and a trap the moment a surface renders them.
+    They are computed for `pending` only, which is also the only branch that
+    reads them."""
+    spec = _spec(["file_io", "git", "search", "task_state"])
+    task = add_task(store)
+    store.tool_request_decide(_add(store, task.id, "shell"), approved=True, by="human")
+    effect = _effect(store, "shell", spec)
+    assert effect.reject_removes == []
+    assert effect.reject_loses == []
+
+    # Non-vacuity: the same shape while the row is still decidable does compute
+    # them, so the emptiness above is the status and not the plumbing.
+    other = add_task(store)
+    _add(store, other.id, "git")
+    assert _effect(store, "git", spec).reject_loses == ["Bash"]
+
+
+# -- E4 verification / two false claims on human-facing text -------------------
+#
+# Both were found by the phase-exit verifier driving the real surfaces, and both
+# are the slice's recurring defect one more time: a sentence asserting more than
+# its inputs prove. Neither is read by a decision rule, which is exactly why
+# neither had a test — and why the audit log and the escalation reason are the two
+# places a false sentence is least recoverable, since a human debugging later has
+# nothing else to go on.
+
+
+def test_the_collateral_loss_message_does_not_claim_a_decision_never_happened(store):
+    """`lost` is "removed and not itself withheld", which is NOT "never
+    requested" — a collateral name can be an *approved* row. With `git` rejected
+    and `shell` approved, both stop working, `shell` lands in `lost`, and the
+    event used to tell a human that the request they had personally approved was
+    never made."""
+    spec = _spec(["file_io", "git", "shell", "search"])
+    task = add_task(store)
+    store.tool_request_decide(_add(store, task.id, "git"), approved=False, by="human")
+    shell = _add(store, task.id, "shell")
+    store.tool_request_decide(shell, approved=True, by="human")
+
+    tools_for(store, LoopConfig(), spec, task.id, "worker")
+    withheld = [
+        e for e in store.events(task.id) if e["kind"] == "tool_capability_withheld"
+    ]
+    assert len(withheld) == 1
+    payload = withheld[0]["payload"]
+    # The state that falsifies the old sentence: the collateral name is a row a
+    # human decided, and decided the *other* way.
+    assert payload["also_lost"] == ["shell"]
+    assert store.tool_request_get(shell).status is ToolRequestStatus.APPROVED
+    assert "never requested" not in payload["message"]
+    # What `lost` does prove is still said, so the fix is not a deletion.
+    assert "shares that capability" in payload["message"]
+    assert "no way to deny one and keep the other" in payload["message"]
+
+
+def test_the_park_reason_does_not_offer_rejection_as_a_way_out(store):
+    """`reject_tool_request` deliberately does not release a parked task, and
+    neither `pause`+`resume` nor `redo` decides the row — each requeues the task
+    with the blocking request still standing, so the next round pays a worker
+    call and parks again. The reason said "approve or reject", which reads as two
+    symmetrical exits and sent a human to the only one that is a dead end."""
+    task = add_task(store)
+    loop, _ = _loop(
+        store, ["worker out\nTOOL_REQUEST: shell (blocking) - need to run the build"]
+    )
+    loop.run_task(task)
+
+    reason = store.get_task(task.id).escalation_reason
+    assert reason.startswith(
+        "Awaiting tool approval: shell (request 1, asked by the worker)."
+    )
+    assert "approve|reject" not in reason
+    assert "only decision that releases the task" in reason
+    # And it states the true consequence of each route it names, rather than
+    # leaving the human to discover it by taking one.
+    assert "leaves it parked" in reason
+    assert "parks on the same request" in reason
