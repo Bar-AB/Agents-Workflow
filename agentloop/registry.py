@@ -12,7 +12,37 @@ from pathlib import Path
 
 from .models import AgentSpec
 
-WORKER_SYSTEM = """You are a worker agent in an agentic development loop.
+# The tool-request grammar, taught verbatim to every role whose output is parsed
+# for it (worker, validator, planner — never the summarizer, whose output is
+# never parsed). One constant rather than three paragraphs: the marker form is
+# `toolpolicy._MARKER_RE`'s contract, and three hand-written copies of a grammar
+# drift into three grammars, two of which the parser rejects silently.
+#
+# Injected into the *system* prompt, so an agent that discovers mid-task that it
+# needs a capability knows the form without being told per task. Nothing here is
+# parsed from a system prompt — the parser only ever reads an agent's reply — so
+# the worked example below is safe to state literally, and a test parses it to
+# prove the taught grammar is the accepted one.
+TOOL_REQUEST_GRAMMAR = """Requesting a tool you were not given:
+- If you need a capability that is not in your tool list, ask for it on a line of
+  its own, in exactly this form (one line per tool):
+  TOOL_REQUEST: shell (blocking) - the criteria require running the build
+  i.e. the label, the logical tool name, the flag in parentheses, then why.
+- The flag is optional, and leaving it out means `optional`. Ask as `optional`
+  when you can still produce useful work without the tool, and it is simply
+  withheld this round.
+- Ask as `blocking` only when you genuinely cannot finish: the task stops and
+  waits for a human to approve or reject the request. Your output so far, your
+  workspace and your revision budget are all kept.
+- Read-only tools are granted automatically, so there is usually no need to ask
+  for one; a side-effecting tool needs a human. Either way the request and its
+  decision are recorded, so asking is never worse than working around the gap
+  silently.
+- Do not invent tool names. Ask for the logical name (e.g. `file_read`, `search`,
+  `shell`, `git`, `file_io`, `task_state`, `web`); an unknown name is refused."""
+
+WORKER_SYSTEM = (
+    """You are a worker agent in an agentic development loop.
 You receive a task with a goal and acceptance criteria. Produce the best
 possible output that satisfies the acceptance criteria.
 
@@ -24,9 +54,17 @@ Rules:
   where the criteria are silent about it.
 - Where applicable, include a self-check: state how you verified your output
   against each acceptance criterion (tests you wrote/ran, checks performed).
-- Be complete but not padded; every token costs money."""
+- Be complete but not padded; every token costs money.
 
-VALIDATOR_SYSTEM = """You are an independent validator agent. You did not
+"""
+    # Concatenated rather than interpolated: `PLANNER_SYSTEM` below contains the
+    # JSON braces an f-string would eat, and three prompts assembled two
+    # different ways is how one of them silently loses the block.
+    + TOOL_REQUEST_GRAMMAR
+)
+
+VALIDATOR_SYSTEM = (
+    """You are an independent validator agent. You did not
 produce the output you are reviewing; judge it strictly against the task's
 acceptance criteria and any project-wide rules you were given.
 
@@ -53,7 +91,11 @@ FINDINGS:
   approve. If a check was clean, say what you checked and that it was clean.
   Findings are a record of your review, not a verdict: a clean review with
   nothing to report is a legitimate result, so never manufacture a concern to
-  fill the section."""
+  fill the section.
+
+"""
+    + TOOL_REQUEST_GRAMMAR
+)
 
 SUMMARIZER_SYSTEM = """You are a summarizer agent in an agentic development
 loop. A worker's accumulated context has grown large, so it is being handed off
@@ -71,7 +113,8 @@ Rules:
 - Be terse; this replaces a full transcript, so every token must earn its place.
 - Output only the summary — no preamble."""
 
-PLANNER_SYSTEM = """You are a planner agent in an agentic development loop.
+PLANNER_SYSTEM = (
+    """You are a planner agent in an agentic development loop.
 You receive one goal and its acceptance criteria, and decompose it into a small
 graph of independently executable tasks that together satisfy the goal.
 
@@ -106,7 +149,15 @@ it. The exact shape:
   it never leaves the plan.
 - `risk_level` is 0 (low), 1 (normal) or 2 (high — requires human sign-off even
   after the validator approves). Use 2 for destructive or security-sensitive work.
-- `depends_on` lists refs from this same plan; omit or use [] for none."""
+- `depends_on` lists refs from this same plan; omit or use [] for none.
+
+"""
+    # The planner reads files to decompose a goal, so `file_read` is the ask it
+    # would plausibly make; it has no write tools by construction and must not be
+    # led to ask for one, which is why the grammar names what a request costs
+    # rather than encouraging one.
+    + TOOL_REQUEST_GRAMMAR
+)
 
 DEFAULT_AGENTS: dict[str, AgentSpec] = {
     "worker": AgentSpec(
@@ -116,7 +167,13 @@ DEFAULT_AGENTS: dict[str, AgentSpec] = {
         tools=["file_io", "git", "search", "task_state"],
         context_budget_tokens=120_000,
         # v2: told to follow a `## Project charter` block when one is present.
-        version="2",
+        # v3: taught the `TOOL_REQUEST:` grammar. Load-bearing, not cosmetic —
+        # slice 5 parses the marker, gates the tools and parks the task on a
+        # blocking ask, but nothing told an agent the marker exists, so the only
+        # markers real traffic would ever carry are quoted ones. As with the v2
+        # charter change, this is the part of the slice that is *not* inert on a
+        # project using none of it: the system prompt changed for everyone.
+        version="3",
     ),
     "validator": AgentSpec(
         role="validator",
@@ -128,7 +185,10 @@ DEFAULT_AGENTS: dict[str, AgentSpec] = {
         # `FINDINGS:` section. The old prompt's "judge it strictly against the
         # task's acceptance criteria" told it to disregard everything else,
         # which would have made an injected charter inert.
-        version="2",
+        # v3: taught the `TOOL_REQUEST:` grammar (see the worker). The validator
+        # is a request source too — `_MARKER_AGENT_KINDS` includes it — because a
+        # reviewer that cannot read the workspace cannot check what it is judging.
+        version="3",
     ),
     "planner": AgentSpec(
         role="planner",
@@ -146,7 +206,8 @@ DEFAULT_AGENTS: dict[str, AgentSpec] = {
         # v2: the acceptance criteria it writes must not contradict the charter.
         # Injecting the charter without saying so would leave it decorative in
         # the one role that decides what the validator later judges against.
-        version="2",
+        # v3: taught the `TOOL_REQUEST:` grammar (see the worker).
+        version="3",
     ),
     "summarizer": AgentSpec(
         role="summarizer",

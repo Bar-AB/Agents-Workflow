@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 import re
 
-from .config import estimate_cost_usd
+from .config import LoopConfig, estimate_cost_usd
 from .memory import MemoryService
 from .models import (
     PlannedTask,
@@ -14,12 +14,34 @@ from .models import (
     Task,
     TaskStatus,
     TestResult,
+    ToolRequestSource,
+    ToolRequestStatus,
     Verdict,
     VerdictKind,
 )
 from .registry import Registry
 from .runner import ModelRunner
 from .store import Store
+
+# Bound as names, not as a module: `agents.py` binds every import this way, and
+# the byte-for-byte differential neuters this slice by patching
+# `agentloop.agents.tools_for` / `.parse_tool_requests`. Patching the
+# `toolpolicy` module object would be inert here, so the "neutered" run would
+# silently be the live run and the differential would compare a run to itself.
+#
+# `MAX_TOOL_REASON_CHARS` is imported rather than restated: it is one bound on
+# one field, and a second copy beside the parser that already truncates to it
+# would be two numbers that must agree with nothing making them. Public in
+# `toolpolicy` rather than imported under its underscore: a name another module
+# depends on is part of that module's interface whatever it is spelled, and
+# `from .x import _y` only hides the coupling from the reader of `x`.
+from .toolpolicy import (
+    MAX_TOOL_REASON_CHARS,
+    ToolClass,
+    classify,
+    parse_tool_requests,
+    tools_for,
+)
 
 _VERDICT_RE = re.compile(
     r"VERDICT:\s*(approve|revise|escalate)\s*"
@@ -45,6 +67,12 @@ _MAX_TOOL_NAME_CHARS = 200
 # than a tool name: it is a sentence with numbers in it, and truncating it to a
 # name's width would cut off the part worth logging.
 _MAX_RUNNER_NOTE_CHARS = 1000
+
+# Largest reported token count treated as a number rather than as garbage. A
+# bound on the *magnitude*, where the others here bound a length: see
+# `_token_count` for why an unbounded `int` was a money bug rather than an
+# untidy number.
+_MAX_TOKEN_COUNT = 2**53
 
 # How much of a validator's findings section the verdict row keeps. Truncation
 # is acceptable here and deliberately *not* for the charter: the charter is an
@@ -73,6 +101,32 @@ _FINDINGS_END_RE = re.compile(r"\n[ \t]*\n[ \t]*#{1,6}\s")
 
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(.+?)```", re.DOTALL | re.IGNORECASE)
 
+# Which agents may author a tool request. An explicit allowlist, not
+# `kind != "summarizer"`: the summarizer must never be parsed, because its output
+# compresses a transcript that may quote a marker verbatim and parsing it would
+# manufacture a request out of a *quotation*. A negative test would hand marker
+# parsing to any role added later, silently, reintroducing exactly that bug. With
+# an allowlist the failure of omission is "a new role's genuine ask is ignored"
+# -> the tool is withheld -> the safe direction.
+_MARKER_AGENT_KINDS = ("worker", "validator", "planner")
+
+# Which ledger status each policy verdict lands on. A mapping rather than
+# branches, so a `ToolClass` added later fails at the lookup instead of falling
+# through to whichever branch happened to be last.
+#
+# "Fails at the lookup" is only an improvement because the lookup is now done
+# *outside* `_invoke`'s closing transaction. Inside it — where it originally sat —
+# "fails" meant rolling back an already-paid `finish_attempt` and having
+# `_with_retry` buy the completion again, so the missing-branch `KeyError` this
+# mapping exists to raise was a triple charge for a typo in an enum. The
+# discipline is one thing, not two: choose the failing shape *and* put it where
+# failing is cheap.
+_TOOL_CLASS_STATUS = {
+    ToolClass.AUTO: ToolRequestStatus.AUTO.value,
+    ToolClass.GATED: ToolRequestStatus.PENDING.value,
+    ToolClass.UNKNOWN: ToolRequestStatus.REFUSED.value,
+}
+
 # Largest planner reply worth attempting to parse. A real plan is a few KB; far
 # past that the reply is runaway or hostile, and parsing it is the expensive
 # part, so the check belongs before `json.loads`, not after.
@@ -91,6 +145,7 @@ def _invoke(
     tools: list[str] | None = None,
     retrieval: dict | None = None,
     charter_version: int | None = None,
+    config: LoopConfig | None = None,
 ) -> tuple[RunResult, int]:
     """Run one agent invocation with full attempt/metrics bookkeeping.
 
@@ -99,6 +154,14 @@ def _invoke(
     invocation, unlike the variable-length lists `retrieval` and `tool_call`
     record. The caller builds the block and passes the version it built from, so
     the recorded version is by construction the one in the prompt.
+
+    `config` is what makes slice 5 present. **`None` means the slice is absent
+    from this invocation** — no marker parsing, no rows, no events — which is why
+    `run_summarizer` and the eval harness, neither of which has a config to give,
+    behave exactly as they did before it existed. `classify` therefore never sees
+    `None` and keeps a required `config`: a policy function whose config may be
+    missing would have to invent a risk judgment, which is the silent degrade to
+    a working default `retrieval.get_backend` refuses by raising.
     """
     # The model call sits deliberately *between* two transactions, never inside
     # one: the store lock must not be held across a network call. Each paired
@@ -127,28 +190,156 @@ def _invoke(
             {"role": role, "prompt": prompt, "tools": list(tools or [])},
         )
     result = runner.run(system, prompt, model, tools)
+    # The completion is now paid for, and every statement between here and the end
+    # of the closing transaction runs over that payment: a raise discards the
+    # tokens and cost the provider billed and `_with_retry` buys the same
+    # completion again. `notes` and a tool's *name* are coerced at this seam
+    # already, on the stated grounds that the `ModelRunner` protocol is a promise
+    # and not a guarantee — and `output`, the *shape* of `tool_calls` and the cost
+    # call's own arguments were trusted at the same seam, in the same transaction,
+    # for the same money. Each was three paid calls, zero attempt rows, `$0`
+    # measured spend and an `infra_error` pointing the human at the network. So
+    # every value the rest of this function reads off `result` is normalized here,
+    # once, above the transaction.
+    if not isinstance(result.output, str):
+        # A reply that is not text is not work. Coercing it with `str()` would
+        # hand a validator an object's repr to review as a work product; blanking
+        # it takes the existing empty-output rule to NEEDS_HUMAN, which is the
+        # fail-safe direction. **Assigned back onto `result`, not kept as a
+        # local**: `loop.run_task` reads `result.output.strip()` right after this
+        # returns, and that read is *outside* `_with_retry` — `run_task` has no
+        # `except Exception` of its own and neither does `_run_serial` — so a local
+        # would leave a deterministic `AttributeError` one frame up that aborts the
+        # whole batch instead of being retried. A different failure from the
+        # re-charge, and a worse one.
+        result.notes = (
+            f"{_runner_note_repr(result.notes)} / " if result.notes else ""
+        ) + (
+            f"Runner returned a non-str output ({type(result.output).__name__}); "
+            f"recorded as empty, which escalates the task rather than sending a "
+            f"non-text reply to the validator."
+        )
+        result.output = ""
+    else:
+        # `isinstance(str)` bounds the *type* and says nothing about whether the
+        # text can be written down. A lone surrogate (`'\ud83d'`, the high half
+        # of a truncated emoji) is a perfectly ordinary `str` that sqlite cannot
+        # store, so it killed `finish_attempt` itself — the first statement of
+        # the closing transaction, over the paid completion — and `_with_retry`
+        # bought the reply again. `json.loads` on a provider body containing one
+        # produces exactly this, which puts it inside slice 4's shipped
+        # `OpenAICompatRunner` rather than in theory.
+        #
+        # Repaired rather than blanked, unlike the non-`str` case above: that
+        # reply was not text at all, while this one is a real work product with
+        # one unwritable character in it, and blanking it would escalate a task
+        # whose worker did the work. The substitution is visible (the escape
+        # text, not a silent `?`) and audited through the same `runner_warning`
+        # event, so nothing is quietly altered.
+        safe_output = _utf8_safe(result.output)
+        if safe_output != result.output:
+            result.notes = (
+                f"{_runner_note_repr(result.notes)} / " if result.notes else ""
+            ) + (
+                "Runner returned output that is not utf-8-encodable (a lone "
+                "surrogate); the offending characters were escaped so the "
+                "attempt could be recorded."
+            )
+            result.output = safe_output
+    # Audited, not swallowed: `result.notes` is what the `runner_warning` event
+    # below carries, so the degrade lands in `agentloop events`, the REST API and
+    # the SSE feed instead of only in the attempt row's blank output.
+    # The *serving* model, kept distinct from the requested `model` parameter: it
+    # is what the pricing table and the attempt row must both read (slice 4), and
+    # it crosses the seam, so it is coerced like any other reported field.
+    served_model = _tool_name_repr(result.model)
+    tokens_in = _token_count(result.tokens_in)
+    tokens_out = _token_count(result.tokens_out)
+    cache_creation = _token_count(result.cache_creation_tokens)
+    cache_read = _token_count(result.cache_read_tokens)
+    # A clamped count is a **substitution**, and it says so in the audit log. The
+    # surrogate branch above already appends to `notes` for exactly this reason and
+    # this branch did not, which is this project's recurring "coercion at some
+    # sites and not others" shape: the ceiling landed in `attempts` and in
+    # `task_metrics` indistinguishable from a measurement, and the dashboard
+    # renders it as one. Appended to `notes` rather than given an event of its own,
+    # so it rides the `runner_warning` slice 4 added for precisely this class.
+    clamped = [
+        name
+        for name, reported in (
+            ("tokens_in", result.tokens_in),
+            ("tokens_out", result.tokens_out),
+            ("cache_creation_tokens", result.cache_creation_tokens),
+            ("cache_read_tokens", result.cache_read_tokens),
+        )
+        if _clamped_count(reported)
+    ]
+    if clamped:
+        result.notes = (
+            f"{_runner_note_repr(result.notes)} / " if result.notes else ""
+        ) + (
+            f"Runner reported {', '.join(clamped)} above the recordable ceiling "
+            f"({_MAX_TOKEN_COUNT}); the recorded count is that ceiling, which is a "
+            f"substitution and not a measurement."
+        )
     cost = estimate_cost_usd(
-        result.model,
-        result.tokens_in,
-        result.tokens_out,
-        result.cache_creation_tokens,
-        result.cache_read_tokens,
+        served_model, tokens_in, tokens_out, cache_creation, cache_read
     )
+    tool_calls = _tool_call_records(result.tool_calls)
+    # Parsed *before* the closing transaction opens, and deliberately: everything
+    # from here to the end of that block runs over an already-paid
+    # `finish_attempt`, so a raise inside it discards tokens and cost the provider
+    # has billed and `_with_retry` buys the completion again. `parse_tool_requests`
+    # is total on a `str` — which the coercion above is what guarantees, since a
+    # regex over a non-`str` raises — and touches no store, but running it out here
+    # means the regex, the bounds and the dedupe are not even in the transaction's
+    # blast radius.
+    #
+    # The classification and the status lookup are hoisted out here for the same
+    # reason, and it took a review to notice they were not: `classify` reads
+    # `config.tool_readonly_allowlist`, whose type nothing validated, and
+    # `_TOOL_CLASS_STATUS[cls]` is a deliberate `KeyError`. Both were raise-sources
+    # sitting *inside* the paid transaction, one statement below a comment
+    # explaining why raise-sources must be removed from it.
+    #
+    # **What hoisting buys is the rollback, not the re-charge** — an earlier
+    # version of this comment claimed "once instead of three times" and that is
+    # false, measured: `_invoke` runs inside `fn` under `_with_retry`, whose
+    # `except Exception` catches a raise from *anywhere* in this function, so both
+    # positions are re-paid `infra_max_retries + 1` times. Hoisted, the raise
+    # merely happens before any closing write, so there is nothing committed to
+    # roll back. (Not "and no `TransactionAborted` at an outer boundary" — that was
+    # the same overclaim one size smaller: the closing block *is* the outermost
+    # transaction here and nothing encloses it, so that exception was unreachable
+    # from either position and naming it made hoisting sound like it bought a
+    # protection it does not.) The consequence
+    # matters more than the correction: hoisting is *not* an alternative to
+    # removing a raise-source, which is why every value below is coerced and the
+    # config is validated at construction (`config._coerced`) as well.
+    parsed = (
+        parse_tool_requests(result.output)
+        if config is not None and kind in _MARKER_AGENT_KINDS
+        else []
+    )
+    classified = [
+        (p, cls, _TOOL_CLASS_STATUS[cls])
+        for p, cls in ((p, classify(p.tool, config)) for p in parsed)
+    ]
     with store.transaction():
         store.finish_attempt(
             attempt_id,
             result.output,
-            result.tokens_in,
-            result.tokens_out,
+            tokens_in,
+            tokens_out,
             cost,
-            model=result.model,
-            cache_creation_tokens=result.cache_creation_tokens,
-            cache_read_tokens=result.cache_read_tokens,
+            model=served_model,
+            cache_creation_tokens=cache_creation,
+            cache_read_tokens=cache_read,
         )
         # Provenance for what the agent actually did, not just what it said:
         # one event per tool use, in the same transaction as the attempt it
         # belongs to. Slice 5's approval policy layers on top of this record.
-        for call in result.tool_calls:
+        for call in tool_calls:
             store.log_event(
                 task.id,
                 "tool_call",
@@ -180,7 +371,7 @@ def _invoke(
                     "attempt_id": attempt_id,
                     "agent_kind": kind,
                     "role": role,
-                    "model": _tool_name_repr(result.model),
+                    "model": served_model,
                     "usage_estimated": bool(result.usage_estimated),
                     # Coerced for the same reason `tool` is, and it is not
                     # optional: this event shares `log_event`'s one
@@ -190,16 +381,70 @@ def _invoke(
                     "note": _runner_note_repr(result.notes),
                 },
             )
+        # The capability asks this agent wrote in its own reply. No `try`/`except`
+        # anywhere in this loop, by design and not by omission: a swallowed
+        # failure of a *nested* transaction leaves `_txn_aborted` set, so the
+        # outer block rolls back the paid `finish_attempt` above and then raises
+        # `TransactionAborted` at the outermost boundary — turning a one-in-a-
+        # million telemetry hiccup into a guaranteed double charge. The
+        # raise-sources are removed instead: the parse is already done, every
+        # value below is a bounded plain `str`/`bool` before the call,
+        # `tool_request_add` resolves the UNIQUE collision by reading rather than
+        # by letting `INSERT` raise, and `tool_requests` declares no foreign keys.
+        for p, cls, status in classified:
+            store.tool_request_add(
+                task.id,
+                # Two distinct facts, never interchangeable: `role` is the
+                # registry role (`spec.role`), `kind` is the loop's own literal
+                # for which agent ran. A custom `task.worker_role` makes them
+                # differ, and `granted_tools` keys on the role.
+                role=role,
+                agent_kind=kind,
+                tool=_tool_name_repr(p.tool),
+                status=status,
+                source=ToolRequestSource.MARKER.value,
+                reason=_plain_str(p.reason, MAX_TOOL_REASON_CHARS),
+                blocking=bool(p.blocking),
+                attempt_id=attempt_id,
+                why=(
+                    "not a known logical tool name" if cls is ToolClass.UNKNOWN else ""
+                ),
+                # **A blocking ask is exempt from the per-task queue cap.** Over
+                # the cap a request is stored `refused`, and
+                # `pending_blocking_tool_requests` reads `pending` only — so a
+                # capped blocking ask could never park, turning "I cannot finish
+                # without this" into "continue without it and tell no human",
+                # which is the fail-safe inversion this project does not trade.
+                # What the exemption costs is bounded by construction rather than
+                # by trust: only a name in `LOGICAL_TOOL_MAP` and outside the
+                # read-only allowlist can become a *pending blocking* row (an
+                # unknown name is `refused`, a read-only one `auto`), so the
+                # ceiling is those few names times the roles on the task —
+                # single digits, whatever the agent emits.
+                #
+                # Rejected: escalating the refusal instead. `tool_request_decide`
+                # accepts only a `pending` row, so a `refused` row can never be
+                # decided; a task escalating on one would re-escalate every round
+                # with no human action able to clear it. A park nobody can lift is
+                # worse than a queue one row longer.
+                #
+                # `parked` is not passed at all: only the loop's park writes it.
+                max_per_task=None if p.blocking else config.max_tool_requests_per_task,
+            )
         store.log_event(
             task.id,
             f"{kind}_output",
             {
                 "role": role,
                 "output": result.output,
-                "tokens_in": result.tokens_in,
-                "tokens_out": result.tokens_out,
-                "cache_creation_tokens": result.cache_creation_tokens,
-                "cache_read_tokens": result.cache_read_tokens,
+                # The coerced numbers, not the reported ones: this event shares
+                # `log_event`'s one `json.dumps`, so a token field of a type it
+                # cannot encode would raise here — inside the closing transaction,
+                # over the paid `finish_attempt` above.
+                "tokens_in": tokens_in,
+                "tokens_out": tokens_out,
+                "cache_creation_tokens": cache_creation,
+                "cache_read_tokens": cache_read,
                 "cost_usd": cost,
             },
         )
@@ -236,19 +481,134 @@ def _runner_note_repr(value) -> str:
     return _plain_str(value, _MAX_RUNNER_NOTE_CHARS)
 
 
+def _token_count(value) -> int:
+    """A reported token count as a non-negative int, or 0 for anything else.
+
+    The same rule `runner._int_or_zero` applies at the other end of the seam, and
+    for the same reason: a *type* nothing validated (a `'n/a'`, a nested dict)
+    raised after the completion was billed. Here it protects two more statements
+    than it does there — `estimate_cost_usd`'s arithmetic, and the `json.dumps`
+    inside the closing transaction that encodes these numbers into the output
+    event. A wrong number is caught by the runner's own never-zero guard; a raise
+    was caught by nothing that could keep the reply.
+
+    Restated rather than imported: the runner's copy is private and CLAUDE.md
+    documents `extract_openai_usage`'s totality under that name, so the
+    alternative was renaming it public in a module this change does not touch.
+
+    **The magnitude is bounded too, not only the type.** Python's `int` is
+    unbounded, so a 400-digit count — which is what `json.loads` hands back for a
+    provider body carrying one — passed the type guard and then made
+    `estimate_cost_usd`'s `tokens_in * pin` an `OverflowError: int too large to
+    convert to float`. That raise is above the closing transaction, so it cost no
+    attempt row, but `_with_retry` still bought the same completion three times
+    and reported it as `infra_error`. Clamped rather than zeroed because the two
+    directions are not symmetric: a clamp overstates the spend where a 0 would
+    report an unbounded number as free. `2**53` is where an `int` stops being
+    exactly representable as a float, so past it the value is no longer a
+    measurement of anything.
+
+    **How far "overstates" carries is bounded, and the docstring used to overstate
+    it in turn.** The clamp trips the budget cap only if a later
+    **iteration boundary** is reached — that is where the cap is read — so on a
+    single approving round the task reaches DONE carrying the ceiling and no status
+    changes at all. The escalation is therefore a tendency, not a guarantee, and it
+    is not what keeps the substituted number honest: the `runner_warning` event
+    `_invoke` fires for a clamped count is.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    try:
+        return max(0, min(int(value), _MAX_TOKEN_COUNT))
+    except (ValueError, OverflowError):  # inf / nan
+        return 0
+
+
+def _clamped_count(value) -> bool:
+    """Whether `_token_count` had to substitute its ceiling for this value.
+
+    A separate predicate rather than a second return value from `_token_count`:
+    that function has four call sites and a tuple return would rewrite all of them
+    to carry a flag three of them would then have to re-join. Total on the same
+    terms — anything that is not a count at all, or is `inf`/`nan`, is zeroed by
+    `_token_count` rather than clamped, so it is not a substitution of a ceiling
+    and does not report as one.
+
+    Named residual, since the next reader will ask: a *zeroed* count is a
+    substitution too, in the opposite and more dangerous direction (0 understates
+    the spend where the ceiling overstates it), and it fires no warning today. That
+    is a wider gap than this predicate — it would have to distinguish "the provider
+    reported nothing" from "the provider reported garbage", which is
+    `extract_usage`'s never-zero guard one layer down rather than a coercion here —
+    so it is stated rather than quietly implied to be covered.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return int(value) > _MAX_TOKEN_COUNT
+    except (ValueError, OverflowError):  # inf / nan
+        return False
+
+
+def _utf8_safe(text: str) -> str:
+    """A `str` that sqlite and `json.dumps` can both actually write down.
+
+    A lone surrogate passes every `isinstance(str)` check in this module and then
+    raises `UnicodeEncodeError` at the sqlite driver — for `output` and `model`
+    that meant inside `_invoke`'s closing transaction, on the already-paid
+    `finish_attempt`. `backslashreplace` rather than `replace`: the escape keeps
+    the evidence of what the provider sent, where a `?` would erase the one
+    detail a reader would need, and both are equally safe to store.
+
+    Total by contract, like every other coercion here — the surrogate is the only
+    way a `str` fails to encode, and it is handled rather than raised.
+    """
+    return text.encode("utf-8", "backslashreplace").decode("utf-8")
+
+
+def _tool_call_records(value) -> list[dict]:
+    """The tool calls in a reported `tool_calls`, dropping anything that is not one.
+
+    `RunResult.tool_calls` is typed `list[dict]`, which across the `ModelRunner`
+    seam is a promise: `None` made `for call in ...` a `TypeError`, and a list of
+    bare names made `call.get(...)` an `AttributeError` — both inside the closing
+    transaction, over an already-paid `finish_attempt`. This is the seam's existing
+    "nothing recorded rather than a wrong record" contract (`extract_tool_calls`
+    states it) applied to the *shape* of the field and not only to the values in
+    it, so a mis-shaped report costs the provenance of that call rather than the
+    attempt it belongs to.
+
+    The `try` is deliberate and is not the ADR-4 hazard: it is here, in a pure
+    function above the transaction, precisely so that there is none inside it.
+    """
+    try:
+        items = list(value)
+    except Exception:
+        return []
+    return [call for call in items if isinstance(call, dict)]
+
+
 def _plain_str(value, limit: int) -> str:
-    """Any value as a bounded plain string, never raising, never JSON-quoted."""
+    """Any value as a bounded plain string, never raising, never JSON-quoted.
+
+    Bounded *and* encodable: the strings this returns are the served model, a
+    tool name and a request reason, and all three go into a column inside a
+    transaction holding a paid `finish_attempt`, so a lone surrogate anywhere in
+    them is the same money bug as one in `output`. Scrubbed here, once, rather
+    than at each of the three call sites — the companion-write hole this project
+    has opened before is a coercion applied at some sites and not others.
+    """
     if value is None:
         return "unknown"
     if isinstance(value, str):
-        return value[:limit]
+        return _utf8_safe(value)[:limit]
     try:
         text = str(value)
     except Exception:
         # A `__str__` that raises would put us straight back in the transaction
         # this function exists to protect.
         text = f"<unrepresentable {type(value).__name__}>"
-    return text[:limit]
+    return _utf8_safe(text)[:limit]
 
 
 def _tool_input_repr(value) -> str:
@@ -386,6 +746,31 @@ def _test_block(result: TestResult | None) -> str:
     )
 
 
+def _gated_tools(
+    store: Store,
+    config: LoopConfig | None,
+    spec,
+    task_id: int | None,
+    agent_kind: str,
+) -> list[str]:
+    """The tools this invocation may use — the gate's only bite point.
+
+    The SDK executes an agent's tools *inside* `runner.run()`, so nothing after
+    that call can withhold a capability; the `tools` list handed to it is the
+    whole enforcement surface.
+
+    **`config is None` means the slice is absent from this invocation**, not the
+    slice running on defaults: the caller gets `spec.tools` itself, the same list
+    object today's code passes, so `eval` and any other direct caller are
+    byte-identical to the pre-slice-5 loop — `tools` order included, since the
+    `{kind}_prompt` event records it. Stated once here rather than three times at
+    the call sites, because it is a rule the differential measures.
+    """
+    if config is None:
+        return spec.tools
+    return tools_for(store, config, spec, task_id, agent_kind)
+
+
 def run_worker(
     store: Store,
     runner: ModelRunner,
@@ -396,6 +781,7 @@ def run_worker(
     workspace: str | None = None,
     test_result: TestResult | None = None,
     handoff_summary: str | None = None,
+    config: LoopConfig | None = None,
 ) -> RunResult:
     spec = registry.get(task.worker_role)
     prompt = (
@@ -444,9 +830,10 @@ def run_worker(
         spec.model,
         spec.system_prompt,
         prompt,
-        spec.tools,
+        _gated_tools(store, config, spec, task.id, "worker"),
         retrieval,
         charter_version,
+        config,
     )
     return result
 
@@ -519,6 +906,7 @@ def run_planner(
     registry: Registry,
     plan_task: Task,
     memory: MemoryService | None = None,
+    config: LoopConfig | None = None,
 ) -> RunResult:
     """Decompose a goal into a task graph (roadmap slice 3).
 
@@ -554,9 +942,10 @@ def run_planner(
         spec.model,
         spec.system_prompt,
         prompt,
-        spec.tools,
+        _gated_tools(store, config, spec, plan_task.id, "planner"),
         retrieval,
         charter_version,
+        config,
     )
     return result
 
@@ -691,6 +1080,7 @@ def run_validator(
     worker_output: str,
     memory: MemoryService | None = None,
     test_result: TestResult | None = None,
+    config: LoopConfig | None = None,
 ) -> tuple[Verdict, int]:
     spec = registry.get(task.validator_role)
     prompt = (
@@ -718,9 +1108,10 @@ def run_validator(
         spec.model,
         spec.system_prompt,
         prompt,
-        spec.tools,
+        _gated_tools(store, config, spec, task.id, "validator"),
         retrieval,
         charter_version,
+        config,
     )
     return parse_verdict(result.output), attempt_id
 
