@@ -183,6 +183,45 @@ def test_human_redo_resets_context(store):
     assert "human_redo" in kinds and "verdict" in kinds
 
 
+def test_a_redone_task_is_claimable_again(store):
+    """`agentloop redo` on a task the loop had claimed must hand it back to the
+    queue for real. Nothing else in the store clears `claimed_by`, so a redo that
+    only wrote the status left the row `pending` and still leased — and the claim's
+    compare-and-swap can never match that."""
+    task = add_task(store)
+    loop, _ = make_loop(store, ["bad", SEVERE])
+    claimed = store.claim_next_task("loop")
+    loop.run_task(claimed)
+    assert store.get_task(task.id).status == TaskStatus.NEEDS_HUMAN
+
+    loop.human_redo(task.id)
+    assert store.get_task(task.id).claimed_by is None
+    reclaimed = store.claim_next_task("loop")
+    assert reclaimed is not None and reclaimed.id == task.id
+
+
+def test_a_stuck_lease_does_not_starve_other_pending_tasks(store):
+    """The stuck row still matches the claim's SELECT, so it is re-picked and
+    fails the swap on every one of the 100 attempts — starving every clean
+    pending task behind it. Two tasks make that visible: without the release the
+    second one is never handed out either."""
+    held = add_task(store)
+    clean = add_task(store)
+    loop, _ = make_loop(store, ["bad", SEVERE])
+    claimed = store.claim_next_task("loop")
+    assert claimed.id == held.id
+    loop.run_task(claimed)
+
+    loop.human_redo(held.id)
+    first = store.claim_next_task("loop")
+    assert first is not None, "the released task starved the whole queue"
+    # A second claim id, because one id resumes the in-flight work it already
+    # owns rather than reaching past it.
+    second = store.claim_next_task("loop-2")
+    assert second is not None
+    assert {first.id, second.id} == {held.id, clean.id}
+
+
 def test_budget_cap_trips_to_human(store):
     task = add_task(store)
     loop, _ = make_loop(
