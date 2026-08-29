@@ -313,6 +313,12 @@ class MockRunner:
     def __init__(self, outputs: list | None = None):
         self.outputs = list(outputs or [])
         self.calls: list[dict] = []
+        # How many calls ran off the end of the script and got the improvised
+        # reply below. A caller measuring the loop needs this: "(mock output)"
+        # is an unparseable verdict, which escalates, which is the gold status
+        # of most escalation fixtures - so an overrun scores as a pass unless
+        # someone can see it happened.
+        self.unscripted = 0
 
     def run(
         self,
@@ -329,7 +335,11 @@ class MockRunner:
                 "tools": list(tools or []),
             }
         )
-        output = self.outputs.pop(0) if self.outputs else "(mock output)"
+        if self.outputs:
+            output = self.outputs.pop(0)
+        else:
+            self.unscripted += 1
+            output = "(mock output)"
         if isinstance(output, BaseException):
             raise output
         if isinstance(output, RunResult):

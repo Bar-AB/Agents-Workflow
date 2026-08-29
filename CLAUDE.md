@@ -78,6 +78,71 @@ as `infra_error`; a `claude-*` model pinned to the OpenAI backend is refused
 before the call; the bearer token cannot follow a redirect and a non-loopback
 `base_url` must be https; and a degraded run (estimated usage) is recorded as a
 `runner_warning` event rather than printed to stdout where nothing can see it.
+Plus Slice 6: **durability and whole-loop evaluation** — four additions whose
+defining property is what they *don't* touch. (1) **Every task workspace is its
+own git repository** (`vcs.py`): one repo per `.agentloop/ws/task-{id}/`, never
+a shared timeline, so parallel workers cannot collide on an index; each worker
+round commits, DONE writes `refs/agentloop/approved`, and `human_reject` /
+`human_redo` roll back to `refs/agentloop/base` instead of leaving or deleting
+the round. (2) **Infra retry/backoff verified** at the validator and executor
+stages — the behaviour pre-existed in `loop._with_retry`; this slice added the
+coverage, not the code, which is why it appears nowhere in the diff of
+`loop.py`'s retry path. (3) **Batch whole-loop evaluation**
+(`agentloop eval --mode batch`, `eval_runs.kind` discriminating `'verdict'` from
+`'batch'`): 9 fixtures driven through a real `Loop`, measuring the final
+`TaskStatus` against gold rather than one agent's verdict, mock-only and
+refusing a live runner loudly. (4) **Coverage in `test_runs.coverage_percent`**,
+parsed out of the test output already captured — no second subprocess — and
+`NULL` when nothing was reported.
+**No decision rule reads any of it**, and that is the load-bearing claim rather
+than a modest one: no status transition, threshold, revision count or budget
+check consults a `VcsResult`, a commit sha, a coverage number or a batch result.
+A committed AST test walks `loop.py` and fails if one ever does, and
+`vcs_enabled=False` is a *proven* behavioral no-op (an enabled-vs-disabled
+differential over the full observable state, not an inspection). The hard-won
+parts are all containment and honesty about limits, and containment took three
+rounds of measurement because each defeated the previous *shape* of guard. The
+obvious two conditions ("this workspace is its own repo root") are defeated by a
+**junction at `<ws>/.git`** — git derives the worktree from the directory
+*containing* `.git`, not from where `.git` resolves to, so the junction reports
+the workspace as its own toplevel and passes, measured with the victim
+repository's branch rewritten off its own work; hence containment of the
+*resolved* `.git` as well. All four path conditions are then defeated by an
+ordinary file write to **`<ws>/.git/commondir`**, because git resolves its ref
+and object store from that file and `.git` is inside the agent-writable
+workspace — so the guard stopped testing paths and **asked git**: `rev-parse
+--show-toplevel --absolute-git-dir --git-common-dir`, with both resolved git
+locations required to **be** `<ws>/.git` by identity. Containment in
+`workspace_root` was the first shape of that check and was itself an escape:
+`workspace_root` is the parent of *every* task workspace, so it admitted both a
+directory the worker made inside its own workspace and a *sibling task's*
+repository. And all five are orthogonal to
+**what git runs**: `.git/config` is an ordinary file in the workspace, and
+`filter.<name>.clean` / `core.fsmonitor` name programs git executes on an
+ordinary round commit — measured as arbitrary command execution outside the
+workspace under `allow_test_exec=False`. That axis is closed by the **config
+pin**: `init_repo` fingerprints the config git itself wrote, the fingerprint
+lives in the store (`vcs_pins`) where no agent can write, and every
+side-effecting call replays it and refuses on `"config-changed"` /
+`"config-unpinned"`. A denylist was never available — filter names are
+arbitrary, so there is no key to pin. Rollback keeps history through a **pre-written**
+`refs/agentloop/discarded/<sha>`, because `reset --hard` orphans the commits it
+moves off and `git show <sha>` resolves an orphan perfectly well, so
+recoverability must be asserted on *reachability* (`git log --all`) and never on
+`git show`; the round commit **force-adds ignored files** (`add -A -f`) so that
+everything the rollback's `clean -ffdqx` deletes is genuinely recoverable, at the
+cost of committing a worker-generated build directory each round; and a
+worker-created *nested* repository is a documented residual — git can only record
+it as a bare gitlink, so its objects do not survive a rollback, which the
+`vcs_rollback` payload names per-rollback via `unrecoverable_nested_repos`
+rather than letting the audit log assert a recovery surface that does not hold
+the work. Second residual, in the same register: with `vcs_enabled=True` the
+operator's `test_command` now runs *inside a git repo* where it previously did
+not, which ignore-aware linters, coverage source discovery and `git ls-files`
+collectors can all notice. That one is *unprovable here* rather than merely
+unproven — the inertness differential runs with test execution off and
+structurally cannot see it — so it is documented in README's residual list
+instead of claimed away.
 
 ## Commands
 - Install: `pip install -e ".[dev]"` (add `.[claude]` for the real runner)
@@ -92,7 +157,9 @@ before the call; the bearer token cannot follow a redirect and a non-loopback
   `agentloop memory list|approve|reject|add|pin|unpin` (`add --pinned`),
   `agentloop charter show [--version N]|set --file|--text [--note]|clear|history`
   (the human-only write surface for project-wide rules),
-  `agentloop eval --runner mock|claude` (validator calibration)
+  `agentloop eval --runner mock|claude --mode verdict|batch`
+  (`verdict` = validator calibration; `batch` = whole-loop decision rules,
+  mock-only)
 - Dashboard: `cd web && npm install && npm run build`, then `agentloop serve`
   (frontend checks: `npm run typecheck`, `npm run build`)
 
@@ -110,7 +177,14 @@ before the call; the bearer token cannot follow a redirect and a non-loopback
   "search", "task_state"]` by default — read-only requests auto-approve; `web`
   deliberately excluded because it egresses the prompt), `gate_declared_tools`
   (default False), and `max_tool_requests_per_task` (10, counting **pending**
-  rows only, with a blocking ask exempt). Knob validation: `LoopConfig.__post_init__`
+  rows only, with a blocking ask exempt). Durability knobs (slice 6):
+  `vcs_enabled` (default True — off is a *proven* behavioral no-op, not merely a
+  documented one), `vcs_command` (default `"git"`) and `vcs_timeout_s` (30).
+  `vcs_command` is an executable **path, not a command line** — deliberately
+  unlike `test_command`, which is a command line and goes through
+  `split_command`; `"git --no-pager"` is therefore one executable name that
+  fails as `"git-missing"`, which is why the README's knob table says so rather
+  than leaving it to be discovered. Knob validation: `LoopConfig.__post_init__`
   normalizes field types by declared annotation, so a `null` list becomes `[]`,
   but a bare string raises, because `x in "string"` is a substring test that
   fails **open** on a permission allowlist — this is the layer that catches a
@@ -151,7 +225,11 @@ before the call; the bearer token cannot follow a redirect and a non-loopback
   pair across two files would let a config edit produce a combination that
   cannot run; defaulted, so an agents.json predating it still loads through
   `AgentSpec(**spec)`), RunResult, PlannedTask (a planner-proposed
-  graph node, with a local `ref` that expresses edges before db ids exist).
+  graph node, with a local `ref` that expresses edges before db ids exist), and
+  `TestResult.coverage_percent` (slice 6): `float | None`, defaulted, where
+  `None` is the honest value for "the command reported none" and the type is
+  optional rather than `0.0` precisely so nothing downstream can read an absent
+  measurement as a low one.
 - `store.py` — SQLite source of truth. Tables: tasks (incl. a `control` column:
   run/pause/abort, written only by `set_control`; and a `claimed_by` lease
   column, written only by `claim_next_task`), attempts (per-invocation
@@ -159,8 +237,21 @@ before the call; the bearer token cannot follow a redirect and a non-loopback
   `cache_read_tokens`, plus `charter_version`), verdicts (incl. `findings`),
   events (append-only audit log — never UPDATE/DELETE), memory (two tiers
   project/loop; reads gated on `approved`, which a value change revokes; `pinned`
-  flag; `last_used_at` set by `memory_read`), memory_hits, charter, test_runs,
-  eval_runs, tool_requests (the capability ledger: one row per ask for one logical
+  flag; `last_used_at` set by `memory_read`), memory_hits, charter, test_runs
+  (incl. `coverage_percent REAL`, nullable *because* NULL is the honest value —
+  a `NOT NULL DEFAULT 0` here would have made "no coverage reported" read as
+  "0% covered", and a schema column can only be added, never corrected, since
+  `_migrate` only adds), eval_runs (incl. `kind TEXT NOT NULL DEFAULT 'verdict'`
+  discriminating per-verdict calibration from a slice-6 whole-loop batch run —
+  the default is not a placeholder but the correct value, since per-verdict was
+  the only harness that existed when the pre-existing rows were written),
+  vcs_pins (one row per task — `task_id` *is* the primary key — holding the
+  fingerprint of the `.git/config` `vcs.init_repo` watched `git init` write:
+  the pin has to live where an agent has no write path, and `.git/config` is
+  inside the workspace it is defending. A live fact with one current value, not
+  history, so a re-created workspace *replaces* its pin; an absent row is
+  `""`, which every side-effecting `vcs` call refuses on),
+  tool_requests (the capability ledger: one row per ask for one logical
   tool, for one task, by one role; `UNIQUE(task_id, role, tool)` and deliberately
   no foreign keys — an FK would raise inside a paid transaction; an `auto`/`approved`
   row *is* the grant — no separate grant table, so a permission never exists without
@@ -392,6 +483,21 @@ before the call; the bearer token cannot follow a redirect and a non-loopback
   calibration report at exit 0, and a calibration number that measured nothing
   is worse than none. Invocations run against a scratch
   in-memory store so they don't pollute the task board.
+  Slice 6 adds the second mode: `run_batch_eval` drives each of `BATCH_FIXTURES`
+  (9 of them) through a real `Loop` and measures the final `TaskStatus` against
+  gold, so "agreement" means *the decision rules landed the task where they
+  should have* rather than *the validator returned the right verdict kind* —
+  the same word measuring two different things, which is why `eval_runs.kind`
+  has to exist rather than the rows merely coexisting. Each fixture gets its own
+  in-memory store, scripted `MockRunner`, `allow_test_exec=False` and
+  `vcs_enabled=False`, so a batch run is deterministic and touches nothing but a
+  temp directory; only the summary row lands in the real store. **Mock-only, and
+  it refuses a non-mock runner loudly** — a batch run against a live provider
+  would be measuring the model rather than the rules, and `eval`'s own history
+  (the `--runner openai` fall-through that printed scripted numbers as a
+  measurement) is the reason that refusal is loud instead of a silent fallback.
+  The fixture list tracks the decision rules: a slice that adds a rule adds a
+  fixture.
 - `agents.py` — prompt building for worker/validator/summarizer/planner; verdict
   and plan parsing.
   `run_planner` decomposes a goal (its own `planner` attempt on the plan row);
@@ -439,6 +545,134 @@ before the call; the bearer token cannot follow a redirect and a non-loopback
   `ANTHROPIC_API_KEY`). `sandbox_isolation='strict'` requests a container/
   no-network tier and degrades to env-scrub with a warning when none is wired
   (documented residual risk: fs/network still open in the env-scrub tier).
+  Slice 6 adds two things here. `_has_any_file` now **skips `.git`** (matched on
+  the path *component*, so `src/.gitignore` still counts): every workspace is a
+  repo now, and counting git's own objects would stop a genuinely empty
+  workspace reporting `status='na'` and instead run the test command against
+  nothing — the one way per-task repos could silently move the *tests gate*, the
+  single thing this slice promised not to touch. And `parse_coverage(output)` is
+  a pure, total function returning `None` or a float in `[0, 100]`, where `None`
+  means "no coverage was reported" and never "0%". **Its ambiguity resolves the
+  opposite way from `agents._extract_findings`**, deliberately: over-reading
+  findings stores stray prose a human reading a verdict can discount, whereas a
+  fabricated coverage number renders on the dashboard as a *measurement*, so two
+  disagreeing TOTAL rows (a multi-suite run) are `None` rather than a guess. The
+  text it parses includes model-written output — a worker can print
+  `TOTAL … 100%` — which is tolerable only because no decision rule reads it;
+  promoting it to evidence would need a different source. `clear_workspace` also
+  gained a read-only-retry handler: `rmtree(ignore_errors=True)` cannot delete
+  the read-only objects git writes, so before slice 6 fixed it the redo fallback
+  left the workspace standing with the previous round still in it.
+- `vcs.py` — **per-task workspace version control (slice 6).** One throwaway git
+  repo per `.agentloop/ws/task-{id}/`, no remote and no shared timeline, so
+  `redo`/`reject` recover the discarded round instead of destroying it.
+  Deliberately *not* in `executor.py`, but **not** because the threat model is
+  narrower — it is a different shape. `executor.py` runs arbitrary AI-generated
+  code; this module runs its own fixed commands, but it runs them *inside a
+  directory that code writes to*, so **both** axes are live and the module
+  defends both. **Aim** — in a workspace with no `.git`, `git rev-parse
+  --show-toplevel` walks up and answers with the operator's real repository, so
+  an unguarded `add -A && commit` stages and commits their whole working tree.
+  **Execution** — a fixed argv is not a fixed *program list*: git config names
+  programs git runs, and `.git/config` lives inside the workspace.
+  Hence `_guard`'s four *path* conditions before any side-effecting command:
+  `<ws>/.git` is a directory, git's toplevel for that cwd *is* the workspace, the
+  resolved workspace is inside `workspace_root`, and the **resolved location of
+  `<ws>/.git`** is too. The fourth is not a restatement of the third — git
+  derives the worktree from the directory *containing* `.git`, so a junction at
+  `<ws>/.git` pointing at the real repo passes the first three (measured, branch
+  pointer rewritten). Any error computing any condition refuses: a guard that
+  errors is a guard that says no.
+  **And then it asks git where it actually is, which is the layer to leave
+  alone.** All four conditions above test *filesystem paths*, and a path test is
+  a guess at what git will make of the path. `.git` is inside the
+  agent-writable workspace and git reads its ref and object store from
+  `.git/commondir`, so **one ordinary file write** at `<ws>/.git/commondir` — no
+  junction, no gitfile, no environment variable — redirected every ref and
+  object write into the operator's repository with all four path conditions
+  holding: measured, guard True, `commit` ok=True, the victim's branch pointer
+  rewritten. A fifth path check would be the same mistake one level deeper, so
+  the guard's single `rev-parse --show-toplevel` is
+  `rev-parse --show-toplevel --absolute-git-dir --git-common-dir` and **both**
+  resolved git locations must **be** `<ws>/.git` by identity — *not* merely lie
+  inside `workspace_root`, which is what this check required at first and which
+  was itself an escape: `workspace_root` holds every task workspace, so
+  containment admitted a directory the worker made inside its own workspace
+  (redirecting the parsed config while the pinned file stayed byte-identical)
+  and a sibling task's repository (aiming one task's `reset --hard` /
+  `clean -ffdqx` at another's history). Reading the location
+  git *resolved* rather than the one the filesystem suggests closes commondir,
+  gitfiles, `GIT_DIR`, worktree links and the next redirect at once — which is
+  why the extra two outputs are not redundant, and why collapsing them back to
+  `--show-toplevel` reopens a critical.
+  **The config pin closes the execution axis, and it is an allowlist because a
+  denylist cannot exist here.** `filter.<name>.clean` and `core.fsmonitor` name
+  programs git executes on an ordinary `add`/`commit`, and a filter name is
+  arbitrary — there is no key to enumerate, so "block the dangerous settings" is
+  not a reachable design. Measured before the pin, with the worker writing only
+  inside its own workspace: `git config --local filter.pwn.clean <python>` plus
+  a `.gitattributes`, guard True before *and* after, `commit` ok=True, canary
+  written outside the workspace; `core.fsmonitor` did it with no `.gitattributes`
+  at all. Note the configuration that bit: `allow_test_exec=False` (the
+  operator's explicit *"execute nothing the agent wrote"* switch) with
+  `vcs_enabled=True` (the default), from a call the loop makes **every round**
+  and from `human_reject`/`human_redo` on the dashboard — so the durability
+  feature was handing back the execution the sandbox switch had just refused.
+  So `init_repo` **mints** a pin — `config_pin(ws)`, a bounded read and a
+  blake2b of the `.git/config` git itself just wrote — and returns it on
+  `VcsResult.pin`; the caller records it in the **store** (`Store.set_vcs_pin`),
+  which is the one place in this system an agent has no write path to, and a pin
+  kept anywhere under `.git/` or the workspace would be exactly as writable as
+  the attack it is meant to catch. Every side-effecting entry point takes
+  `pin=` and refuses on a mismatch, an unreadable config or a missing pin
+  (`"config-changed"` / `"config-unpinned"`), and the check runs **before any
+  subprocess** — it is a file read and a hash, cheap enough for the per-round hot
+  path, and nothing may spawn under a config this module did not write — a
+  guarantee that holds only in union with `_guard`'s **git-reported** check (the
+  fifth, after the four path conditions above), which
+  require the resolved git dir *and common dir* to **be** `<ws>/.git` by
+  identity rather than merely to sit inside `workspace_root`: git parses
+  `config` from the common dir, so containment alone let a worker redirect
+  `.git/commondir` at a directory inside its own workspace and own the parsed
+  config while the fingerprinted file stayed byte-identical (and let `<ws>/.git`
+  resolve into a *sibling task's* repository). The read is also of a **regular**
+  file only — `stat()` reports `st_size == 0` for a FIFO, so the size bound
+  alone would pass one and block the read forever, with no timeout. Three
+  properties make it hold rather than merely look like it holds: git was
+  *measured* never to rewrite `.git/config` during any command this module
+  issues (`init`, `add`, `commit`, `update-ref`, `status`, `rev-parse`,
+  `reset --hard`, `clean`), so a change is always somebody else's; the mint
+  happens on exactly the branch that *creates* the repo, never on one it found,
+  because re-pinning an existing repository would bless the edit on the next
+  round and turn the gate into the attacker's signature; and `""` is checked
+  first, so an unpinned caller cannot match an unreadable config by comparing
+  `""` to `""`. `is_repo` deliberately takes no pin — it is a containment
+  observation with no side effect, so a True there does not promise a later
+  `commit` is accepted. `rollback` writes
+  `refs/agentloop/discarded/<sha>` **before** anything moves — named for the sha
+  and not a counter, because a counter is a read-then-write that two rollbacks
+  can collide on and `update-ref` overwrites silently, losing exactly the history
+  the ref exists to keep while reporting `ok=True`. The identity is passed per
+  invocation (`-c user.name/-c user.email`) and the operator's config is
+  neutralised twice over (`GIT_CONFIG_GLOBAL=os.devnull` plus
+  `-c commit.gpgsign=false -c core.hooksPath=`, `-c init.templateDir=` on init):
+  `GIT_CONFIG_NOSYSTEM` leaves `~/.gitconfig` live, where a plain
+  `commit.gpgsign=true` was measured to fail every commit and a `core.hooksPath`
+  hook to run inside the workspace and write outside it. Its own
+  `_child_env()` over `_GIT_ENV_ALLOWLIST`, not `executor._child_env` (a
+  *method*, reading `self.env_allowlist`) and taking no config, because the one
+  knob it could read is `sandbox_env_allowlist` — the test sandbox's knob, which
+  would let an operator re-admit precisely what this env removes. **Every entry
+  point is total**: `init_repo`/`commit`/`mark_approved`/`rollback` always return
+  a JSON-encodable `VcsResult` and `is_repo` always returns a `bool`, so a caller
+  may ignore the result entirely — durability must never fail an attempt.
+  `VcsResult.reason` is a closed vocabulary (`"disabled"`, `"git-missing"`,
+  `"no-workspace"`, `"git-failed"`, `"timeout"`, `"not-a-workspace-repo"`,
+  `"config-unpinned"`, `"config-changed"`, `"already"`, `"residue"`,
+  `"unrecorded"`) and is `""` *exactly* when nothing degraded;
+  `"no-workspace"` exists because `subprocess.run` raises `FileNotFoundError` for
+  a missing `cwd` exactly as for a missing executable, and reporting that as
+  `"git-missing"` told an operator to install git they already had.
 - `memory.py` — two-tier policy: approved-only reads, unapproved agent writes,
   `hit_count`-based project→loop promotion (`_record_reads` bumps only facts a
   ranked injection scored above zero, and only once per `task_id`;
@@ -530,6 +764,36 @@ before the call; the bearer token cannot follow a redirect and a non-loopback
   role missing from the registry resolves to the default rather than raising, so
   `run_summarizer`'s deliberate fallback for an older agents.json still degrades
   instead of crashing.
+  The slice-6 durability wiring is **six call sites and no logic**: `run_task`
+  initialises the repo once per invocation and commits each round, carrying the
+  workspace's config pin — read from `Store.vcs_pin`, recorded through
+  `set_vcs_pin` on the one branch that *creates* a repo (`VcsResult.pin` is
+  non-empty only there, including on a failed init, since a pin nobody recorded
+  is a workspace nothing can act on again) and replayed on every later call; `_vcs_mark_approved`
+  moves `refs/agentloop/approved` when a task reaches DONE — by the rules *or*
+  by `human_approve`, which for `risk_level >= human_review_risk_level` is the
+  only route to DONE, so omitting it would leave the approved ref absent for
+  exactly the tasks a human vetted — and `_vcs_rollback_to_base` returns the
+  workspace to `refs/agentloop/base` on `human_reject` and `human_redo`. Always
+  to `base`, never to the approved ref: that ref is a bookmark a human placed,
+  and rolling onto it would let a reject of a later round silently resurrect an
+  earlier approved one. Every call is *call, log, discard*; the one branch
+  (`human_redo` choosing between the rollback and `clear_workspace`) reads
+  `VcsResult.ok`/`reason` to pick a **filesystem shape**, never a status. Two
+  invariants make that structural rather than stylistic: **no git subprocess runs
+  inside `Store.transaction()`** (the connection lock is held across execute and
+  commit, so a 30-second `vcs_timeout_s` in there would stall every dashboard
+  reader, and a raise would roll back the paired audit event) — so each `vcs_*`
+  event is a standalone `log_event`, correct because it is a pure audit fact with
+  no row change to pair with; and `_vcs_degraded` excludes `"disabled"` and
+  `"already"` from the degradation path, because a deliberate configuration is
+  not a degradation and an idempotent no-op is a success — logging them would
+  have put a row and a `RuntimeWarning` on each of the ~300 loop tests that run
+  with vcs off. `human_redo`'s fallback is likewise not unconditional: when a
+  rollback fails *after* recording the discarded tip, the wipe is skipped and the
+  gap audited (`history_preserved`), since `clear_workspace` would rmtree exactly
+  the ref `vcs.rollback` had just refused to lose, under a warning reading
+  "nothing happened".
 - `server.py` — REST + SSE dashboard backend, stdlib `http.server` only. The
   append-only `events` table *is* the change feed: SSE is a `WHERE id > cursor`
   query, so reconnects resume losslessly via `Last-Event-ID` and the dashboard
@@ -540,9 +804,19 @@ before the call; the bearer token cannot follow a redirect and a non-loopback
   the loud write-time refusal that pays for never truncating at inject time.
   `--runner claude|openai|mock` appears on **four** subcommands (`plan`, `run`,
   `serve`, `eval`) and sets only the loop's *default* backend; per-role pins are
-  an agents.json decision and are applied on top of it.
+  an agents.json decision and are applied on top of it. `eval` additionally
+  takes `--mode verdict|batch` (slice 6); `--mode batch` with a non-mock
+  `--runner` is refused with a non-zero exit rather than quietly downgraded.
 - `web/` — Vite + React + TypeScript dashboard. `types.ts` mirrors the server's
-  JSON shapes; keep them in sync when changing an endpoint.
+  JSON shapes; keep them in sync when changing an endpoint. `test_runs` reaches
+  the API wholesale (`server.py` returns the rows), so `coverage_percent` needed
+  no server change — and `TaskDetail` renders it **only when it is not null**,
+  with no placeholder at all, because a dash or a `0%` in that slot would show an
+  absent measurement as a measured one. The three `vcs_*` event digests in
+  `EventFeed` follow the same rule at a finer grain: `discarded_sha`,
+  `discarded_ref`, `degraded` and `unrecoverable_nested_repos` are **absent, not
+  null**, when they do not apply, so each is tested before it is rendered and the
+  nested-repo line names the gap rather than implying a recovery surface.
 
 ## Decision rules (do not change without updating tests + README)
 - approve + confidence ≥ approve_threshold (0.70) + tests not failing → DONE,
@@ -847,6 +1121,36 @@ before the call; the bearer token cannot follow a redirect and a non-loopback
   `capability_live`, because a granted in-process tool (`task_state`) confers no
   concrete capability and is still genuinely in force, so the concrete list would
   strip the green off a real grant.
+- **Slice 6 adds no decision rule**, and the negative is stated here rather than
+  left implicit because a durability layer is exactly the kind of addition that
+  grows one by accident. No status transition, threshold, revision count or
+  budget check reads a `VcsResult`, a commit sha, `test_runs.coverage_percent`
+  or a batch-evaluation result; every `vcs.*` call in `loop.py` is *call, log,
+  discard*. Unlike slice 4's provider rule and slice 5's gate rule, which are
+  argued, this one is **enforced**:
+  `test_vcs_loop.py::test_no_status_write_is_downstream_of_a_vcs_result` walks
+  `loop.py`'s AST and fails if a vcs result ever flows into a status write, and
+  `::test_vcs_disabled_and_enabled_produce_identical_observable_state` runs the
+  same task with the feature on and off and diffs the whole observable state, so
+  `vcs_enabled=False` is a proven no-op rather than a documented intention.
+  Coverage is a *display value*, not evidence — nothing may promote it to
+  evidence without a different source, since the text it is parsed from includes
+  model-written output a worker can fabricate.
+- What slice 6 *does* change is the **workspace contract of `reject` and
+  `redo`**, which is a behaviour change with no status attached and therefore
+  belongs here as well as in the README. `human_reject` now rolls the workspace
+  back to `refs/agentloop/base` instead of leaving the rejected round in place,
+  and `human_redo`'s "fresh start, no carried context" now means *emptied*
+  rather than *destroyed*: `vcs.rollback` writes
+  `refs/agentloop/discarded/<sha>` at the tip before anything moves, so the
+  discarded round stays reachable from `git log --all`. The rollback target is
+  always `base` and never the approved ref, because the approved ref is a
+  bookmark a human placed and rolling onto it would let a reject of a later round
+  silently resurrect an earlier approved one. The statuses, the revision count
+  and the audit trail are exactly what they were; only what is left on disk
+  differs — and on a pre-slice-6 workspace with no `.git`, not even that: the
+  guard refuses, reject leaves the tree untouched and redo falls back to the
+  wipe, which is the pre-slice-6 behaviour precisely.
 
 ## Conventions
 - Python ≥ 3.10, stdlib-only core (no runtime deps); claude-agent-sdk and
@@ -896,6 +1200,17 @@ before the call; the bearer token cannot follow a redirect and a non-loopback
    CLI `agentloop tools` surface, dashboard tools panel, and the fixed
    `Store.release_claim` that makes `agentloop redo <id>` recover stranded
    claims in `main`.
-6. git-commit-per-task rollback; infra retry/backoff (distinct from "revise");
-   batch whole-loop evaluation; coverage in test_runs.
+6. ~~git-commit-per-task rollback; infra retry/backoff (distinct from "revise");
+   batch whole-loop evaluation; coverage in test_runs.~~ **Done (Slice 6)** —
+   `vcs.py` gives every task workspace its own git repo (round commits,
+   `refs/agentloop/base`/`approved`, and a pre-written
+   `refs/agentloop/discarded/<sha>` that is what makes a rolled-back round
+   recoverable), wired at six call sites in `loop.py` that read nothing;
+   `agentloop eval --mode batch` + `eval_runs.kind` measure the decision rules
+   end to end; `test_runs.coverage_percent` records what the test output already
+   reported, NULL when it reported none. The infra-retry half was **already
+   deduped into the decision-rules section in slice 0** — `loop._with_retry`
+   shipped then and this slice changed none of it; what it added is the missing
+   coverage at the validator and executor stages, which is why "verified" and
+   not "implemented" is the honest word for that quarter of the item.
 7. Office-metaphor visualization layered on the existing dashboard data.

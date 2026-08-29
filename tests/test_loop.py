@@ -6,7 +6,9 @@ from pathlib import Path
 import pytest
 
 from agentloop.agents import _MAX_TOOL_INPUT_CHARS
+from agentloop import loop as loop_module
 from agentloop.config import LoopConfig
+from agentloop.executor import TestExecutor
 from agentloop.loop import Loop
 from agentloop.models import RunResult, Task, TaskStatus
 from agentloop.registry import Registry
@@ -37,6 +39,9 @@ def make_loop(store, outputs, **cfg_overrides):
     # and test execution is off unless a test explicitly opts in.
     cfg_overrides.setdefault("workspace_root", str(Path(store.db_path).parent / "ws"))
     cfg_overrides.setdefault("allow_test_exec", False)
+    # Slice 6: git is off in the loop tests. A repo per workspace would
+    # spawn real subprocesses in ~300 tests that are not about durability.
+    cfg_overrides.setdefault("vcs_enabled", False)
     config = LoopConfig(db_path=store.db_path, **cfg_overrides)
     runner = MockRunner(outputs)
     return Loop(store, runner, Registry.load(), config), runner
@@ -285,6 +290,140 @@ def test_infra_error_is_not_a_revision(store):
 
     assert task.status == TaskStatus.DONE
     assert task.revision_count == 0  # retry != revise
+
+
+# The stage tests above cover the *worker* call only. `_with_retry` wraps three
+# more call sites, and "a retry is not a revision" is a claim about the helper,
+# not about one caller. The two below pin the other two stages a task passes
+# through in a normal round, and the third pins the backoff the helper applies
+# between attempts — which no existing test could see, because the default
+# `infra_retry_backoff_s` is 0.0 and the sleep is skipped entirely.
+
+
+def _record_sleeps(monkeypatch) -> list[float]:
+    """Attach a recorder to the sleep the retry loop actually calls.
+
+    `loop.py` binds `import time` as a module, so the live call site is
+    `agentloop.loop.time.sleep` and patching it there is patching the one the
+    production branch reaches."""
+    delays: list[float] = []
+    monkeypatch.setattr(loop_module.time, "sleep", delays.append)
+    return delays
+
+
+class _FlakyExecutor(TestExecutor):
+    """A TestExecutor whose first `run` raises, then delegates to the real one.
+
+    `Loop(..., executor=…)` is the existing injection seam; nothing is patched."""
+
+    __test__ = False
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.calls = 0
+
+    def run(self, workspace):
+        self.calls += 1
+        if self.calls == 1:
+            raise OSError("sandbox spawn failed")
+        return super().run(workspace)
+
+
+def test_infra_error_at_the_validator_stage_is_not_a_revision(store):
+    """A transient failure of the *validator* call is retried to success and
+    does not consume a revision — the worker is not re-run and the verdict that
+    lands is the one the retry produced."""
+    task = add_task(store)
+    loop, _ = make_loop(
+        store,
+        ["worker output", RuntimeError("API 503"), APPROVE],
+        infra_max_retries=2,
+    )
+    loop.run_task(task)
+
+    assert task.status == TaskStatus.DONE
+    assert task.revision_count == 0  # retry != revise
+    stages = [
+        e["payload"]["stage"]
+        for e in store.events(task.id)
+        if e["kind"] == "infra_error"
+    ]
+    assert stages == ["validator"]
+    # One worker attempt, and the validator attempt that finally returned.
+    assert store.task_metrics(task.id)["verdicts"][0]["kind"] == "approve"
+
+
+def test_infra_error_at_the_executor_stage_is_not_a_revision(store, tmp_path):
+    """A transient failure of the *executor* call is retried to success, does
+    not consume a revision, and the retried run's result is still recorded as a
+    test_run row — the retry replaces the failed call, it does not skip it."""
+    task = add_task(store)
+    config = LoopConfig(
+        db_path=store.db_path,
+        workspace_root=str(tmp_path / "ws"),
+        allow_test_exec=False,
+        infra_max_retries=2,
+    )
+    flaky = _FlakyExecutor(enabled=False)
+    loop = Loop(
+        store,
+        MockRunner(["worker output", APPROVE]),
+        Registry.load(),
+        config,
+        executor=flaky,
+    )
+    loop.run_task(task)
+
+    assert task.status == TaskStatus.DONE
+    assert task.revision_count == 0  # retry != revise
+    stages = [
+        e["payload"]["stage"]
+        for e in store.events(task.id)
+        if e["kind"] == "infra_error"
+    ]
+    assert stages == ["executor"]
+    assert flaky.calls == 2  # raised once, then delegated
+    assert len(store.test_runs(task.id)) == 1
+
+
+def test_infra_retry_backoff_is_bounded_and_exponential(store, monkeypatch):
+    """The backoff between retries doubles, is bounded by `infra_max_retries`,
+    and is skipped entirely when the knob is 0.
+
+    The zero-backoff half is the control: it varies the *config* so the other
+    side of `if delay > 0` runs, which is what proves the recorder is attached
+    to the live call site rather than passing vacuously."""
+    delays = _record_sleeps(monkeypatch)
+    task = add_task(store)
+    boom = RuntimeError("API 503")
+    loop, _ = make_loop(
+        store,
+        [boom] * 4,
+        infra_max_retries=3,
+        infra_retry_backoff_s=0.01,
+    )
+    loop.run_task(task)
+
+    assert task.status == TaskStatus.NEEDS_HUMAN
+    assert delays == [0.01, 0.02, 0.04]  # doubling, one per retry, then give up
+    events = [e for e in store.events(task.id) if e["kind"] == "infra_error"]
+    assert len(events) == 4  # infra_max_retries + 1 attempts, all logged
+    assert [e["payload"]["attempt"] for e in events] == [1, 2, 3, 4]
+
+    # Control: same scenario, backoff turned off -> the sleep never runs.
+    delays.clear()
+    other = add_task(store)
+    loop2, _ = make_loop(
+        store,
+        [boom] * 4,
+        infra_max_retries=3,
+        infra_retry_backoff_s=0.0,
+    )
+    loop2.run_task(other)
+
+    assert other.status == TaskStatus.NEEDS_HUMAN
+    assert delays == []
+    assert len([e for e in store.events(other.id) if e["kind"] == "infra_error"]) == 4
 
 
 def test_relevant_memory_is_retrieved_into_the_worker_prompt(store):

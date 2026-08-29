@@ -50,6 +50,7 @@ def _cfg(store):
         db_path=store.db_path,
         workspace_root=str(Path(store.db_path).parent / "ws"),
         allow_test_exec=False,
+        vcs_enabled=False,  # slice 6: no git subprocess here
     )
 
 

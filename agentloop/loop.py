@@ -135,10 +135,15 @@ is recorded as a `test_disagreement` event — the loop measures its validators.
 
 from __future__ import annotations
 
+import shutil
 import threading
 import time
 import warnings
+from pathlib import Path
 
+# The **module**, never its names: P5/P6 patch this module attribute, and a
+# direct name binding would make that patch inert (`agents.py` is the scar).
+from . import vcs
 from .agents import (
     PlanError,
     parse_plan,
@@ -221,6 +226,39 @@ class _ConfigError(Exception):
 # endpoint it is a guaranteed 404, so it is refused before the call rather than
 # after three paid round trips.
 _CLAUDE_MODEL_PREFIXES = ("claude-", "anthropic/")
+
+
+def _clear_worktree(ws) -> bool:
+    """Remove everything in a workspace **except** its `.git`, and report
+    whether the working tree is empty afterwards.
+
+    Redo's fresh start and the recovery ref are not in conflict, and the fix
+    for a rollback that left residue behind a written ref is not to choose
+    between them: `clear_workspace` rmtrees `.git` and with it the discarded
+    ref the audit event just named a human at, while leaving the tree alone
+    breaks the "no carried-over context" promise. This keeps the repo — the
+    next `init_repo` is idempotent — and clears what the next round would
+    otherwise inherit.
+
+    Total, like `clear_workspace`: never raises, and the answer is the observed
+    state of the filesystem rather than a guess from which branch ran."""
+    try:
+        ws = Path(ws)
+        if not ws.is_dir():
+            return True
+        for child in ws.iterdir():
+            if child.name == ".git":
+                continue
+            try:
+                if child.is_dir() and not child.is_symlink():
+                    shutil.rmtree(child, ignore_errors=True)
+                else:
+                    child.unlink(missing_ok=True)
+            except Exception:
+                pass
+        return not any(child.name != ".git" for child in ws.iterdir())
+    except Exception:
+        return False
 
 
 def _check_model_for_backend(role: str, model: str, backend: ModelRunner) -> None:
@@ -684,6 +722,143 @@ class Loop:
             self.store.set_status(task, TaskStatus.DONE)
         return self._require(plan_id)
 
+    # -- durability (slice 6): call, log, discard -----------------------------
+    #
+    # Every one of these is orchestration with **no logic in it**: no status,
+    # threshold, revision count or budget rule reads a `VcsResult` (DD-8), and
+    # none of them runs inside an open `Store.transaction()` (DD-10) — a 30s
+    # `vcs_timeout_s` there would stall every dashboard reader on the shared
+    # connection, and a raise would roll back the paired audit event.
+
+    def _vcs_degraded(
+        self, task_id: int, op: str, result, extra: dict | None = None
+    ) -> None:
+        """Record a durability degradation where something can see it.
+
+        `"disabled"` and `"already"` never arrive here (F15c): a deliberate
+        config choice is not a degradation, and an idempotent no-op is a
+        success. Logging them would put a row and a `RuntimeWarning` on every
+        run of the ~300 loop tests that switch vcs off.
+
+        Both channels, per the `executor.py` precedent: a warning alone reaches
+        neither `agentloop events` nor the SSE feed.
+        """
+        # A degradation is not always an *absence*: `rollback` can return
+        # `ok=True, reason="residue"`, which means the call ran and files
+        # survived it. Saying "ran without durability" there would be a
+        # misdiagnosis of the same kind `no-workspace` was added to remove.
+        if result.ok:
+            message = (
+                f"git {op} degraded ({result.reason}); task {task_id} kept a "
+                f"partial result: {result.stderr}"
+            )
+        else:
+            message = (
+                f"git {op} unavailable ({result.reason}); "
+                f"task {task_id} ran without durability: {result.stderr}"
+            )
+        warnings.warn(message, RuntimeWarning, stacklevel=2)
+        self.store.log_event(
+            task_id,
+            "vcs_unavailable",
+            {
+                "op": op,
+                "reason": result.reason,
+                "stderr": result.stderr,
+                **(extra or {}),
+            },
+        )
+
+    def _vcs_mark_approved(self, task: Task, ws) -> None:
+        """Point `refs/agentloop/approved` at the workspace tip (C3 and C4).
+
+        Additive: it moves a ref and removes nothing. The result is logged and
+        discarded. Every caller gates the call on `set_status` reporting that
+        its DONE write *landed* — the row is lease-predicated, so a write that
+        did not land would otherwise leave the approved ref asserting a
+        transition the row never took."""
+        result = vcs.mark_approved(ws, self.config, pin=self.store.vcs_pin(task.id))
+        if result.ok:
+            self.store.log_event(
+                task.id, "vcs_commit", {"sha": result.sha, "ref": "approved"}
+            )
+        elif result.reason != "disabled":
+            self._vcs_degraded(task.id, "mark_approved", result)
+
+    def _vcs_rollback_to_base(self, task_id: int) -> vcs.VcsResult:
+        """Return a task's workspace to `refs/agentloop/base` (C5 and C6).
+
+        The one destructive call expression in this module - and it destroys
+        nothing recoverable: `vcs.rollback` writes
+        `refs/agentloop/discarded/<sha>` at the tip *before* anything moves
+        (DD-12), so the discarded round stays reachable from `git log --all`,
+        which is what makes "reject recovers the work" true rather than
+        aspirational.
+
+        Always to `base`, never to the approved ref (ADR-2/DD-2): the approved
+        ref is a bookmark a human placed, and rolling onto it would let a
+        reject of a later round silently resurrect an earlier approved one.
+
+        `create=False` (the default) is load-bearing for the same reason it is
+        at C4: rejecting a task whose workspace never existed must not conjure
+        one - the guard then refuses with `not-a-workspace-repo`, and the
+        workspace keeps whatever it held, which is today's behaviour exactly.
+
+        The result is logged and returned; C6 reads it to choose a *filesystem
+        shape* only. No status, threshold, revision count or budget rule reads
+        it (DD-8).
+        """
+        result = vcs.rollback(
+            workspace_for(self.config.workspace_root, task_id),
+            vcs.BASE_REF,
+            self.config,
+            # The pin recorded when this workspace's repo was created. Read
+            # from the store because that is the one place a worker cannot
+            # write: a rollback runs `reset --hard` and `clean -ffdqx`, so a
+            # config it did not vet is a command the worker chose.
+            pin=self.store.vcs_pin(task_id),
+        )
+        if result.ok:
+            payload = {"ref": "base"}
+            if result.sha:
+                # The pair is *absent*, not null, when HEAD was already at the
+                # target and nothing was discarded: these two keys name the
+                # recovery surface, and a null would assert one exists.
+                payload["discarded_sha"] = result.sha
+                payload["discarded_ref"] = f"{vcs.DISCARDED_REF_PREFIX}/{result.sha}"
+            payload["files_removed"] = result.files_removed
+            if result.nested_repos:
+                # The ref above holds everything the rollback deleted *except*
+                # a nested repository, which a commit can only record as a bare
+                # gitlink. Named rather than quietly omitted: a log asserting a
+                # recovery surface that does not hold the work is the defect,
+                # not the bytes git cannot carry.
+                payload["unrecoverable_nested_repos"] = list(result.nested_repos)
+            if result.reason:
+                # `reason` is `""` *exactly* when nothing degraded, so a
+                # non-empty one on an ok result is a degradation the audit has
+                # to carry: `"residue"` means the rollback ran and files
+                # survived it, which the payload above reports as clean.
+                payload["degraded"] = result.reason
+            self.store.log_event(task_id, "vcs_rollback", payload)
+            if result.reason:
+                self._vcs_degraded(task_id, "rollback", result)
+        elif result.reason != "disabled":
+            # `sha` on a *failed* rollback means the discarded tip was recorded
+            # before the failure, so the history a caller might now wipe is
+            # exactly the history `vcs.rollback` refused to lose. The audit
+            # says which of the two failures this was, because "ran without
+            # durability" reads as "nothing happened" for both.
+            preserved = bool(result.sha)
+            extra: dict = {"history_preserved": preserved}
+            if preserved:
+                extra["discarded_sha"] = result.sha
+                extra["discarded_ref"] = f"{vcs.DISCARDED_REF_PREFIX}/{result.sha}"
+            if result.nested_repos:
+                extra["unrecoverable_nested_repos"] = list(result.nested_repos)
+            self._vcs_degraded(task_id, "rollback", result, extra)
+        return result
+
     def run_task(self, task: Task) -> Task:
         feedback = ""
         test_result = TestResult()
@@ -692,6 +867,14 @@ class Loop:
         # re-measures from 0 and does one safe handoff at the first boundary if
         # the accumulated context already exceeds the threshold.
         handoff_watermark = 0
+        # Durability locals (slice 6). `vcs_ready` is None until C1 has run
+        # once for this `run_task` invocation, then a bool gating every later
+        # vcs call; `round_n` names the per-round commits. Both are in-loop
+        # locals for the same reason `handoff_watermark` is: a restart simply
+        # re-initialises the repo, which is idempotent.
+        vcs_ready: bool | None = None
+        vcs_pin = ""
+        round_n = 0
         while True:
             # Human control is read fresh from the store at each iteration
             # boundary, so a pause/abort set from another process (CLI or
@@ -725,6 +908,24 @@ class Loop:
                 # Worker self-checks in its own output (spec §4.2–4.3).
                 self.store.set_status(task, TaskStatus.IN_PROGRESS)
                 ws = workspace_for(self.config.workspace_root, task.id, create=True)
+                if vcs_ready is None:
+                    # C1: one repo per task workspace (DD-1), created once per
+                    # `run_task` invocation. `.git` is invisible to
+                    # `_has_any_file`, so this cannot flip the tests gate.
+                    vcs_pin = self.store.vcs_pin(task.id)
+                    init = vcs.init_repo(ws, self.config, pin=vcs_pin)
+                    if init.pin:
+                        # Non-empty *only* when this call created the repo, so
+                        # this records a config git wrote a moment ago and can
+                        # never re-bless one a worker edited between rounds. It
+                        # is recorded even on a failed init: the config exists
+                        # either way, and a pin nobody recorded is a workspace
+                        # nothing can ever act on again.
+                        vcs_pin = init.pin
+                        self.store.set_vcs_pin(task.id, vcs_pin)
+                    vcs_ready = bool(init.ok or init.reason == "already")
+                    if not init.ok and init.reason not in ("already", "disabled"):
+                        self._vcs_degraded(task.id, "init", init)
                 worker_runner = self._runner_for(task.worker_role)
                 result = self._with_retry(
                     task,
@@ -781,6 +982,23 @@ class Loop:
                     return task
                 task.output = result.output
                 self.store.update_task(task)
+                if vcs_ready:
+                    # C2: the round's snapshot, taken after the output is in the
+                    # store (which stays the sole source of truth for it) and
+                    # *before* the pending-tool park, whose partial output is
+                    # explicitly preserved and so must be in the commit.
+                    round_n += 1
+                    committed = vcs.commit(
+                        ws, f"round {round_n}", self.config, pin=vcs_pin
+                    )
+                    if committed.ok:
+                        self.store.log_event(
+                            task.id,
+                            "vcs_commit",
+                            {"sha": committed.sha, "round": round_n},
+                        )
+                    else:
+                        self._vcs_degraded(task.id, "commit", committed)
 
                 # A capability the agent called load-bearing and does not have
                 # (slice 5). Checked here — after the output is stored, before
@@ -973,7 +1191,17 @@ class Loop:
                         "(high-risk task).",
                     )
                 else:
-                    self.store.set_status(task, TaskStatus.DONE)
+                    landed = self.store.set_status(task, TaskStatus.DONE)
+                    if landed and vcs_ready:
+                        # C3: gated on the write *landing*, the one shape
+                        # C4 and C5 also use. `set_status` is lease-predicated
+                        # and returns whether the row was written, so a no-op
+                        # DONE write must not move `refs/agentloop/approved`.
+                        # The sibling high-risk branch above does not mark
+                        # approved
+                        # — that task is NEEDS_HUMAN, and its ref is written by
+                        # `human_approve` instead (C4).
+                        self._vcs_mark_approved(task, ws)
                 return task
 
             if task.revision_count >= cfg.max_revisions:
@@ -1242,20 +1470,53 @@ class Loop:
             # it before a later redo.
             #
             # Gated on the status write, for the reason spelled out in `abort`.
-            if self.store.set_status(task, TaskStatus.DONE):
+            landed = self.store.set_status(task, TaskStatus.DONE)
+            if landed:
                 self.store.tool_requests_clear_parked(task_id)
         # Re-read rather than returning the in-hand object: `set_status` assigns the
         # new status onto it *before* the predicated write, so on a write that did
         # not land the object claims a transition the row never took.
-        return self._require(task_id)
+        fresh = self._require(task_id)
+        # C4: outside the transaction (DD-10), and only for a row that actually
+        # reached DONE. A `risk_level >= human_review_risk_level` task reaches
+        # DONE *only* through here, so without this the approved ref would be
+        # absent for exactly the tasks a human vetted. Plan rows returned above.
+        # `create=False` (the default) is load-bearing: approving a task whose
+        # workspace never existed must not conjure one — the guard then refuses.
+        if landed:
+            self._vcs_mark_approved(
+                fresh, workspace_for(self.config.workspace_root, task_id)
+            )
+        return fresh
 
     def human_reject(self, task_id: int, note: str = "") -> Task:
         task = self._require(task_id)
         with self.store.transaction():
             self.store.log_event(task_id, "human_reject", {"note": note})
             # Both the gate and the clear: see `human_approve` and `abort`.
-            if self.store.set_status(task, TaskStatus.FAILED, reason=note):
+            landed = self.store.set_status(task, TaskStatus.FAILED, reason=note)
+            if landed:
                 self.store.tool_requests_clear_parked(task_id)
+        # C5: outside the transaction (DD-10), and gated on the write landing -
+        # the same shape as C3 and C4. `set_status` is lease-predicated, so
+        # "the row is already FAILED and committed" is exactly what its return
+        # value exists to *not* assume: on a predicated miss the task was not
+        # rejected, a live worker may be mid-round, and rolling its workspace
+        # back would destroy the round that worker is still writing. On a
+        # refusal, or a miss, the workspace simply keeps its files -
+        # byte-for-byte what `human_reject` did before this slice, since it
+        # touched the workspace not at all.
+        #
+        # There is deliberately no residue fallback here, and that is a
+        # decision rather than an omission. Redo falls back to
+        # `clear_workspace`, which rmtrees `.git` and with it the discarded
+        # ref; a reject *keeps* the rejected work so a human can recover it, so
+        # wiping the one thing that makes it recoverable would invert the point
+        # of the call. Residue is audited instead - `_vcs_rollback_to_base`
+        # logs `degraded` on the event and a `vcs_unavailable` row - so what
+        # survived on disk is visible rather than hidden behind an ok result.
+        if landed:
+            self._vcs_rollback_to_base(task_id)
         return self._require(task_id)
 
     def approve_tool_request(self, request_id: int, note: str = "") -> Task:
@@ -1426,8 +1687,68 @@ class Loop:
         task.revision_count = 0
         task.escalation_reason = ""
         # Wipe the workspace too: a redo that reran over the previous attempt's
-        # files would not be a fresh start.
-        clear_workspace(self.config.workspace_root, task_id)
+        # files would not be a fresh start. C6: with a repo, the rollback is
+        # that wipe *and* keeps the round recoverable; without one - feature
+        # off, git missing, a workspace predating this slice - or with residue
+        # left behind, the fallback is today's `clear_workspace`, unchanged.
+        # `vcs.is_repo` is deliberately not called first: `rollback` re-runs
+        # the identical guard internally and says `not-a-workspace-repo`, so a
+        # pre-check would be a second, racier copy of it.
+        result = self._vcs_rollback_to_base(task_id)
+        if not (result.ok and result.reason != "residue"):
+            # ...except when the rollback failed *after* recording the
+            # discarded tip (`sha` set on a failed result). `vcs.rollback`
+            # aborts rather than lose that history, while `clear_workspace`
+            # rmtrees `.git`, every round commit and that freshly written ref -
+            # so an unconditional fallback destroyed precisely what the callee
+            # had just refused to destroy, under a warning that reads as
+            # "nothing happened". The tree is left as it is and the gap is
+            # audited (`history_preserved` in the `vcs_unavailable` payload);
+            # the next run re-initialises what is there, which is idempotent.
+            #
+            # The discriminator is "was a recovery ref written", not "did the
+            # call succeed": `ok=True, reason="residue"` **with** a sha is the
+            # production shape, so `result.ok or not result.sha` let an ok
+            # result through to the wipe regardless of sha and destroyed the
+            # ref `_vcs_rollback_to_base` had logged one statement earlier.
+            if not result.sha:
+                if not clear_workspace(self.config.workspace_root, task_id):
+                    # The fallback for every failed rollback cannot itself fail
+                    # silently: `rmtree` with an error handler installed
+                    # swallows per-file failures, so a redo that kept the
+                    # previous round would look exactly like one that did not.
+                    warnings.warn(
+                        f"Workspace for task {task_id} survived the redo wipe; "
+                        f"the fresh start it promises is not what the next run "
+                        f"will see.",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                    self.store.log_event(
+                        task_id,
+                        "vcs_unavailable",
+                        {"op": "clear_workspace", "reason": "residue", "stderr": ""},
+                    )
+            elif not _clear_worktree(
+                workspace_for(self.config.workspace_root, task_id)
+            ):
+                # A ref exists, so the fresh start is kept by emptying the
+                # working tree rather than by deleting the history that ref
+                # names. Its own failure is audited for the same reason the
+                # wipe's is: a redo that kept the previous round looks exactly
+                # like one that did not.
+                warnings.warn(
+                    f"Workspace for task {task_id} kept files the redo could "
+                    f"not clear; the fresh start it promises is not what the "
+                    f"next run will see.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                self.store.log_event(
+                    task_id,
+                    "vcs_unavailable",
+                    {"op": "clear_worktree", "reason": "residue", "stderr": ""},
+                )
         # One transaction for the release, the flag clear and the status write —
         # see `resume` for why the parked accessors' "no event of its own"
         # contract depends on it.

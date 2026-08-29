@@ -24,10 +24,12 @@ Runnable two ways:
 
 from __future__ import annotations
 
+import tempfile
 from dataclasses import dataclass
+from pathlib import Path
 
 from .agents import run_validator
-from .models import Task, VerdictKind
+from .models import Task, TaskStatus, VerdictKind
 from .registry import Registry
 from .runner import MockRunner
 from .store import Store
@@ -398,4 +400,312 @@ def format_report(result: dict) -> str:
     for c in s["calibration"]:
         acc = "  n/a" if c["accuracy"] is None else f"{c['accuracy'] * 100:5.1f}%"
         lines.append(f"  {c['bucket']:>13s} {c['n']:>4d} {c['correct']:>8d}  {acc:>8s}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Batch whole-loop evaluation (slice 6, Part 3)
+#
+# `run_eval` above measures one validator verdict at a time against a gold
+# `VerdictKind`. That is structurally blind to the thing the loop actually is:
+# the decision rules. Whether a `revise` at 0.55 produces a *revision round*
+# rather than an escalation, whether an exhausted revision budget lands at
+# NEEDS_HUMAN, whether a severe verdict skips the revision loop entirely -- none
+# of those is visible one verdict at a time.
+#
+# A batch fixture is therefore a whole task: a definition, a scripted sequence
+# of runner replies covering every round it will take, and the gold final
+# `TaskStatus`. `run_batch_eval` drives each through a real `Loop` and reports
+# the same three-part shape (`agreement`, a confusion matrix, per-fixture
+# detail) -- with `agreement` counting matched *final statuses*, which is what
+# `eval_runs.kind='batch'` says it counts.
+#
+# This is a regression harness, never a gate: no decision rule reads a batch
+# result (DD-8), and the row it writes is a measurement of the loop, not an
+# input to it.
+
+
+@dataclass
+class BatchFixture:
+    id: str
+    category: str  # happy | revision | escalation | risk
+    title: str
+    goal: str
+    criteria: str
+    risk_level: int
+    script: list[str]  # scripted runner replies, in the order the loop pops them
+    gold: TaskStatus  # the final status the decision rules must reach
+    # How many scripted replies this fixture expects the loop **not** to
+    # consume. Almost always 0. `b-empty-output` scripts a validator reply the
+    # loop must never reach, and that unreached reply *is* the assertion, so
+    # the count is declared per fixture rather than assumed globally -
+    # otherwise the fidelity check below could only be written by dropping the
+    # one fixture whose script proves a call did not happen.
+    unused_script: int = 0
+
+
+_APPROVE = _v("approve", 0.92, "pass", "Meets every acceptance criterion.")
+_REVISE = _v("revise", 0.55, "fail", "Empty input is unhandled; add a guard.")
+_SEVERE = _v("escalate", 0.10, "fail", "Wrong approach; solves another problem.")
+# An `approve` kind whose confidence is below `severe_threshold`. The kind is
+# the *agreeing* one on purpose: this fixture pins that the threshold, not the
+# word, is what escalates.
+_UNSURE = _v("approve", 0.30, "na", "Cannot tell whether this is correct.")
+
+
+BATCH_FIXTURES: list[BatchFixture] = [
+    BatchFixture(
+        "b-approve-first",
+        "happy",
+        "slugify util",
+        "Write slugify(text) -> lowercase hyphenated ascii.",
+        "Lowercase, hyphen-separated, tested.",
+        1,
+        ["def slugify(t): ...  # with tests", _APPROVE],
+        TaskStatus.DONE,
+    ),
+    BatchFixture(
+        "b-revise-then-approve",
+        "revision",
+        "mean util",
+        "Write mean(xs) returning the arithmetic mean.",
+        "Defined behaviour on empty input, tested.",
+        1,
+        ["def mean(xs): ...", _REVISE, "def mean(xs): ...  # empty guarded", _APPROVE],
+        TaskStatus.DONE,
+    ),
+    BatchFixture(
+        "b-low-confidence-approve-revises",
+        "revision",
+        "percent util",
+        "Write pct(a, b) returning a/b as a percentage.",
+        "Handles b == 0, tested.",
+        1,
+        # An approve *below* approve_threshold is not a completion: it forces a
+        # revision round first, then the confident approve completes the task.
+        [
+            "def pct(a, b): ...",
+            _v("approve", 0.60, "pass", "Probably fine."),
+            "def pct(a, b): ...  # zero guarded",
+            _APPROVE,
+        ],
+        TaskStatus.DONE,
+    ),
+    BatchFixture(
+        "b-revisions-exhausted",
+        "revision",
+        "port parser",
+        "Write parse_port(s) -> int in 1..65535 or ValueError.",
+        "Range-checked and tested.",
+        1,
+        # One more worker/validator pair than `max_revisions`, all revise: the
+        # budget runs out and the task escalates instead of looping forever.
+        ["v1", _REVISE, "v2", _REVISE, "v3", _REVISE, "v4", _REVISE],
+        TaskStatus.NEEDS_HUMAN,
+    ),
+    BatchFixture(
+        "b-severe-verdict",
+        "escalation",
+        "lru cache",
+        "Build an LRU cache.",
+        "Evicts least-recently-used at capacity, tested.",
+        1,
+        ["class Cache(dict): pass", _SEVERE],
+        TaskStatus.NEEDS_HUMAN,
+    ),
+    BatchFixture(
+        "b-below-severe-threshold",
+        "escalation",
+        "date format",
+        "Write format_date(d) in the standard format.",
+        "Uses the standard format, tested.",
+        1,
+        ["def format_date(d): ...", _UNSURE],
+        TaskStatus.NEEDS_HUMAN,
+    ),
+    BatchFixture(
+        "b-worker-escalate",
+        "escalation",
+        "locale-sensitive slug",
+        "Slugify Unicode text correctly.",
+        "Handles non-ascii correctly, tested.",
+        1,
+        ["ESCALATE: which transliteration should non-ascii text take?"],
+        TaskStatus.NEEDS_HUMAN,
+    ),
+    BatchFixture(
+        "b-empty-output",
+        "escalation",
+        "retry decorator",
+        "Write @retry(n) retrying a call n times then re-raising.",
+        "Retries then re-raises, tested.",
+        1,
+        # An empty worker output is the *absence* of work; the validator must
+        # never see it, so the scripted approve here is deliberately never
+        # consumed - declared as such, so "the script was consumed as scripted"
+        # can be asserted for every fixture including this one.
+        ["", _APPROVE],
+        TaskStatus.NEEDS_HUMAN,
+        unused_script=1,
+    ),
+    BatchFixture(
+        "b-high-risk-signoff",
+        "risk",
+        "delete stale rows",
+        "Write purge(db) removing rows older than 30 days.",
+        "Removes only stale rows, tested.",
+        2,
+        # An approve at 0.92 that would complete a risk-1 task: at risk 2 it
+        # parks for human sign-off instead.
+        ["def purge(db): ...", _APPROVE],
+        TaskStatus.NEEDS_HUMAN,
+    ),
+]
+
+
+def run_batch_eval(
+    result_store: Store,
+    registry: Registry,
+    fixtures: list[BatchFixture] | None = None,
+) -> dict:
+    """Drive each fixture through a real `Loop` and persist one summary row.
+
+    Each fixture runs against a scratch in-memory store (the `run_eval`
+    precedent -- the task board is not polluted) with its own scripted
+    `MockRunner`, test execution off and git off, so the run is deterministic
+    and touches nothing but a throwaway workspace directory. Only the summary
+    lands in `result_store`, tagged `kind='batch'`.
+    """
+    from .config import LoopConfig
+    from .loop import Loop
+
+    fixtures = fixtures if fixtures is not None else BATCH_FIXTURES
+    detail: list[dict] = []
+    n_correct = 0
+
+    with tempfile.TemporaryDirectory(prefix="agentloop-batch-eval-") as tmp:
+        for fx in fixtures:
+            scratch = Store(":memory:")
+            try:
+                config = LoopConfig(
+                    db_path=":memory:",
+                    workspace_root=str(Path(tmp) / fx.id),
+                    allow_test_exec=False,
+                    vcs_enabled=False,
+                )
+                task = Task(
+                    id=None,
+                    title=fx.title,
+                    goal=fx.goal,
+                    acceptance_criteria=fx.criteria,
+                    risk_level=fx.risk_level,
+                )
+                scratch.add_task(task)
+                runner = MockRunner(list(fx.script))
+                Loop(scratch, runner, registry, config).run_task(task)
+                # The **row**, never the in-hand object: `set_status` assigns
+                # the new status onto the task it was handed *before* its
+                # lease-predicated write, so the object can claim a transition
+                # the row never took (`human_approve` documents exactly this).
+                # Latent in a single-worker harness, and the wrong default for
+                # something whose entire output is a measurement.
+                row = scratch.get_task(task.id)
+                measured = row.status if row else task.status
+                revision_count = row.revision_count if row else task.revision_count
+                escalation_reason = (
+                    row.escalation_reason if row else task.escalation_reason
+                )
+                # Script fidelity, measured on the same run as the status.
+                unscripted = runner.unscripted
+                remaining = len(runner.outputs)
+                metrics = scratch.task_metrics(task.id)
+            finally:
+                scratch.close()
+
+            # Reaching gold off the end of the script is not agreement.
+            # `MockRunner` improvises "(mock output)" forever once its script
+            # runs out; that parses as no verdict, which escalates, which is
+            # the gold status of most of these fixtures - so a regression in
+            # the severe-verdict rule, the risk gate or the revision budget
+            # could overrun the script and still score `correct`. A fixture
+            # scripts every call the loop makes, so an extra or a missing call
+            # is a rule change and the fixture no longer measures what it says.
+            script_consumed = unscripted == 0 and remaining == fx.unused_script
+            correct = measured == fx.gold and script_consumed
+            n_correct += int(correct)
+            detail.append(
+                {
+                    "id": fx.id,
+                    "category": fx.category,
+                    "gold": fx.gold.value,
+                    "measured": measured.value,
+                    "correct": correct,
+                    "script_consumed": script_consumed,
+                    "unscripted_calls": unscripted,
+                    "script_remaining": remaining,
+                    "revision_count": revision_count,
+                    "has_escalation_reason": bool(escalation_reason),
+                    "attempts": metrics["attempts"],
+                    "tokens": metrics["tokens"],
+                }
+            )
+
+    # Rows and columns are the statuses this run actually involved, rather than
+    # every member of `TaskStatus`: the loop's transient statuses can never be a
+    # final one, and a dense matrix over all ten would be mostly zeros. Built
+    # from the union of gold and measured, so every fixture has a cell and the
+    # cells always sum to `n` -- reconciliation is structural, not asserted.
+    statuses = sorted({d["gold"] for d in detail} | {d["measured"] for d in detail})
+    confusion = {g: {p: 0 for p in statuses} for g in statuses}
+    for d in detail:
+        confusion[d["gold"]][d["measured"]] += 1
+
+    n = len(fixtures)
+    summary = {
+        "agreement": round(n_correct / n, 4) if n else 0.0,
+        "n": n,
+        "statuses": statuses,
+        "confusion": confusion,
+    }
+    result_store.add_eval_run(
+        runner=MockRunner.__name__,
+        n_fixtures=n,
+        agreement=(n_correct / n if n else 0.0),
+        summary=summary,
+        detail=detail,
+        kind="batch",
+    )
+    return {"summary": summary, "detail": detail}
+
+
+def format_batch_report(result: dict) -> str:
+    """Human-readable text report of a run_batch_eval result."""
+    s = result["summary"]
+    statuses = s["statuses"]
+    width = max([len(x) for x in statuses] + [8]) + 2
+    lines = [
+        f"Whole-loop batch evaluation \u2014 {s['n']} fixtures",
+        f"Agreement with gold: {s['agreement'] * 100:.1f}%",
+        "",
+        "Confusion matrix (rows = gold, cols = measured):",
+        " " * 14 + "".join(f"{k:>{width}s}" for k in statuses),
+    ]
+    for g in statuses:
+        row = s["confusion"][g]
+        lines.append(f"  {g:>11s} " + "".join(f"{row[p]:>{width}d}" for p in statuses))
+    # Sized off the widest id actually present, so a longer fixture id shifts
+    # the whole table rather than overflowing its own row out of alignment.
+    idw = max([len(d["id"]) for d in result["detail"]] + [2]) + 1
+    lines += [
+        "",
+        "Per fixture:",
+        f"  {'id':<{idw}s} {'gold':>11s} {'measured':>11s} {'rev':>4s}"
+        f" {'att':>4s} {'tokens':>8s}  ok",
+    ]
+    for d in result["detail"]:
+        lines.append(
+            f"  {d['id']:<{idw}s} {d['gold']:>11s} {d['measured']:>11s}"
+            f" {d['revision_count']:>4d} {d['attempts']:>4d} {d['tokens']:>8d}"
+            f"  {'yes' if d['correct'] else 'NO'}"
+        )
     return "\n".join(lines)

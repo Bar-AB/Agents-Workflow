@@ -173,6 +173,14 @@ export function TaskDetail({
           {test_runs.map((r) => (
             <div className={`test-row t-${r.status}`} key={r.id}>
               {r.status} · exit {r.exit_code ?? '—'} · {r.duration_s}s ·{' '}
+              {/* Coverage is rendered only when the run actually reported one.
+                  `null` means "no coverage was reported", never 0% — and an
+                  absent measurement shown as a number would be a fabricated
+                  one, which is the direction this project's telemetry rule
+                  forbids. So there is no placeholder here, not even a dash. */}
+              {r.coverage_percent !== null && (
+                <>coverage {r.coverage_percent}% · </>
+              )}
               {r.summary}
             </div>
           ))}

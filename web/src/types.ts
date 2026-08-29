@@ -194,6 +194,8 @@ export interface TestRun {
   summary: string
   stdout_tail: string
   duration_s: number
+  // Null when the test command reported no coverage at all — not 0%.
+  coverage_percent: number | null
   created_at: number
 }
 
@@ -224,6 +226,47 @@ export interface RetrievalPayload {
     pinned: boolean
     score: number
   }[]
+}
+
+// Payloads of the three slice-6 durability events. Mirrors what `loop.py`
+// actually writes, and the optionality is the load-bearing part: the optional
+// keys are **absent**, not null, when they do not apply, so every one is
+// declared `?` and must be tested for before it is rendered. A field rendered
+// as present when it is absent would assert a recovery surface that does not
+// exist — the same "never assert more than the inputs prove" rule the tool
+// panel's chip colour is governed by.
+export interface VcsCommitPayload {
+  sha: string
+  // A round snapshot carries `round`; the approved-ref move carries
+  // `ref: 'approved'`. Exactly one of the two is present.
+  round?: number
+  ref?: string
+}
+
+export interface VcsRollbackPayload {
+  ref: string
+  files_removed: number
+  // Present only when something was actually discarded (HEAD was not already at
+  // the target). Together they name where the rolled-back round survives.
+  discarded_sha?: string
+  discarded_ref?: string
+  // A non-empty `reason` on an ok result: the rollback ran and degraded — e.g.
+  // `'residue'`, meaning files survived it.
+  degraded?: string
+  // Directories that held a repository of their own. A commit records those as
+  // bare gitlinks, so their objects are NOT in the discarded ref: naming them
+  // is the whole point, and the UI must not imply they are recoverable.
+  unrecoverable_nested_repos?: string[]
+}
+
+export interface VcsUnavailablePayload {
+  op: string
+  reason: string
+  stderr: string
+  // Set only on a failed rollback: whether the discarded tip was recorded
+  // before the failure.
+  history_preserved?: boolean
+  discarded_sha?: string
 }
 
 export interface ModelRollup {
