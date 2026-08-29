@@ -58,6 +58,9 @@ def store(tmp_path):
 def make_loop(store, outputs, registry=None, **cfg_overrides):
     cfg_overrides.setdefault("workspace_root", str(Path(store.db_path).parent / "ws"))
     cfg_overrides.setdefault("allow_test_exec", False)
+    # Slice 6: git is off in the loop tests. A repo per workspace would
+    # spawn real subprocesses in ~300 tests that are not about durability.
+    cfg_overrides.setdefault("vcs_enabled", False)
     config = LoopConfig(db_path=store.db_path, **cfg_overrides)
     runner = MockRunner(outputs)
     return Loop(store, runner, registry or Registry.load(), config), runner

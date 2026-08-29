@@ -115,6 +115,15 @@ class LoopConfig:
     # to env-scrub with a warning when it is not (documented residual risk).
     sandbox_isolation: str = "env"
 
+    # Per-task workspace version control (roadmap slice 6). `git` is an external
+    # executable in the same category as `test_command`: its absence degrades
+    # the feature and never breaks a run. `vcs_command` is an executable *path*,
+    # not a command line — deliberately unlike `test_command`, which is a
+    # command line and goes through `executor.split_command`.
+    vcs_enabled: bool = True
+    vcs_command: str = "git"
+    vcs_timeout_s: int = 30
+
     # Memory (spec §7): a project fact read this often is promoted to the
     # cross-project loop tier.
     memory_promote_threshold: int = 3

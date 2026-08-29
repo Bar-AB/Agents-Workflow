@@ -261,7 +261,34 @@ CREATE TABLE IF NOT EXISTS test_runs (
     summary TEXT NOT NULL DEFAULT '',
     stdout_tail TEXT NOT NULL DEFAULT '',
     duration_s REAL NOT NULL DEFAULT 0.0,
+    -- Coverage as the test command reported it, NULL when it reported none
+    -- (slice 6). NULL is not 0%. A display value: nothing in the loop reads it.
+    coverage_percent REAL,
     created_at REAL NOT NULL
+);
+
+-- The git config pin (slice 6). A task's workspace repo keeps its `.git/config`
+-- *inside* the agent-writable workspace, and git config names programs git runs
+-- (`filter.<name>.clean`, `core.fsmonitor`), so an unpinned round commit is
+-- arbitrary command execution from a worker that wrote only inside its own
+-- directory -- measured, on `allow_test_exec=False`. The fingerprint of the
+-- config `git init` wrote therefore lives *here*: the store is the one place in
+-- this system an agent has no write path to, and a pin kept anywhere under the
+-- workspace would be as writable as the attack it is meant to catch.
+--
+-- One row per task, because there is one repo per task workspace (DD-1), and
+-- `task_id` is the primary key rather than an autoincrement id: this is a live
+-- fact with exactly one current value, not history (the audit log is the
+-- history), so a re-created workspace *replaces* its pin instead of adding a
+-- second one a lookup would have to choose between.
+--
+-- No foreign key, for `tool_requests`' reason: these rows are written on the
+-- paid per-round path and an FK violation there must never be able to roll back
+-- an attempt.
+CREATE TABLE IF NOT EXISTS vcs_pins (
+    task_id     INTEGER PRIMARY KEY,
+    fingerprint TEXT NOT NULL,
+    created_at  REAL NOT NULL
 );
 
 -- Agent-requested tools (roadmap slice 5): one row per ask for one logical tool,
@@ -325,6 +352,12 @@ CREATE TABLE IF NOT EXISTS eval_runs (
     agreement REAL NOT NULL,
     summary TEXT NOT NULL DEFAULT '{}',
     detail TEXT NOT NULL DEFAULT '[]',
+    -- Which harness wrote this row, and therefore what `agreement` counts:
+    -- 'verdict' = one validator verdict kind against gold, 'batch' = one whole
+    -- task's final TaskStatus against gold. One number, one meaning, one
+    -- discriminator -- a second table would have duplicated the row shape,
+    -- which is already exactly right, and split "the eval history" in two.
+    kind TEXT NOT NULL DEFAULT 'verdict',
     created_at REAL NOT NULL
 );
 """
@@ -538,6 +571,11 @@ class Store:
             # what every pre-charter attempt row correctly becomes.
             ("attempts", "charter_version", "INTEGER"),
             ("verdicts", "findings", "TEXT NOT NULL DEFAULT ''"),
+            ("test_runs", "coverage_percent", "REAL"),
+            # Pre-existing rows are per-verdict calibration runs, because that
+            # is the only harness that existed when they were written -- so the
+            # default is not a placeholder, it is the correct value.
+            ("eval_runs", "kind", "TEXT NOT NULL DEFAULT 'verdict'"),
         ]
         for table, column, decl in additions:
             cols = {
@@ -1653,8 +1691,8 @@ class Store:
         with self.transaction():
             cur = self._conn.execute(
                 "INSERT INTO test_runs (task_id, attempt_id, status, exit_code,"
-                " summary, stdout_tail, duration_s, created_at)"
-                " VALUES (?,?,?,?,?,?,?,?)",
+                " summary, stdout_tail, duration_s, coverage_percent,"
+                " created_at) VALUES (?,?,?,?,?,?,?,?,?)",
                 (
                     task_id,
                     attempt_id,
@@ -1663,6 +1701,7 @@ class Store:
                     result.summary,
                     result.stdout_tail,
                     result.duration_s,
+                    result.coverage_percent,
                     time.time(),
                 ),
             )
@@ -1685,6 +1724,35 @@ class Store:
                 "SELECT * FROM test_runs WHERE task_id=? ORDER BY id", (task_id,)
             ).fetchall()
         ]
+
+    # -- the workspace git config pin (slice 6) -------------------------------
+
+    def set_vcs_pin(self, task_id: int, fingerprint: str) -> None:
+        """Record the fingerprint of the `.git/config` `vcs.init_repo` just
+        watched `git init` write for this task's workspace.
+
+        Replaces rather than appends: a workspace that is wiped and re-created
+        (`human_redo`) gets a new config and therefore a new pin, and a lookup
+        that had to choose between two would be a gate with a second answer in
+        it. No paired event, deliberately — this is derived bookkeeping about a
+        directory, not a state change of the task, and what the audit log has
+        to carry is the *refusal* it produces (`vcs_unavailable`, via the
+        loop's `_vcs_degraded`), which is the only part a human can act on."""
+        self._conn.write(
+            "INSERT INTO vcs_pins (task_id, fingerprint, created_at) "
+            "VALUES (?, ?, ?) ON CONFLICT(task_id) DO UPDATE SET "
+            "fingerprint=excluded.fingerprint, created_at=excluded.created_at",
+            (task_id, fingerprint, time.time()),
+        )
+
+    def vcs_pin(self, task_id: int) -> str:
+        """The recorded pin, or `""` when there is none — which every
+        side-effecting `vcs` entry point refuses on (`"config-unpinned"`), so
+        an absent row fails closed rather than opening the gate."""
+        rows = self._conn.execute(
+            "SELECT fingerprint FROM vcs_pins WHERE task_id=?", (task_id,)
+        ).fetchall()
+        return rows[0]["fingerprint"] if rows else ""
 
     # -- agent tool requests (roadmap slice 5) --------------------------------
 
@@ -2261,17 +2329,23 @@ class Store:
         agreement: float,
         summary: dict,
         detail: list,
+        kind: str = "verdict",
     ) -> int:
+        """Persist one harness run. `kind` says what `agreement` counts: a
+        validator verdict kind ('verdict') or a whole task's final status
+        ('batch'). Defaulted and trailing, so the per-verdict caller is
+        unchanged."""
         with self.transaction():
             cur = self._conn.execute(
                 "INSERT INTO eval_runs (runner, n_fixtures, agreement, summary,"
-                " detail, created_at) VALUES (?,?,?,?,?,?)",
+                " detail, kind, created_at) VALUES (?,?,?,?,?,?,?)",
                 (
                     runner,
                     n_fixtures,
                     agreement,
                     json.dumps(summary),
                     json.dumps(detail),
+                    kind,
                     time.time(),
                 ),
             )
@@ -2280,6 +2354,7 @@ class Store:
                 "eval_run",
                 {
                     "runner": runner,
+                    "kind": kind,
                     "n_fixtures": n_fixtures,
                     "agreement": round(agreement, 4),
                 },

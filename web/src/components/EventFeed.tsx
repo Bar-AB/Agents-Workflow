@@ -1,4 +1,10 @@
-import type { EventRow, RetrievalPayload } from '../types'
+import type {
+  EventRow,
+  RetrievalPayload,
+  VcsCommitPayload,
+  VcsRollbackPayload,
+  VcsUnavailablePayload,
+} from '../types'
 
 function clock(ts: number): string {
   return new Date(ts * 1000).toLocaleTimeString(undefined, { hour12: false })
@@ -48,7 +54,52 @@ function digest(ev: EventRow): string {
     case 'tool_call':
       return `${p.agent_kind} · ${p.tool}`
     case 'eval_run':
-      return `${p.runner}: ${p.n_fixtures} fixtures, agreement ${p.agreement}`
+      // `kind` discriminates validator calibration from a whole-loop batch run:
+      // both write this row, and "agreement" means a different measurement
+      // under each, so the number is unreadable without it.
+      return `${p.kind ?? 'verdict'} · ${p.runner}: ${p.n_fixtures} fixtures, agreement ${p.agreement}`
+    // The three slice-6 durability events. Each renders **only** the fields its
+    // payload actually carries: the optional keys are absent, not null, when
+    // they do not apply, so an unconditional render would assert a fact the
+    // event does not prove.
+    case 'vcs_commit': {
+      const c = ev.payload as unknown as VcsCommitPayload
+      // A round snapshot carries `round`; the approved-ref move carries `ref`.
+      const what = c.ref ?? (c.round !== undefined ? `round ${c.round}` : '')
+      const sha = c.sha ? c.sha.slice(0, 7) : ''
+      return [sha, what].filter(Boolean).join(' · ')
+    }
+    case 'vcs_rollback': {
+      const r = ev.payload as unknown as VcsRollbackPayload
+      const parts = [`→ ${r.ref} · ${r.files_removed} file(s) removed`]
+      // Where the discarded round survives — omitted entirely when HEAD was
+      // already at the target and nothing was discarded.
+      if (r.discarded_sha) parts.push(`kept ${r.discarded_sha.slice(0, 7)}`)
+      // `degraded` on an ok result means the rollback ran and something
+      // survived it; saying nothing would report a partial as clean.
+      if (r.degraded) parts.push(`degraded: ${r.degraded}`)
+      // Named, never softened: a nested repo's objects are recorded as a bare
+      // gitlink, so the discarded ref does NOT hold them and there is no
+      // recovery surface to point at.
+      if (r.unrecoverable_nested_repos?.length)
+        parts.push(
+          `unrecoverable nested repo(s): ${r.unrecoverable_nested_repos.join(', ')}`,
+        )
+      return parts.join(' · ')
+    }
+    case 'vcs_unavailable': {
+      const u = ev.payload as unknown as VcsUnavailablePayload
+      const parts = [`${u.op}: ${u.reason}`]
+      // Only a failed rollback reports this, and the two values mean opposite
+      // things to whoever is deciding whether to wipe the workspace.
+      if (u.history_preserved !== undefined)
+        parts.push(
+          u.history_preserved
+            ? `history kept${u.discarded_sha ? ` at ${u.discarded_sha.slice(0, 7)}` : ''}`
+            : 'no history recorded',
+        )
+      return parts.join(' · ')
+    }
     case 'human_abort':
       return p.note ? String(p.note) : 'aborted mid-run'
     case 'task_defined':

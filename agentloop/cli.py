@@ -347,7 +347,12 @@ def _charter_cmd(store: Store, args) -> int:
 
 
 def _eval_cmd(store: Store, args) -> int:
-    """Run the validator calibration harness (spec: eval)."""
+    """Run an evaluation harness: per-verdict calibration, or whole-loop batch.
+
+    `--mode verdict` (the default) is the pre-existing validator calibration.
+    `--mode batch` drives whole tasks through a real `Loop` and measures the
+    *decision rules* against a gold final status.
+    """
     from . import eval as evalmod
 
     registry = Registry.load(
@@ -355,6 +360,22 @@ def _eval_cmd(store: Store, args) -> int:
             getattr(args, "config", None) or "loopconfig.json"
         ).registry_path
     )
+    if getattr(args, "mode", "verdict") == "batch":
+        if args.runner != "mock":
+            # Same refusal, and the same reason, as `--runner openai` falling
+            # through to the mock branch used to earn: batch fixtures are
+            # scripted round-by-round, so a real provider cannot consume one and
+            # anything printed afterwards would be a number that measured
+            # nothing -- which is worse than none.
+            raise ValueError(
+                f"eval --mode batch requires --runner mock (got {args.runner!r}): "
+                "batch fixtures are scripted whole-task transcripts, and a real "
+                "provider cannot be handed a script."
+            )
+        result = evalmod.run_batch_eval(store, registry)
+        print(evalmod.format_batch_report(result))
+        return 0
+
     if args.runner == "claude":
         # Opt-in and skipped without credentials — never a hard failure in CI.
         from .runner import anyio as _sdk
@@ -488,8 +509,14 @@ def main(argv: list[str] | None = None) -> int:
     cclear.add_argument("--note", default="")
     chsub.add_parser("history", help="Every version, oldest first")
 
-    ev = sub.add_parser("eval", help="Validator calibration harness")
+    ev = sub.add_parser("eval", help="Evaluation harness (calibration / batch)")
     ev.add_argument("--runner", default="mock", choices=["claude", "openai", "mock"])
+    ev.add_argument(
+        "--mode",
+        default="verdict",
+        choices=["verdict", "batch"],
+        help="verdict: validator calibration; batch: whole-loop decision rules",
+    )
 
     sub.add_parser("init-registry", help="Write default agents.json")
 

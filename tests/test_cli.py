@@ -592,3 +592,46 @@ def test_cli_tools_a_partly_live_capability_reports_both_halves(capsys):
     out = capsys.readouterr().out
     assert "Write and Edit are not available to this role" in out
     assert "it still has Read" in out
+
+
+# -- batch eval mode (slice 6, Part 3) ----------------------------------------
+
+
+@pytest.mark.parametrize("runner", ["claude", "openai"])
+def test_batch_mode_refuses_a_non_mock_runner(runner, capsys):
+    """Batch fixtures are scripted, so a real provider would be handed a script
+    it cannot consume. Following the documented `--runner openai` precedent: a
+    number that measured nothing is worse than none."""
+    rc = main(["eval", "--mode", "batch", "--runner", runner])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert err.startswith("error:")
+    assert "batch" in err and runner in err
+    assert "Traceback" not in err
+
+
+def test_batch_mode_with_the_mock_runner_writes_one_row(capsys, tmp_path):
+    from agentloop.store import Store
+
+    rc = main(["eval", "--mode", "batch"])
+    assert rc == 0
+    assert "Agreement with gold" in capsys.readouterr().out
+    s = Store(tmp_path / "agentloop.db")
+    try:
+        rows = s.eval_runs()
+        assert [r["kind"] for r in rows] == ["batch"]
+    finally:
+        s.close()
+
+
+def test_eval_with_no_flags_still_runs_the_verdict_harness(capsys, tmp_path):
+    from agentloop.store import Store
+
+    rc = main(["eval"])
+    assert rc == 0
+    assert "Validator calibration" in capsys.readouterr().out
+    s = Store(tmp_path / "agentloop.db")
+    try:
+        assert [r["kind"] for r in s.eval_runs()] == ["verdict"]
+    finally:
+        s.close()

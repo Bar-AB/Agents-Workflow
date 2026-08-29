@@ -26,6 +26,7 @@ def live(tmp_path):
         db_path=store.db_path,
         workspace_root=str(tmp_path / "ws"),
         allow_test_exec=False,
+        vcs_enabled=False,  # slice 6: no git subprocess here
         stream_poll_seconds=0.05,
     )
     loop = Loop(store, MockRunner(), Registry.load(), config)

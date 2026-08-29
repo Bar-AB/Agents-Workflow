@@ -187,6 +187,10 @@ class TestResult:
     summary: str = ""
     stdout_tail: str = ""
     duration_s: float = 0.0
+    # Parsed out of the captured output when the test command reported one
+    # (slice 6). None means *nothing was reported*, never 0% covered. A
+    # display value only: no decision rule reads it (DD-8).
+    coverage_percent: float | None = None
 
     @property
     def passed(self) -> bool | None:

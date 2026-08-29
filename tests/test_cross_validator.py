@@ -281,6 +281,9 @@ def _config(store, **overrides):
 
     overrides.setdefault("workspace_root", str(Path(store.db_path).parent / "ws"))
     overrides.setdefault("allow_test_exec", False)
+    # Slice 6: git is off in the loop tests. A repo per workspace would
+    # spawn real subprocesses in ~300 tests that are not about durability.
+    overrides.setdefault("vcs_enabled", False)
     return LoopConfig(db_path=store.db_path, **overrides)
 
 

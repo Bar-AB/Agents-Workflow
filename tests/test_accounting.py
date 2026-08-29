@@ -101,6 +101,7 @@ def test_cache_heavy_run_trips_cost_cap(store):
         db_path=store.db_path,
         workspace_root=str(Path(store.db_path).parent / "ws"),
         allow_test_exec=False,
+        vcs_enabled=False,  # slice 6: no git subprocess in a test about money
         max_cost_usd_per_task=0.01,
     )  # tiny cost cap
     # ~21k cache-read tokens at sonnet's 0.10x input rate; two attempts clear
@@ -125,6 +126,7 @@ def test_cache_tokens_count_toward_token_cap(store):
         db_path=store.db_path,
         workspace_root=str(Path(store.db_path).parent / "ws"),
         allow_test_exec=False,
+        vcs_enabled=False,  # slice 6: no git subprocess in a test about money
         max_cost_usd_per_task=1e9,  # cost cap out of the way
         max_tokens_per_task=1000,
     )  # token cap is the gate
@@ -147,6 +149,7 @@ def test_cache_breakdown_persisted_and_rolled_up(store):
         db_path=store.db_path,
         workspace_root=str(Path(store.db_path).parent / "ws"),
         allow_test_exec=False,
+        vcs_enabled=False,  # slice 6: no git subprocess in a test about money
         max_tokens_per_task=10**9,
         max_cost_usd_per_task=10**9,
     )
