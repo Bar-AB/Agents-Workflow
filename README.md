@@ -38,7 +38,7 @@ agentloop/
                redo / pause / resume / abort / events / serve / memory /
                charter / eval
 web/           Vite + React + TypeScript dashboard
-tests/         876 tests on MockRunner + real subprocesses (no API keys needed)
+tests/         878 tests on MockRunner + real subprocesses (no API keys needed)
 ```
 
 ## Quick start
@@ -649,9 +649,11 @@ command runs is the real exposure. Defenses are layered:
   `PATH` gets the running interpreter's script directory prepended, because the
   default `test_command` is `pytest -q` and invoking `agentloop` by path (which
   the quick start offers) left the venv's `Scripts` off `PATH`. That failure was
-  quiet in the worst way: `status="error"` is not `"fail"`, so the tests gate
-  fell back to the validator's own `TESTS:` claim — the exact thing executed
-  tests exist to replace.
+  quiet, though not in the way this said at first: `TestResult.passed` returns
+  `False` for `"error"` as well as `"fail"` (only `"na"` falls back to the
+  validator's own `TESTS:` claim), so an unresolvable command does not become
+  auto-approvable — it fails *every* round, burns `max_revisions` on a gap no
+  worker can close, and escalates citing test failures that never ran.
 - **Isolation tier** (`sandbox_isolation`): `env` (default) is env-scrub only.
   `strict` asks for a container / no-network / read-only-fs tier when a backend
   is available and **degrades to env-scrub with a warning** when it is not.

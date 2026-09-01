@@ -1228,7 +1228,7 @@ the project was used against a live provider for the first time, plus every
 finding it produced. The framing that matters: **the repo's own database held 0
 tasks and 0 attempts**, so nothing here had ever been driven end to end by a
 real model — and three of the criticals sat on exactly that path, invisible to
-740 passing mock-based tests. 876 tests now; every fix landed with a regression
+740 passing mock-based tests. 878 tests now; every fix landed with a regression
 test that was watched failing first, and the two guards worth doubting were
 falsified by neutering the mechanism and confirming the test went red.
 
@@ -1374,9 +1374,11 @@ falsified by neutering the mechanism and confirming the test went red.
   `_with_retry` and became three `infra_error` retries (now refused at
   construction, where `cli.main` renders it as `error: …`); the child `PATH`
   omitted the running interpreter's script directory, so the default `pytest -q`
-  could not resolve when `agentloop` was invoked by path as the README offers —
-  and `status="error"` is not `"fail"`, so the tests gate silently fell back to
-  the validator's claim; `run_metrics`'s `by_model` rollup counted unfinished
+  could not resolve when `agentloop` was invoked by path as the README offers,
+  so the command failed every round and burned `max_revisions` on a gap no
+  worker could close (see the round-2 note below: an earlier version of this
+  sentence claimed `status="error"` falls back to the validator's `TESTS:`
+  claim, which `TestResult.passed` disproves); `run_metrics`'s `by_model` rollup counted unfinished
   attempts while the headline totals filtered them, so the two never reconciled;
   `config.load` reported an unknown key (a typo'd budget cap) with `print`,
   which is strictly weaker than the `warnings.warn` this project already calls
@@ -1452,6 +1454,40 @@ an unresolvable command fails every round and burns `max_revisions`. The
 documented "Windows job kill" is `taskkill /F /T`, which walks the live
 parent-PID chain and therefore misses a reparented orphan; that residual is now
 named rather than claimed away.
+
+**A third round, from the integration verifier**, which ran 18 scenarios against
+the finished tree — reproducing the pre-fix `vcs` failure, driving the
+cross-origin attacks over raw sockets against a real server, and neutering all
+three round-2 mechanisms to confirm the suite goes red in each direction. 16
+passed; the two that failed were both honesty gaps rather than exposure, and
+both are the same shape as everything else this slice found.
+- **The cache-field reporter was wired into both backends and could only see
+  one of them.** `coerced_usage_fields` scanned top-level keys ending in
+  `tokens`. Anthropic reports its cache counts there; **OpenAI nests them**
+  under `prompt_tokens_details.cached_tokens`, and `prompt_tokens_details` does
+  not end in `tokens` — so on that backend a garbage cached count was invisible
+  while `extract_openai_usage` coerced it to 0 and recorded that as measured.
+  The docs said the reporter covered both, and a reporter present on a path but
+  structurally unable to read that path's data shape *reads as coverage*. It now
+  descends one level and names the field as `parent.child`. Note the direction,
+  because it decides the severity: with `cached` at 0, `tokens_in = prompt -
+  cached` becomes the **full** prompt at the full rate, so this over-billed and
+  tripped the cap early rather than under-measuring.
+- **A correction reached the code and not the prose.** The executor comment
+  wrongly claiming `status="error"` falls back to the validator's `TESTS:` claim
+  was fixed in round 2 — but the same sentence survived in `README.md` and in
+  CLAUDE.md's own round-1 list, so this document contradicted its own
+  correction. `TestResult.passed` returns `False` for `"error"` as well as
+  `"fail"`; only `"na"` falls back. The real consequence, and the one an
+  operator needs, is that an unresolvable test command fails *every* round and
+  burns `max_revisions`.
+
+The verifier's own caveat is worth keeping: all of this remains mock-driven.
+The framing at the top of this section — 0 tasks, 0 attempts, three criticals on
+the one path 740 tests could not see — applies to the verification too. The
+nested-cache gap is precisely that class of bug: a data shape nobody had a live
+sample of. Watch the first few real runs' `attempts` rows and `runner_warning`
+events.
 
 **What was checked and found sound**, because a review naming no confirmed
 property is not a review: all 43 `store.py` write sites are transactionally

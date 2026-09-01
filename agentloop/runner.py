@@ -186,23 +186,56 @@ def coerced_usage_fields(usage) -> list[str]:
 
     Separate from `_int_or_zero` rather than folded into it so that function
     stays a pure `value -> int` used in six places. Total: it cannot raise, for
-    the same money reason everything else on this path is total."""
+    the same money reason everything else on this path is total.
+
+    **Descends one level into nested dicts**, reported as `parent.child`, and
+    that is not generality for its own sake — without it this function was blind
+    on exactly the backend it mattered most for. Anthropic reports its cache
+    counts at the top level; **OpenAI nests them** under
+    `prompt_tokens_details.cached_tokens`, and `prompt_tokens_details` does not
+    end in `tokens`, so a garbage cached count was invisible here while
+    `extract_openai_usage` coerced it to 0 and recorded that as measured:
+
+        coerced_usage_fields({"prompt_tokens": 5000, "completion_tokens": 300,
+                              "prompt_tokens_details": {"cached_tokens": "n/a"}})
+        -> []                      # before: reported nothing
+        -> ['prompt_tokens_details.cached_tokens']   # now
+
+    The wiring was on both backends and the docs said so, which is what made the
+    gap worth naming rather than shrugging at: a reporter present on a path but
+    structurally unable to see that path's data shape reads as coverage.
+
+    One level, not arbitrary recursion: a provider nests counts one deep, and an
+    unbounded walk over a body this function must never raise on is a cost with
+    no known caller."""
     bad: list[str] = []
+
+    def _check(key: str, value, prefix: str = "") -> None:
+        name = f"{prefix}{key}"
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            bad.append(name)
+            return
+        try:
+            int(value)
+        except (ValueError, OverflowError):  # inf / nan
+            bad.append(name)
+
     try:
         if not isinstance(usage, dict):
             return bad
         for key, value in usage.items():
             if value is None or not isinstance(key, str):
                 continue
+            if isinstance(value, dict):
+                for sub_key, sub_value in value.items():
+                    if sub_value is None or not isinstance(sub_key, str):
+                        continue
+                    if sub_key.endswith("tokens"):
+                        _check(sub_key, sub_value, prefix=f"{key}.")
+                continue
             if not key.endswith("tokens"):
                 continue  # not a count field; not ours to judge
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                bad.append(key)
-                continue
-            try:
-                int(value)
-            except (ValueError, OverflowError):  # inf / nan
-                bad.append(key)
+            _check(key, value)
     except Exception:
         return bad
     return sorted(bad)

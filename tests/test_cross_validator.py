@@ -1141,3 +1141,51 @@ def test_a_contentless_or_truncated_completion_raises(monkeypatch):
     ok["choices"][0]["finish_reason"] = "stop"
     r3, _ = _stubbed(monkeypatch, ok)
     assert r3.run("s", "p", "gpt-5-mini").output.startswith("VERDICT")
+
+
+def test_an_unreadable_nested_cache_field_is_reported_on_the_openai_shape(monkeypatch):
+    """The reporter was wired into both backends and could only *see* one of
+    them, which reads as coverage and is not.
+
+    Anthropic reports its cache counts at the top level; OpenAI nests them under
+    `prompt_tokens_details.cached_tokens`, and `prompt_tokens_details` does not
+    end in `tokens` — so a garbage cached count was invisible while
+    `extract_openai_usage` coerced it to 0 and recorded that as a measurement.
+    Measured before the fix: `coerced_usage_fields(...) -> []`.
+    """
+    usage = {
+        "prompt_tokens": 5000,
+        "completion_tokens": 300,
+        "prompt_tokens_details": {"cached_tokens": "n/a"},
+    }
+    assert runner_mod.coerced_usage_fields(usage) == [
+        "prompt_tokens_details.cached_tokens"
+    ]
+
+    r, _sent = _stubbed(monkeypatch, _response(usage=usage))
+    with pytest.warns(RuntimeWarning):
+        result = r.run("system", "prompt", "gpt-4o-mini")
+
+    # The readable fields stay measured; only the unreadable one is declared.
+    assert result.tokens_in == 5000 and result.tokens_out == 300
+    assert result.cache_read_tokens == 0
+    assert result.usage_estimated is True
+    assert "cached_tokens" in result.notes
+    assert "unreadable" in result.notes
+
+
+def test_a_readable_nested_cache_field_reports_nothing(monkeypatch):
+    """The control: the reporter must fire on garbage, not on the shape."""
+    usage = {
+        "prompt_tokens": 5000,
+        "completion_tokens": 300,
+        "prompt_tokens_details": {"cached_tokens": 1000},
+    }
+    assert runner_mod.coerced_usage_fields(usage) == []
+
+    r, _sent = _stubbed(monkeypatch, _response(usage=usage))
+    result = r.run("system", "prompt", "gpt-4o-mini")
+    assert result.usage_estimated is False
+    assert result.notes == ""
+    # ...and the cached share is still subtracted out of the inclusive prompt.
+    assert result.tokens_in == 4000 and result.cache_read_tokens == 1000
