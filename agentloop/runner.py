@@ -266,6 +266,7 @@ def never_zero_usage(
     source: str,
     model: str,
     reason: str,
+    coerced: list[str] | None = None,
 ) -> tuple[tuple[int, int, int, int], str]:
     """Substitute an estimate for any usage field a provider left at zero, and
     say so. Returns `((in, out, cache_write, cache_read), note)`, where `note`
@@ -295,13 +296,32 @@ def never_zero_usage(
     if tokens_out == 0:
         tokens_out = est_out
         estimated.append("output")
-    note = ""
+    parts: list[str] = []
     if estimated:
-        note = (
-            f"{source}: {reason} for model {model!r}; estimated "
+        parts.append(
+            f"{reason} for model {model!r}; estimated "
             f"{' and '.join(estimated)} tokens (~{tokens_in} in / "
             f"{tokens_out} out) so the budget cap still measures this attempt."
         )
+    # A field that was *present and unreadable* is a different thing from one
+    # that was absent, and the estimate above cannot see the difference for the
+    # two **cache** fields — nothing estimates those, so `_int_or_zero` coerced
+    # a garbage `cache_read_input_tokens` to 0 and the result was recorded as a
+    # measurement: `estimated` empty, `note` empty, `usage_estimated=False`, no
+    # `runner_warning`. Per the decision rules the token total includes cache
+    # reads and cost prices them at 0.10x, so on a cache-heavy run that is the
+    # dominant term of the budget cap. Reported here rather than estimated,
+    # because there is no honest estimate for a cache hit — but reported, so it
+    # can never pass as measured.
+    if coerced:
+        parts.append(
+            f"usage field(s) {', '.join(coerced)} were present "
+            f"but unreadable and are recorded as 0; the totals for model "
+            f"{model!r} understate this attempt."
+        )
+    note = ""
+    if parts:
+        note = f"{source}: " + " ".join(parts)
         warnings.warn(note, RuntimeWarning, stacklevel=2)
     return (tokens_in, tokens_out, cache_creation, cache_read), note
 
@@ -561,6 +581,7 @@ class ClaudeSDKRunner:
         # which is the difference between the two `reason` strings below and the
         # only thing the operator can act on.
         saw_usage = False
+        coerced: list[str] = []
         async for message in query(prompt=prompt, options=options):
             text = getattr(message, "result", None)
             if isinstance(text, str):
@@ -575,6 +596,7 @@ class ClaudeSDKRunner:
                 usage = getattr(message, "usage", None)
                 if isinstance(usage, dict) and usage:
                     saw_usage = True
+                    coerced = coerced_usage_fields(usage)
                     (tokens_in, tokens_out, cache_creation, cache_read) = extract_usage(
                         usage
                     )
@@ -598,6 +620,7 @@ class ClaudeSDKRunner:
             output,
             source="claude-agent-sdk",
             model=model,
+            coerced=coerced,
             reason=(
                 "usage reported zero"
                 if saw_usage
@@ -868,9 +891,11 @@ class OpenAICompatRunner:
         # Usage second, and it may *not* raise: by this point the completion is
         # in hand and already billed. Any schema surprise degrades to the
         # estimate path instead of discarding it and re-paying via `_with_retry`.
+        coerced: list[str] = []
         try:
             usage = data.get("usage") if isinstance(data, dict) else None
             if isinstance(usage, dict) and usage:
+                coerced = coerced_usage_fields(usage)
                 tokens_in, tokens_out, cache_creation, cache_read = (
                     extract_openai_usage(usage)
                 )
@@ -889,6 +914,7 @@ class OpenAICompatRunner:
             output,
             source=self.base_url,
             model=model,
+            coerced=coerced,
             reason=reason,
         )
 

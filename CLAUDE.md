@@ -1228,7 +1228,7 @@ the project was used against a live provider for the first time, plus every
 finding it produced. The framing that matters: **the repo's own database held 0
 tasks and 0 attempts**, so nothing here had ever been driven end to end by a
 real model — and three of the criticals sat on exactly that path, invisible to
-740 passing mock-based tests. 871 tests now; every fix landed with a regression
+740 passing mock-based tests. 876 tests now; every fix landed with a regression
 test that was watched failing first, and the two guards worth doubting were
 falsified by neutering the mechanism and confirming the test went red.
 
@@ -1425,6 +1425,22 @@ the round, not against it.
   not see any of this: with the exemption removed entirely, all 215 tests still
   passed. It now fails in *both* directions — too permissive and too strict —
   and that was verified by neutering each way.
+
+Three more from the same round, each a place where a degradation existed and
+nothing recorded it — the project's own standing rule is that a warning nobody
+sees in `agentloop events` is unrecorded. A garbage **cache**-token field was
+coerced to 0 and written as a *measurement*: nothing estimates the cache fields,
+so `estimated` stayed empty, `note` stayed empty, `usage_estimated` stayed False
+and no `runner_warning` fired — and per the decision rules the token total
+includes cache reads, so on a cache-heavy run that is the dominant term of the
+budget cap. `coerced_usage_fields` now reports it (and note the failure mode
+worth remembering: the reporter was written, and then *not called* — dead code
+that reads as a fix, which is why its test was written to fail against exactly
+that state). A typo'd `loopconfig.json` key now logs a `config_warning` event
+from `Loop.__init__`, the first place in that path with a store. And
+`_run_parallel` recorded only `errors[0]`, discarding every other worker's
+exception on the one path whose whole purpose is that a dying worker must not be
+silent; each is now logged as `worker_failed` before the first is raised.
 
 Two smaller ones from the same round, both places the code and its own prose had
 drifted apart: the `` added to stop `TESTS: nap` reading as `na` had silently

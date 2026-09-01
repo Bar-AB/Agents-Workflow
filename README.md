@@ -38,7 +38,7 @@ agentloop/
                redo / pause / resume / abort / events / serve / memory /
                charter / eval
 web/           Vite + React + TypeScript dashboard
-tests/         871 tests on MockRunner + real subprocesses (no API keys needed)
+tests/         876 tests on MockRunner + real subprocesses (no API keys needed)
 ```
 
 ## Quick start

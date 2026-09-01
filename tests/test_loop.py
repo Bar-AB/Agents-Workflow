@@ -1053,3 +1053,75 @@ def test_resume_clears_the_pause_message_it_is_undoing(tmp_path):
     assert finished.status is TaskStatus.DONE
     assert "Paused by human" not in finished.escalation_reason
     store.close()
+
+
+def test_a_typod_config_key_reaches_the_audit_log(tmp_path, monkeypatch):
+    """A `warnings.warn` alone reaches neither `agentloop events`, the REST API
+    nor the SSE feed — the same gap that made the original `print` insufficient,
+    one channel up. The stakes are a budget: `"max_cost_per_task"` (dropping
+    `usd`) keeps the shipped default while `/api/config` renders the effective
+    value with nothing saying the file disagreed."""
+    import json as _json
+
+    cfg_path = tmp_path / "loopconfig.json"
+    cfg_path.write_text(
+        _json.dumps({"max_cost_per_task": 2.0, "approve_threshold": 0.8}),
+        encoding="utf8",
+    )
+    with pytest.warns(RuntimeWarning):
+        config = LoopConfig.load(str(cfg_path))
+    config.workspace_root = str(tmp_path / "ws")
+    config.allow_test_exec = False
+    config.vcs_enabled = False
+
+    store = Store(tmp_path / "t.db")
+    Loop(store, MockRunner([]), Registry.load(), config)
+
+    (event,) = [e for e in store.events() if e["kind"] == "config_warning"]
+    assert event["payload"]["unknown_keys"] == ["max_cost_per_task"]
+    # The control: the key that *was* recognised really took effect, so this is
+    # about the ignored one and not about the file being rejected wholesale.
+    assert config.approve_threshold == 0.8
+    store.close()
+
+
+def test_a_clean_config_writes_no_warning_event(tmp_path):
+    """The control: the row must mean "a key was ignored", not "a loop started"."""
+    import json as _json
+
+    cfg_path = tmp_path / "loopconfig.json"
+    cfg_path.write_text(_json.dumps({"approve_threshold": 0.8}), encoding="utf8")
+    config = LoopConfig.load(str(cfg_path))
+    config.workspace_root = str(tmp_path / "ws")
+    config.allow_test_exec = False
+    config.vcs_enabled = False
+
+    store = Store(tmp_path / "t.db")
+    Loop(store, MockRunner([]), Registry.load(), config)
+    assert not [e for e in store.events() if e["kind"] == "config_warning"]
+    store.close()
+
+
+def test_every_failing_parallel_worker_is_recorded_not_just_the_first(tmp_path):
+    """`errors` is a list because n workers fail independently — a real bug in
+    one thread and a locked database in two others is three exceptions — and
+    raising `errors[0]` reported one while discarding the rest, on a path whose
+    whole purpose is that a dying worker must not be silent."""
+    import sqlite3
+
+    store = Store(tmp_path / "t.db")
+    for _ in range(3):
+        add_task(store)
+    loop, _ = make_loop(store, [APPROVE] * 20, max_parallel_workers=3)
+
+    def always_locked(worker_id):
+        raise sqlite3.OperationalError("database is locked")
+
+    store.claim_next_task = always_locked
+    with pytest.raises(sqlite3.OperationalError):
+        loop.run()
+
+    failures = [e for e in store.events() if e["kind"] == "worker_failed"]
+    assert len(failures) == 3, "each worker's exception must be recorded"
+    assert sum(1 for e in failures if e["payload"]["raised"]) == 1
+    store.close()

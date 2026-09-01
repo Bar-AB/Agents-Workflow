@@ -297,7 +297,18 @@ class LoopConfig:
                     RuntimeWarning,
                     stacklevel=2,
                 )
-            return cls(**{k: v for k, v in data.items() if k in known})
+            config = cls(**{k: v for k, v in data.items() if k in known})
+            # Carried so `Loop.__init__` can put it in the audit log, where this
+            # project's own convention says a degradation belongs — the warning
+            # above is still invisible to `agentloop events`, the REST API and
+            # the SSE feed, which is the exact gap that made the previous
+            # `print` insufficient. Set as a plain attribute rather than a
+            # dataclass field on purpose: it is a fact about *this load*, not a
+            # setting, so it must not appear in `asdict`, in `/api/config`, or
+            # in a round-tripped `loopconfig.json`.
+            config.unknown_keys = list(unknown)
+            config.unknown_keys_path = str(path)
+            return config
         return cls()
 
 

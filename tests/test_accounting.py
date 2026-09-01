@@ -303,3 +303,73 @@ def test_the_sdk_runner_reports_a_real_usage_dict_as_measured(monkeypatch):
     assert (out.tokens_in, out.tokens_out, out.cache_read_tokens) == (900, 120, 40)
     assert out.usage_estimated is False
     assert out.notes == ""
+
+
+def test_an_unreadable_cache_field_is_reported_not_recorded_as_zero(monkeypatch):
+    """A usage field that is *present and unreadable* is not the same as an
+    absent one, and only the cache fields could not tell the difference.
+
+    Nothing estimates `cache_creation`/`cache_read`, so `_int_or_zero` coerced a
+    garbage `cache_read_input_tokens` to 0 and the result was recorded as a
+    measurement — `estimated` empty, `note` empty, `usage_estimated=False`, no
+    `runner_warning`. Per the decision rules the token total includes cache
+    reads and cost prices them at 0.10x, so on a cache-heavy run that is the
+    dominant term of the budget cap: the cap silently under-measures and the
+    dashboard renders the fabricated zero as spend."""
+    import asyncio
+
+    from agentloop.runner import ClaudeSDKRunner
+
+    class Result:
+        result = "the worker output"
+        usage = {
+            "input_tokens": 5000,
+            "output_tokens": 300,
+            "cache_read_input_tokens": "n/a",  # present, unreadable
+        }
+        content = []
+
+    async def fake_query(prompt, options):
+        yield Result()
+
+    monkeypatch.setattr(runner, "query", fake_query, raising=False)
+    monkeypatch.setattr(runner, "ResultMessage", Result, raising=False)
+
+    with pytest.warns(RuntimeWarning):
+        out = asyncio.run(ClaudeSDKRunner()._run_async("s", "p", "claude-opus-5", None))
+
+    # The readable fields are still measured, not estimated over.
+    assert (out.tokens_in, out.tokens_out) == (5000, 300)
+    assert out.cache_read_tokens == 0
+    # ...and the zero is declared rather than passed off as a measurement.
+    assert out.usage_estimated is True
+    assert "cache_read_input_tokens" in out.notes
+    assert "unreadable" in out.notes
+
+
+def test_a_wholly_readable_usage_dict_reports_nothing(monkeypatch):
+    """The control: the reporter must fire on garbage, not on every call."""
+    import asyncio
+
+    from agentloop.runner import ClaudeSDKRunner
+
+    class Result:
+        result = "out"
+        usage = {
+            "input_tokens": 5000,
+            "output_tokens": 300,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 120,
+        }
+        content = []
+
+    async def fake_query(prompt, options):
+        yield Result()
+
+    monkeypatch.setattr(runner, "query", fake_query, raising=False)
+    monkeypatch.setattr(runner, "ResultMessage", Result, raising=False)
+
+    out = asyncio.run(ClaudeSDKRunner()._run_async("s", "p", "claude-opus-5", None))
+    assert out.usage_estimated is False
+    assert out.notes == ""
+    assert out.cache_read_tokens == 120

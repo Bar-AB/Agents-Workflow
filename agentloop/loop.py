@@ -343,6 +343,35 @@ class Loop:
         # (claim_next_task only resumes tasks a worker already owns).
         self.worker_id = "loop"
 
+        # A typo'd config key lands in the audit log, not only in a warning.
+        # `LoopConfig.load` has no store, so it records what it ignored and this
+        # is the first place with somewhere to put it. The stakes are a budget:
+        # an operator who writes `"max_cost_per_task"` (dropping `usd`) keeps
+        # the shipped default and bills every run against a cap they believe
+        # they lowered, while `/api/config` renders the *effective* value with
+        # nothing saying the file disagreed. A `warnings.warn` alone reaches
+        # neither `agentloop events`, the REST API nor the SSE feed — the same
+        # gap that made the original `print` insufficient, one channel up.
+        #
+        # Total: telemetry must never break construction.
+        unknown = list(getattr(config, "unknown_keys", ()) or ())
+        if unknown:
+            try:
+                self.store.log_event(
+                    None,
+                    "config_warning",
+                    {
+                        "path": str(getattr(config, "unknown_keys_path", "")),
+                        "unknown_keys": unknown,
+                        "message": (
+                            "These keys were ignored; the shipped default is in "
+                            "force for anything you meant to set."
+                        ),
+                    },
+                )
+            except Exception:
+                pass
+
     # -- public API ----------------------------------------------------------
 
     def run(self, max_tasks: int | None = None) -> int:
@@ -500,6 +529,27 @@ class Loop:
                 t.join()
             raise
         if errors:
+            # Every one of them is recorded before the first is raised. `errors`
+            # is a list because n workers can fail independently — a real bug in
+            # one thread and a locked database in two others is three
+            # exceptions — and raising `errors[0]` reports one while discarding
+            # the rest, on a path whose whole purpose is that a dying worker
+            # must not be silent. The raise still carries only the first, so the
+            # caller's behaviour is unchanged; what changes is that the others
+            # stop vanishing.
+            for exc in errors:
+                try:
+                    self.store.log_event(
+                        None,
+                        "worker_failed",
+                        {
+                            "error": f"{type(exc).__name__}: {exc}"[:1000],
+                            "workers": n,
+                            "raised": exc is errors[0],
+                        },
+                    )
+                except Exception:
+                    pass  # telemetry must not replace the exception below
             raise errors[0]
         return state["claimed"]
 
