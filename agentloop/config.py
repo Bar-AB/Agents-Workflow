@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import re
+import warnings
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
@@ -92,7 +93,21 @@ class LoopConfig:
     approve_threshold: float = 0.70
     severe_threshold: float = 0.40
     max_revisions: int = 3
-    max_tokens_per_task: int = 500_000
+    # Raised from 500_000 in slice 8. Measured on a real `--runner claude` run
+    # against the README's own quick-start task: the validator returned
+    # `approve` at 0.85 and the task escalated anyway with "Budget cap exceeded
+    # (tokens=556515, cost=$0.49)" — the *token* cap tripping at under a tenth
+    # of the cost cap, on the first task a new user runs.
+    #
+    # The two caps measure different things and only one of them was calibrated.
+    # Per the decision rules, the token total includes prompt-cache reads, so a
+    # cached second round re-counts the whole prompt; 500k was roughly one and a
+    # half rounds of a real conversation. The cache-read *rule* is deliberately
+    # unchanged — the cap stays a true ceiling on everything the loop consumes,
+    # priced at 0.10x on the cost side where it belongs — because changing what
+    # the number counts would rewrite a rule documented in CLAUDE.md, the README
+    # table and the tests, to fix what was only ever a badly chosen default.
+    max_tokens_per_task: int = 3_000_000
     max_cost_usd_per_task: float = 5.00
     # Tasks at or above this risk level require explicit human sign-off even
     # after validator approval (spec §4.7). Levels: 0=low, 1=normal, 2=high.
@@ -263,11 +278,37 @@ class LoopConfig:
             if unknown:
                 # Surface typos rather than silently ignoring a setting the
                 # user believes is in effect.
-                print(
-                    f"warning: ignoring unknown config keys in {path}: "
-                    f"{', '.join(unknown)}"
+                #
+                # `warnings.warn`, not `print`. The stakes are a budget: an
+                # operator who writes `"max_cost_per_task"` (dropping `usd`)
+                # keeps the *default* cap and bills every run against a limit
+                # they believe they lowered. A `print` is strictly weaker than
+                # the `warnings.warn` this project already calls insufficient
+                # for recorded degradation — it is invisible to `-W error`,
+                # uncapturable by `pytest.warns`, and under `agentloop serve`
+                # it scrolls past in a terminal nobody is watching. This is the
+                # same argument `runner.py` makes for preferring `warn` over
+                # `print`, applied to the one file that decides what a run is
+                # allowed to spend.
+                warnings.warn(
+                    f"ignoring unknown config keys in {path}: "
+                    f"{', '.join(unknown)} — check for a typo; the shipped "
+                    f"default is in force for anything you meant to set.",
+                    RuntimeWarning,
+                    stacklevel=2,
                 )
-            return cls(**{k: v for k, v in data.items() if k in known})
+            config = cls(**{k: v for k, v in data.items() if k in known})
+            # Carried so `Loop.__init__` can put it in the audit log, where this
+            # project's own convention says a degradation belongs — the warning
+            # above is still invisible to `agentloop events`, the REST API and
+            # the SSE feed, which is the exact gap that made the previous
+            # `print` insufficient. Set as a plain attribute rather than a
+            # dataclass field on purpose: it is a fact about *this load*, not a
+            # setting, so it must not appear in `asdict`, in `/api/config`, or
+            # in a round-tripped `loopconfig.json`.
+            config.unknown_keys = list(unknown)
+            config.unknown_keys_path = str(path)
+            return config
         return cls()
 
 

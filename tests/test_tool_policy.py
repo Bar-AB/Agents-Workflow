@@ -3098,15 +3098,46 @@ def test_a_rejected_tool_takes_down_the_capability_it_shares(store):
     ]
 
 
-def test_a_pending_tool_request_withholds_the_capability_too(store):
-    """A withheld ask subtracts exactly as a rejected one does. The audit trail
-    records a pending row as withheld, so leaving the capability in place would be
-    the same lie one status earlier."""
+def test_a_pending_tool_request_withholds_a_capability_the_role_lacks(store):
+    """A pending ask subtracts the concrete capability **it alone would confer**.
+
+    Rewritten in slice 8, and the reasoning matters because changing a test to
+    match code is normally the wrong move. This test predates the E3/G1
+    remediation block below and was never reconciled with it. That block, and
+    CLAUDE.md's decision-rules section, both state the rule in terms of
+    *capability*: "an **undecided** (pending) request for a capability the role
+    already holds ... takes nothing away, because nobody was ever asked", and
+    the reason given is that otherwise an agent revokes its own baseline simply
+    by asking for it.
+
+    The old assertion used `spec=["git", "search"]` with a pending `shell`, and
+    `git` and `shell` both resolve to `Bash` — so the role *already held* the
+    capability, and the row was subtracting it anyway. `LOGICAL_TOOL_MAP` is not
+    injective, so a name-level test of "already holds" and a capability-level
+    subtraction disagree on exactly the collision pairs, and the shipped worker
+    prompt teaches `TOOL_REQUEST: shell` by worked example.
+
+    So the case is split. Here the role holds **no** `Bash` at all, which is the
+    scenario the original name was describing, and the pending row still
+    withholds — the audit trail and the resolution agree.
+    """
     task = add_task(store)
     _add(store, task.id, "shell")
-    spec = _spec(["git", "search"])
+    spec = _spec(["search"])  # no `git`: the role holds no Bash of its own
 
     assert tools_for(store, LoopConfig(), spec, task.id, "worker") == ["search"]
+
+
+def test_a_pending_ask_for_a_capability_the_role_already_holds_takes_nothing(store):
+    """The other half of the split above, and the defect it was hiding."""
+    task = add_task(store)
+    _add(store, task.id, "shell")
+    spec = _spec(["git", "search"])  # `git` already confers Bash
+
+    assert tools_for(store, LoopConfig(), spec, task.id, "worker") == [
+        "git",
+        "search",
+    ]
 
 
 def test_an_auto_row_never_subtracts_anything(store):
@@ -3153,13 +3184,21 @@ def test_a_tool_sharing_nothing_concrete_is_untouched(store):
     ]
 
 
-def test_the_collateral_loss_is_audited_where_a_human_will_read_it(store):
-    """The surprising half of the design, made visible rather than discovered.
+def test_an_optional_ask_never_costs_the_worker_a_capability_it_already_had(store):
+    """End-to-end, and slice 8's inversion of this test.
 
-    End-to-end: the worker asks for `shell`, the row sits `pending`, and the
-    *next* invocation's `tools` has lost the `git` the shipped role declares. A
-    human reading the audit trail — with no access to the source — must be able to
-    learn that `git` stopped working and why.
+    It used to assert the opposite: that round 2's `tools` had *lost* the `git`
+    the shipped role declares, because the worker wrote `TOOL_REQUEST: shell`
+    and `shell`/`git` both resolve to `Bash`. That is the self-revocation
+    CLAUDE.md's rule exists to prevent — "an undecided (pending) request for a
+    capability the role already holds ... takes nothing away, because nobody was
+    ever asked" — and it fired on an **optional** ask, which never reaches a
+    human queue at all. The shipped worker prompt teaches `TOOL_REQUEST: shell`
+    by worked example, so this was the taught path.
+
+    The audit half of the old test has not been dropped, only moved to where the
+    loss is real: a human's **rejection**, which still subtracts unconditionally
+    (see `test_a_rejected_baseline_capability_loss_is_audited`).
     """
     task = add_task(store)
     loop, runner = _loop(store, [MARK_OPTIONAL_SHELL, REVISE, "worker out v2", APPROVE])
@@ -3167,8 +3206,37 @@ def test_the_collateral_loss_is_audited_where_a_human_will_read_it(store):
 
     worker_calls = [c for c in runner.calls if "# Task:" in c["prompt"]]
     assert "git" in worker_calls[0]["tools"]  # round 1: no row existed yet
-    assert "git" not in worker_calls[1]["tools"]  # round 2: shell is withheld
-    assert "shell" not in worker_calls[1]["tools"]
+    assert "git" in worker_calls[1]["tools"]  # round 2: still held, nobody decided
+    assert "shell" not in worker_calls[1]["tools"]  # ...and still not granted
+
+    # Nothing was taken, so nothing is announced as taken. A withholding event
+    # here would be the mirror defect: telling a human a capability was lost
+    # when the resolution kept it.
+    assert not [
+        e for e in store.events(task.id) if e["kind"] == "tool_capability_withheld"
+    ]
+    # The request itself is still recorded — the row and its audit are not what
+    # changed, only what the undecided row costs.
+    assert [e for e in store.events(task.id) if e["kind"] == "tool_requested"]
+    prompts = [e for e in store.events(task.id) if e["kind"] == "worker_prompt"]
+    assert "git" in prompts[1]["payload"]["tools"]
+
+
+def test_a_rejected_baseline_capability_loss_is_audited(store):
+    """The surprising half of the design, made visible rather than discovered —
+    kept from the test above and re-aimed at the decision that really causes it.
+
+    A human rejects `shell`; `git` shares its `Bash` and stops working. That is
+    the fail-closed direction (a human who believes they closed a gate must find
+    it closed), and it is exactly the side effect that must not be left to be
+    discovered from the source.
+    """
+    task = add_task(store)
+    spec = _spec(["file_io", "git", "search", "task_state"])
+    rid = _add(store, task.id, "shell")
+    store.tool_request_decide(rid, approved=False, by="human")
+
+    assert "git" not in tools_for(store, LoopConfig(), spec, task.id, "worker")
 
     (event,) = [
         e for e in store.events(task.id) if e["kind"] == "tool_capability_withheld"
@@ -3179,10 +3247,6 @@ def test_the_collateral_loss_is_audited_where_a_human_will_read_it(store):
     assert payload["capability"] == ["Bash"]
     # And as a sentence, so the fact does not depend on a reader joining two lists.
     assert "git" in payload["message"] and "shell" in payload["message"]
-    # The prompt event tells the truth about what was handed over: the `tools` it
-    # records is the subtracted list, not the one the policy started from.
-    prompts = [e for e in store.events(task.id) if e["kind"] == "worker_prompt"]
-    assert "git" not in prompts[1]["payload"]["tools"]
 
 
 def test_the_queued_request_says_what_deciding_it_also_decides(store):
@@ -3548,18 +3612,21 @@ def test_a_previewed_grant_of_nothing_is_what_the_gate_then_enforces(store):
 def test_a_previewed_grant_of_bash_is_also_what_the_gate_enforces(store):
     """The non-vacuity control for the test above: same shape, no rejected sibling,
     and now the preview promises `Bash` and the gate delivers it. Without this,
-    the pair above would pass on a preview that always promised nothing."""
+    the pair above would pass on a preview that always promised nothing.
+
+    Slice 8 dropped `git` from the spec. It used to be declared, and the control
+    got its non-vacuity from the *defect*: the pending `shell` stripped the
+    role's own `git`, so approving appeared to "grant Bash" when it was only
+    handing back what the ask had just taken. With a role that genuinely has no
+    Bash, the promise and the delivery are both about a real new capability."""
     task = add_task(store)
-    spec = _spec(["file_io", "git", "search", "task_state"])
+    spec = _spec(["file_io", "search", "task_state"])  # no `git`: no Bash held
     shell = _add(store, task.id, "shell")
 
     effect = _effect(store, "shell", spec)
     assert effect.approve_grants == ["Bash"]
-    # And the sibling the role declares starts working again with it: while the ask
-    # is pending, its own withheld `Bash` has already taken `git` down.
-    assert effect.approve_enables == ["git"]
-    assert effect.costs_now == ["git"]
-    assert effect.reject_removes == []  # nothing left to lose
+    assert effect.costs_now == []  # an undecided ask costs nothing
+    assert effect.reject_removes == []  # and there is no sibling to take down
 
     store.tool_request_decide(shell, approved=True, by="human")
     assert "Bash" in resolve_tools(tools_for(store, LoopConfig(), spec, task.id, "w"))
@@ -3618,11 +3685,22 @@ def test_effective_tools_is_pure_over_its_arguments(store):
     """The seam's own contract: given the same rows it returns the same answer, and
     it takes no store at all — which is what lets the read paths call it."""
     config = LoopConfig()
-    args = (config, "worker", ["file_io", "git"], [], ["shell"], ["shell"])
+    # A *rejected* `shell` (withheld, not pending), so the subtraction is real
+    # and the equality below is not comparing two empty answers. Slice 8: with a
+    # pending row this pair became a no-op, because an undecided ask no longer
+    # costs the role a capability it already holds.
+    args = (config, "worker", ["file_io", "git"], [], ["shell"], [])
     first = effective_tools(*args)
     assert first == effective_tools(*args)
-    assert first.allowed == ["file_io"]  # git lost its Bash to the pending shell
+    assert first.allowed == ["file_io"]  # git lost its Bash to the rejected shell
     assert first.removed == ["git"]
+
+    # ...and the same arguments with the row merely *pending* take nothing, which
+    # is what makes the assertion above about the decision rather than the name.
+    pending = effective_tools(
+        config, "worker", ["file_io", "git"], [], ["shell"], ["shell"]
+    )
+    assert pending.allowed == ["file_io", "git"]
 
 
 # -- E4 cycle 2 / H1 + H2: the rendered claim is computed, not narrated --------
@@ -3697,11 +3775,26 @@ def test_a_pending_row_that_can_deliver_nothing_does_not_promise_a_grant(store):
 
 def test_a_pending_row_that_can_deliver_something_says_it_would(store):
     """The non-vacuity control: no rejected sibling, so approving really does
-    grant `Bash` and the verb is allowed to promise it."""
-    spec = _spec(["file_io", "git", "search", "task_state"])
+    grant `Bash` and the verb is allowed to promise it.
+
+    Slice 8 dropped `git` from the spec for the same reason as
+    `test_a_previewed_grant_of_bash_is_also_what_the_gate_enforces`: with `git`
+    declared the role already holds Bash, so "would grant" was never the honest
+    verb — "already has" is."""
+    spec = _spec(["file_io", "search", "task_state"])  # no `git`: no Bash held
     task = add_task(store)
     _add(store, task.id, "shell")
     assert _effect(store, "shell", spec).verb == "would grant"
+
+
+def test_a_pending_row_for_a_capability_the_role_holds_says_already_has(store):
+    """The other side of the verb, and the display half of slice 8's fix: with
+    `git` declared the role already has `Bash`, so approving `shell` delivers no
+    new capability and the headline must not claim it would."""
+    spec = _spec(["file_io", "git", "search", "task_state"])
+    task = add_task(store)
+    _add(store, task.id, "shell")
+    assert _effect(store, "shell", spec).verb == "already has"
 
 
 def test_an_approved_row_not_in_force_does_not_claim_to_grant(store):
@@ -3830,3 +3923,120 @@ def test_the_park_reason_does_not_offer_rejection_as_a_way_out(store):
     # leaving the human to discover it by taking one.
     assert "leaves it parked" in reason
     assert "parks on the same request" in reason
+
+
+# ---------------------------------------------------------------------------
+# Slice 8: the pending exemption has to speak the same language as the
+# subtraction.
+#
+# `held` was a set of logical NAMES; `subtract_withheld` works over the
+# CONCRETE footprint from `resolve_tools`. `LOGICAL_TOOL_MAP` is not injective,
+# so the two disagreed on exactly the collision pairs — and the pair that
+# collides is the one the shipped system prompt teaches agents to ask for.
+# ---------------------------------------------------------------------------
+
+WORKER_DECLARES = ["file_io", "git", "search", "task_state"]
+
+
+def test_a_pending_ask_for_a_sibling_name_costs_the_role_nothing():
+    """`shell` and `git` both resolve to `Bash`. An undecided, non-blocking ask
+    is nobody's decision — it must not silently revoke a held capability."""
+    config = LoopConfig()
+    effect = effective_tools(
+        config, "worker", WORKER_DECLARES, [], ["shell"], ["shell"]
+    )
+    assert effect.allowed == WORKER_DECLARES
+    assert effect.lost == []
+
+
+def test_a_pending_ask_for_its_own_name_still_costs_nothing():
+    """The case that already worked, kept as a regression."""
+    config = LoopConfig()
+    effect = effective_tools(config, "worker", WORKER_DECLARES, [], ["git"], ["git"])
+    assert effect.allowed == WORKER_DECLARES
+    assert effect.lost == []
+
+
+def test_a_rejected_sibling_name_still_subtracts_unconditionally():
+    """The control, and the load-bearing half: widening the *pending* exemption
+    must not widen the *rejected* one. A human who believes they closed a gate
+    must find it closed, even though `git` was in the role's baseline."""
+    config = LoopConfig()
+    effect = effective_tools(
+        config,
+        "worker",
+        WORKER_DECLARES,
+        [],
+        ["shell"],
+        [],  # decided, not pending
+    )
+    assert "git" not in effect.allowed
+    assert effect.lost == ["git"]
+
+
+def test_a_pending_ask_for_an_unheld_capability_is_not_granted_by_the_exemption():
+    """The other control: exempting a pending row from subtraction must not
+    hand over a capability the role never had. `web` shares nothing with the
+    worker's baseline, so it is neither granted nor taken."""
+    config = LoopConfig()
+    effect = effective_tools(config, "worker", WORKER_DECLARES, [], ["web"], ["web"])
+    assert effect.allowed == WORKER_DECLARES
+    assert "web" not in effect.allowed
+
+
+def test_a_pending_ask_whose_footprint_only_overlaps_still_costs_nothing():
+    """The boundary the first version of this exemption got wrong, and the one
+    its tests could not see.
+
+    `LOGICAL_TOOL_MAP` has *partial* overlaps as well as exact collisions:
+    `file_io` -> [Read, Write, Edit] and `file_read` -> [Read], and the shipped
+    **planner** declares `file_read`. The first fix tested `subset`, so
+    `{Read, Write, Edit} <= {Read, ...}` was False, the row was not exempt, and
+    `subtract_withheld` removed every name overlapping `Read` — measured:
+
+        planner declares:          ['file_read', 'search', 'task_state']
+        pending optional file_io -> ['search']   lost ['file_read']
+
+    Same self-revocation as the `git`/`shell` case, one collision pair over.
+    """
+    config = LoopConfig()
+    declared = ["file_read", "search", "task_state"]
+    effect = effective_tools(config, "planner", declared, [], ["file_io"], ["file_io"])
+    assert effect.allowed == declared
+    assert effect.lost == []
+
+
+def test_a_rejected_partially_overlapping_ask_still_subtracts():
+    """The control, and the half that must not widen: a human's denial of
+    `file_io` still takes `file_read` down with it, because that is the
+    fail-closed direction."""
+    config = LoopConfig()
+    declared = ["file_read", "search", "task_state"]
+    effect = effective_tools(config, "planner", declared, [], ["file_io"], [])
+    assert "file_read" not in effect.allowed
+    assert effect.lost == ["file_read"]
+
+
+def test_a_pending_ask_sharing_nothing_is_still_withheld():
+    """The other control, and the one that makes the exemption non-vacuous: a
+    suite that passed with the exemption removed entirely would prove nothing,
+    so pin the case where the row genuinely *is* withheld."""
+    config = LoopConfig()
+    declared = ["search", "task_state"]  # Glob/Grep only: shares nothing with Bash
+    effect = effective_tools(config, "worker", declared, [], ["shell"], ["shell"])
+    assert "shell" not in effect.allowed
+    assert effect.withheld == ["shell"]
+
+
+def test_a_pending_ask_cannot_revoke_a_capability_a_human_just_granted():
+    """`held` was built only from the declared paths, so a granted capability
+    was not exempt. With `gate_declared_tools=True` a human approves `git`, and
+    the agent's next `TOOL_REQUEST: shell` — the registry's own worked example,
+    undecided and never shown to anyone — subtracted the `Bash` that human had
+    just granted. A grant is the strongest form of "already holds" there is."""
+    config = LoopConfig(gate_declared_tools=True)
+    effect = effective_tools(
+        config, "worker", ["search"], ["git"], ["shell"], ["shell"]
+    )
+    assert "git" in effect.allowed
+    assert effect.lost == []

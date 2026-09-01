@@ -27,6 +27,15 @@ export function useLiveLoop() {
   const [memory, setMemory] = useState<MemoryFact[]>([])
   const [toolRequests, setToolRequests] = useState<ToolRequest[]>([])
   const [events, setEvents] = useState<EventRow[]>([])
+  // A monotonic "something happened" counter, separate from `events.length`.
+  // `TaskDetail` used the length as its refetch trigger, and the array is
+  // capped at MAX_EVENTS — so after 300 events (about fifteen task rounds) the
+  // length was constant forever and the detail pane stopped refetching for the
+  // rest of the session. It then showed a stale status, output, verdict list
+  // and tool-request rows directly above the Approve / Reject / Redo buttons,
+  // with no way to force it: the header Refresh does not refetch the detail,
+  // and re-clicking the same card sets `selected` to the value it already has.
+  const [revision, setRevision] = useState(0)
   const [connection, setConnection] = useState<Connection>('connecting')
   const [error, setError] = useState<string | null>(null)
 
@@ -74,6 +83,7 @@ export function useLiveLoop() {
       try {
         const row = JSON.parse((e as MessageEvent).data) as EventRow
         setEvents((prev) => [row, ...prev].slice(0, MAX_EVENTS))
+        setRevision((n) => n + 1)
         scheduleRefresh()
       } catch {
         /* a malformed frame shouldn't take the dashboard down */
@@ -101,6 +111,7 @@ export function useLiveLoop() {
     memory,
     toolRequests,
     events,
+    revision,
     connection,
     error,
     refresh,

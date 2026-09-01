@@ -13,7 +13,14 @@ layered accordingly:
   `split_command` and run without a shell, so `pytest -q; rm -rf /` is passed
   as literal argv, not interpreted.
 - cwd is pinned to the task's own workspace directory.
-- A timeout bounds runtime; captured output is truncated to bound memory.
+- A timeout bounds runtime **and is enforced against the whole process tree**,
+  and output is read into a bounded ring buffer rather than truncated after the
+  fact. Both were promises this docstring made and the code did not keep: see
+  `_run_bounded`, which replaced `subprocess.run(capture_output=True,
+  timeout=...)` after a child was measured writing 331 MB in 4 s into the
+  orchestrator's heap, and a surviving grandchild holding the inherited pipe was
+  measured defeating a 3 s timeout for 20.3 s (indefinitely, in the general
+  case).
 - **The child environment is scrubbed to a minimal allowlist** (`_child_env`).
   The parent env — which holds `ANTHROPIC_API_KEY` and every other secret — is
   never passed wholesale, so generated code cannot read credentials from it.
@@ -33,11 +40,14 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import sys
+import threading
 import time
 import warnings
+from collections import deque
 from pathlib import Path
 
 from .models import TestResult
@@ -212,6 +222,177 @@ def _unquote(token: str) -> str:
     return token
 
 
+def _kill_tree(proc: subprocess.Popen) -> bool:
+    """Kill the child **and everything it started**. Never raises.
+
+    `Popen.kill()` signals only the direct child, so a test that shells out
+    leaves its grandchildren running — and they hold the inherited stdout pipe,
+    which is what makes the read below never end. On Windows `taskkill /T`
+    walks the tree; elsewhere the child is its own session leader (see
+    `start_new_session` at the call site) so one `killpg` reaches all of it.
+
+    Returns **whether the child is confirmed gone**, and the return value is the
+    point rather than a convenience. Both arms below can fail for ordinary
+    reasons — `taskkill` answers "Access is denied" for an elevated or
+    job-held child, `os.getpgid` raises `ProcessLookupError` — and swallowing
+    that is correct (a failed kill must not raise into a paid round) only if
+    somebody upstream can still tell. Returning `None` and then rendering
+    "killed the process tree" was a string asserting more than its inputs
+    proved, which is the one thing this project's conventions forbid outright.
+    """
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True,
+                timeout=10,
+                shell=False,
+            )
+        else:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except Exception:
+        pass  # last resort below; a failed kill must not raise into the loop
+    try:
+        proc.kill()
+    except Exception:
+        pass
+    # `returncode` is set only once the process has actually been reaped, so
+    # this is the observation rather than a hope about the two calls above.
+    try:
+        proc.wait(timeout=10)
+    except Exception:
+        pass
+    return proc.returncode is not None
+
+
+def _run_bounded(
+    argv: list[str], *, cwd: str, timeout_s: int, env: dict[str, str]
+) -> tuple[str, int, bool, float]:
+    """Run one command, keeping only the tail of its output and enforcing a
+    real wall-clock bound. Returns `(tail, exit_code, timed_out, waited_s)`.
+
+    Replaces `subprocess.run(capture_output=True, timeout=...)`, which was
+    wrong on this threat model in two independent ways. The stated threat is
+    *arbitrary AI-generated code*, and the module docstring promised "a timeout
+    bounds runtime; captured output is truncated to bound memory". Neither
+    held:
+
+    * **Memory.** `capture_output=True` materialises the *whole* stream and the
+      truncation to `_MAX_TAIL_CHARS` happened afterwards, on a string that was
+      already in memory. Measured: a child printing in a loop produced 331 MB in
+      4 s (662 MB peak heap, bytes→str doubling); at the default 120 s timeout
+      that extrapolates to ~9.8 GB held inside the orchestrator, to store 4000
+      characters. Three lines of generated test code could OOM-kill the loop —
+      and `agents._invoke` reaches `finish_attempt` only on a clean return, so
+      the tokens and cost of the completion already paid for die with it.
+
+    * **Time.** `subprocess.run`'s `timeout` kills only the direct child and
+      then blocks in `communicate()` until every inherited pipe handle closes.
+      Measured: a child spawning a 20 s grandchild that inherits stdout, with a
+      3 s timeout, raised `TimeoutExpired` after 20.3 s. A grandchild that never
+      exits blocks here **forever**, inside `_with_retry`, holding the task
+      claim, with no recovery but killing the process.
+
+    So: read in a reader thread into a bounded ring, and enforce the deadline
+    ourselves by killing the whole process tree. The reader is a daemon, so even
+    an orphan that somehow survives the kill cannot keep the interpreter alive.
+    """
+    # `stderr=STDOUT` so the two streams interleave in the order they were
+    # written, which is what a human reading a failure tail wants, and what
+    # `_summarize` and `parse_coverage` already assume of `combined`.
+    popen_kwargs: dict = {
+        "cwd": cwd,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT,
+        "stdin": subprocess.DEVNULL,
+        "shell": False,  # never; argv is passed through literally
+        "env": env,
+    }
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = getattr(
+            subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+        )
+    else:
+        popen_kwargs["start_new_session"] = True
+
+    proc = subprocess.Popen(argv, **popen_kwargs)
+
+    # Only the tail is ever retained, so peak memory is bounded by this deque
+    # regardless of how much the child writes. Bytes, decoded once at the end:
+    # decoding per chunk can split a multi-byte character across a boundary.
+    chunks: deque[bytes] = deque()
+    held = 0
+    # Bytes, not characters: a bound in characters cannot be enforced before
+    # decoding. 4x `_MAX_TAIL_CHARS` is enough that even 4-byte codepoints
+    # cannot leave the tail short.
+    cap = _MAX_TAIL_CHARS * 4
+
+    def pump() -> None:
+        nonlocal held
+        try:
+            assert proc.stdout is not None
+            for block in iter(lambda: proc.stdout.read(65536), b""):
+                chunks.append(block)
+                held += len(block)
+                while held > cap and len(chunks) > 1:
+                    held -= len(chunks.popleft())
+        except Exception:
+            pass  # a closed pipe on kill is the normal end of this thread
+        finally:
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
+
+    reader = threading.Thread(target=pump, name="agentloop-testout", daemon=True)
+    reader.start()
+
+    started = time.time()
+    timed_out = False
+    killed = True
+    try:
+        proc.wait(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        killed = _kill_tree(proc)
+    waited = time.time() - started
+
+    # The pump ends when the pipe closes, which happens when the last holder of
+    # the inherited stdout handle exits — *not* when the direct child does. So a
+    # bounded join, and its result is read.
+    reader.join(timeout=5)
+    lingering = reader.is_alive()
+
+    if lingering and not timed_out:
+        # The child exited normally within its timeout while a grandchild it
+        # spawned kept the pipe open. `_kill_tree` used to run only on the
+        # timeout branch, so this case leaked the grandchild (holding workspace
+        # files open on Windows, which is what `clear_workspace`'s rmtree needs
+        # released) and leaked one daemon thread per round — and `raw` below was
+        # whatever had arrived by that instant, returned as though it were the
+        # whole output. Kill it here too, then re-join.
+        killed = _kill_tree(proc)
+        reader.join(timeout=5)
+        lingering = reader.is_alive()
+
+    raw = b"".join(chunks)[-cap:]
+    # `degraded` is "" exactly when nothing degraded — the same convention
+    # `VcsResult.reason` uses, so a caller can render the honest sentence
+    # instead of one that assumes the happy path.
+    degraded = ""
+    if not killed:
+        degraded = "could not confirm the process tree was killed"
+    elif lingering:
+        degraded = "output may be incomplete: a child kept the pipe open"
+    return (
+        raw.decode("utf8", "replace"),
+        proc.returncode if proc.returncode is not None else -1,
+        timed_out,
+        waited,
+        degraded,
+    )
+
+
 class TestExecutor:
     """Runs a task's tests in its workspace and reports what actually happened."""
 
@@ -227,6 +408,17 @@ class TestExecutor:
         isolation: str = "env",
     ):
         self.command = command
+        # Split here, at construction, and *not* inside `run()`. An unbalanced
+        # quote in `loopconfig.json` (`pytest -q "C:\\my tests`) makes
+        # `split_command` raise `ValueError: No closing quotation`, and `run()`
+        # is called from inside `_with_retry`, whose handler treats every
+        # exception as a transient infra failure — so a config typo became three
+        # identical retries, three `infra_error` events, and a `needs_human`
+        # reason pointing the operator at their network. Exactly the
+        # misclassification `RunnerConfigError` was introduced to prevent one
+        # module over. Raised from `__init__` it reaches `cli.main`'s handler and
+        # renders as `error: ...`, which is where a config mistake belongs.
+        split_command(command)
         self.timeout_s = timeout_s
         self.enabled = enabled
         self.env_allowlist = list(env_allowlist or [])
@@ -268,25 +460,16 @@ class TestExecutor:
 
         started = time.time()
         try:
-            proc = subprocess.run(
+            combined, code, timed_out, waited, degraded = _run_bounded(
                 argv,
                 cwd=str(ws),
-                capture_output=True,
-                text=True,
-                timeout=self.timeout_s,
-                shell=False,  # never; argv is passed through literally
+                timeout_s=self.timeout_s,
                 env=self._child_env(),
             )
         except FileNotFoundError:
             return TestResult(
                 status="error",
                 summary=f"Test command not found: {argv[0]}",
-                duration_s=round(time.time() - started, 3),
-            )
-        except subprocess.TimeoutExpired:
-            return TestResult(
-                status="error",
-                summary=f"Tests timed out after {self.timeout_s}s.",
                 duration_s=round(time.time() - started, 3),
             )
         except OSError as exc:
@@ -297,14 +480,58 @@ class TestExecutor:
             )
 
         duration = round(time.time() - started, 3)
-        combined = (proc.stdout or "") + (proc.stderr or "")
+
+        # A degradation is stated in the `summary`, which `Store.add_test_run`
+        # persists and the REST API and dashboard both render — so it reaches a
+        # human the way every other recorded degradation in this project does,
+        # rather than living only in a warning nobody sees. It also warns, for
+        # the operator watching a terminal.
+        #
+        # It deliberately does **not** touch `status`. `status` feeds the tests
+        # gate, and no decision rule may start reading a durability signal; an
+        # unconfirmed kill is a statement about our cleanup, not about whether
+        # the tests passed.
+        if degraded:
+            warnings.warn(
+                f"test execution degraded ({degraded}); "
+                f"the recorded result for this round says so.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        note = f" [{degraded}]" if degraded else ""
+
+        if timed_out:
+            return TestResult(
+                status="error",
+                # The measured wait, not the requested one. `subprocess.run`'s
+                # handler reported `self.timeout_s` unconditionally, so a call
+                # that had actually blocked for an hour still said "120s" — a
+                # rendered string asserting more than its inputs prove.
+                #
+                # The kill is reported the same way: `_kill_tree` answers
+                # whether the child was actually reaped, and this sentence says
+                # what happened rather than what was attempted. `taskkill`
+                # answers "Access is denied" for an elevated or job-held child
+                # and `os.getpgid` raises `ProcessLookupError`; swallowing those
+                # is right, claiming success after them is not.
+                summary=(
+                    f"Tests timed out after {self.timeout_s}s "
+                    f"(gave up at {waited:.1f}s; "
+                    f"{'process tree killed' if not degraded else degraded})."
+                ),
+                stdout_tail=combined[-_MAX_TAIL_CHARS:],
+                duration_s=duration,
+            )
         return TestResult(
-            status="pass" if proc.returncode == 0 else "fail",
-            exit_code=proc.returncode,
-            summary=_summarize(combined, proc.returncode),
+            status="pass" if code == 0 else "fail",
+            exit_code=code,
+            summary=_summarize(combined, code) + note,
             stdout_tail=combined[-_MAX_TAIL_CHARS:],
             duration_s=duration,
-            coverage_percent=parse_coverage(combined),
+            # `None` when the output may be truncated: a coverage number parsed
+            # from a partial stream is a fabricated measurement, which is the
+            # one thing `parse_coverage` contracts never to produce.
+            coverage_percent=None if degraded else parse_coverage(combined),
         )
 
     def _child_env(self) -> dict[str, str]:
@@ -320,6 +547,31 @@ class TestExecutor:
         env = {k: v for k, v in os.environ.items() if k.upper() in allow}
         # Keep child output stable and unbuffered for readable tails.
         env["PYTHONUNBUFFERED"] = "1"
+        # The running interpreter's script directory is prepended to PATH, and
+        # this is a correctness fix rather than a convenience. The README offers
+        # `.venv\\Scripts\\agentloop.exe` as an equal alternative to activating
+        # the venv, and taken up, the venv's `Scripts` is not on `PATH` — so the
+        # default `test_command` of `pytest -q` could not resolve. Measured on a
+        # real run: `Test command not found: pytest`.
+        #
+        # That failure is quiet, though not in the way an earlier version of
+        # this comment claimed. `TestResult.passed` returns `False` for both
+        # `"fail"` and `"error"` (only `"na"` returns `None` and falls back to
+        # the validator's claim), so an unresolvable command does **not** become
+        # auto-approvable — it fails *every* round and burns `max_revisions` on
+        # a gap no worker can close, escalating with a reason about test
+        # failures that never ran. The correction matters because in this repo
+        # the comments are the spec: a future reader trusting the old wording
+        # would conclude that a timeout or a missing binary is auto-approvable.
+        #
+        # The interpreter running the loop is the one whose tools the default
+        # command means. Prepended, not appended, so a venv's `pytest` wins over
+        # a stale global one — the same interpreter/tool pairing the operator
+        # gets from activating.
+        scripts_dir = str(Path(sys.executable).resolve().parent)
+        existing = env.get("PATH", "")
+        if scripts_dir and scripts_dir not in existing.split(os.pathsep):
+            env["PATH"] = scripts_dir + (os.pathsep + existing if existing else "")
         return env
 
 

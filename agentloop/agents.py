@@ -43,12 +43,77 @@ from .toolpolicy import (
     tools_for,
 )
 
+# Decoration and/or whitespace: markdown emphasis, code ticks, spaces, newlines.
+# Interleaved rather than "decoration then whitespace", because `**VERDICT:**
+# approve` puts them in that order and `**VERDICT: approve**` in the other.
+_VERDICT_GAP = r"[\s*_`~]*"
+# The same, plus the separators a model puts *between* the three fields.
+_VERDICT_SEP = r"[\s*_`~,;|·–—-]*"
+
+# The decision-critical parser, deliberately tolerant of **decoration and
+# separators** and deliberately strict about **meaning**.
+#
+# The strict original accepted exactly one rendering, and an unparseable verdict
+# escalates at confidence 0 — below `severe_threshold`, so straight to
+# NEEDS_HUMAN with no revision round and a `reasoning` reading "Unparseable
+# validator output", which hides that the validator actually approved. Measured
+# against real formatting, five of six ordinary shapes did that: per-field
+# emphasis, comma and pipe separators, a bare `.95`, `n/a` for the value the
+# prompt spells `na`, and a percentage.
+#
+# `toolpolicy._MARKER_RE` already made this argument and won it — it tolerates a
+# markdown prefix, four reason separators, CRLF and every Unicode line
+# terminator, because LLM output is markdown. This parser drives an automatic
+# state transition and had none of that.
+#
+# What is NOT widened: the three verdict *kinds*, the requirement that all
+# three labelled fields be present, and — most importantly — the **range** of a
+# confidence. Prose that merely *sounds* like an approval still escalates at 0,
+# and nothing here guesses a verdict. The two error directions are not
+# symmetric — reading past a bold marker costs nothing, while failing to read a
+# real decision spends a human's attention and is invisible in the record.
+#
+# The tests values *are* widened, to the `passed`/`failed` word forms, and that
+# is a widening of spelling rather than of meaning: `passed` and `pass` are the
+# same answer. The three answers themselves (true / false / no result) are the
+# same three.
 _VERDICT_RE = re.compile(
-    r"VERDICT:\s*(approve|revise|escalate)\s*"
-    r"CONFIDENCE:\s*([01](?:\.\d+)?)\s*"
-    r"TESTS:\s*(pass|fail|na)",
+    rf"{_VERDICT_GAP}VERDICT{_VERDICT_GAP}:{_VERDICT_GAP}"
+    rf"(approve|revise|escalate){_VERDICT_SEP}"
+    rf"CONFIDENCE{_VERDICT_GAP}:{_VERDICT_GAP}"
+    # A percentage is captured separately rather than folded into the number,
+    # because `0.95` and `95%` are the same confidence written two ways and only
+    # the `%` says which one was meant. A **bare** `95` is not disambiguated by
+    # anything, so `parse_verdict` refuses it rather than guessing — see the
+    # range check there, and note that an earlier version *clamped* instead,
+    # which mapped it to 1.0 and auto-approved at maximum confidence.
+    rf"(\d*\.?\d+){_VERDICT_GAP}(%?){_VERDICT_SEP}"
+    rf"TESTS{_VERDICT_GAP}:{_VERDICT_GAP}"
+    # `\b` so `TESTS: nap` is not read as `na`.
+    #
+    # `passed`/`failed` as well as `pass`/`fail`: both are at least as ordinary
+    # an LLM rendering as the shapes this pattern was widened for, and the `\b`
+    # above had silently narrowed them *out* — measured, `TESTS: passed` went
+    # from parsing (under the old pattern, which had no `\b`) to escalating.
+    # A slice whose stated purpose is surviving ordinary formatting must not
+    # lose a form on the way. The optional suffixes restore them and keep the
+    # `nap` protection, since `\b` still applies after the whole alternation.
+    rf"(pass(?:ed)?|fail(?:ed|ing)?|n/a|na)\b",
     re.IGNORECASE,
 )
+
+# `n/a` is the same answer as `na`; the prompt asks for one and models write
+# both. `None` means "no executed result to speak of", which the loop then
+# resolves against `TestResult` rather than against this claim.
+_TESTS_VALUES = {
+    "pass": True,
+    "passed": True,
+    "fail": False,
+    "failed": False,
+    "failing": False,
+    "na": None,
+    "n/a": None,
+}
 
 # How much of the free-text context (feedback, or the output under review) feeds
 # the memory retrieval query alongside the task definition.
@@ -1167,8 +1232,41 @@ def parse_verdict(text: str) -> Verdict:
             reasoning=f"Unparseable validator output:\n{text}",
         )
     kind = VerdictKind(m.group(1).lower())
-    confidence = max(0.0, min(1.0, float(m.group(2))))
-    tests = {"pass": True, "fail": False, "na": None}[m.group(3).lower()]
+    raw_confidence = float(m.group(2))
+    if m.group(3):  # written as a percentage
+        raw_confidence /= 100.0
+    # **Rejected, not clamped**, and the difference is the whole gate.
+    #
+    # The widened pattern accepts any magnitude, and an earlier version clamped
+    # instead — which mapped every out-of-range number to `1.0`, the *top* of the
+    # scale. Measured: `VERDICT: approve CONFIDENCE: 95 TESTS: pass` parsed as
+    # APPROVE at 1.0, unconditionally clearing both `approve_threshold` (0.70)
+    # and `severe_threshold` (0.40), so a task went DONE with no human — and
+    # under the slice-3 graph that DONE releases every dependent. `CONFIDENCE:
+    # 55` rewrote a validator's revise-band judgement into certainty the same
+    # way. Before the widening, the strict pattern simply did not match those
+    # replies and they escalated at 0.
+    #
+    # So widening the *pattern* turned a fail-safe non-match into a fail-open
+    # maximum, on the one gate CLAUDE.md rules "never guess-approve". A bare
+    # `95` is genuinely ambiguous — it could be a percentage missing its sign,
+    # or a typo — and this parser does not guess: an out-of-range confidence is
+    # an unparseable verdict, which is exactly what it was before.
+    #
+    # A percentage that clears 100 is refused on the same rule, for the same
+    # reason. Nothing here clamps, because a clamp *substitutes the most
+    # permissive legal value* for a value the model did not write.
+    if not 0.0 <= raw_confidence <= 1.0:
+        return Verdict(
+            kind=VerdictKind.ESCALATE,
+            confidence=0.0,
+            reasoning=(
+                f"Unparseable validator output (confidence "
+                f"{m.group(2)}{m.group(3)} is outside 0-1):\n{text}"
+            ),
+        )
+    confidence = raw_confidence
+    tests = _TESTS_VALUES[m.group(4).lower()]
     reasoning = text[m.end() :].strip()
     return Verdict(
         kind=kind,

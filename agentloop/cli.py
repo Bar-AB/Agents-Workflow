@@ -419,7 +419,32 @@ def _build(args) -> tuple[Store, Loop]:
     return store, Loop(store, runner, registry, config)
 
 
+def _make_output_encoding_total() -> None:
+    """Never let an em-dash end a command.
+
+    On Windows, redirecting output (`agentloop status 1 > out.txt`, or any pipe)
+    switches stdout from the console encoding to the ANSI code page, and this
+    CLI prints prose containing en/em dashes. Measured: `agentloop status 1 |
+    head` raised `UnicodeEncodeError` *before* reaching the output section, and
+    `main`'s handler catches `(KeyError, ValueError)` — `UnicodeEncodeError`
+    subclasses `ValueError` — so it surfaced as the single word `error: charmap`
+    and exit 1. Redirecting `status` or `events` to a file is an ordinary thing
+    to do, and losing the command to it is not an acceptable outcome for a
+    character in a sentence.
+
+    `errors="replace"` rather than forcing UTF-8: the goal is that output can
+    always be written, not that a console silently changes encoding under the
+    operator. Best-effort — `reconfigure` is absent if a caller has replaced the
+    streams (pytest's `capsys` does), and that is not worth failing over."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
+    _make_output_encoding_total()
     p = argparse.ArgumentParser(prog="agentloop")
     p.add_argument("--config", default=None, help="Path to loopconfig.json")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -464,7 +489,21 @@ def main(argv: list[str] | None = None) -> int:
     sv = sub.add_parser("serve", help="Run the live dashboard (Phase 2)")
     sv.add_argument("--host", default=None)
     sv.add_argument("--port", type=int, default=None)
-    sv.add_argument("--runner", default="mock", choices=["claude", "openai", "mock"])
+    # Kept for argument-shape compatibility, but `serve` never invokes a model:
+    # its routes call only the human decision methods (`approve`/`reject`/`redo`,
+    # `pause`/`resume`/`abort`, the tool-request decisions), none of which run an
+    # agent. An operator reasonably reads `serve --runner claude` as "the
+    # dashboard will now drive real work", and it does nothing at all — so the
+    # help text says so rather than leaving it to be discovered.
+    sv.add_argument(
+        "--runner",
+        default="mock",
+        choices=["claude", "openai", "mock"],
+        help=(
+            "Accepted but inert: `serve` runs no agents, it only serves the "
+            "dashboard. Use `agentloop run --runner ...` to drive the loop."
+        ),
+    )
 
     m = sub.add_parser("memory", help="Inspect and gate the memory store")
     msub = m.add_subparsers(dest="mem_cmd", required=True)

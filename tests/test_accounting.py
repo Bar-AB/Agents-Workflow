@@ -14,6 +14,7 @@ from agentloop.config import (
 from agentloop.loop import Loop
 from agentloop.models import RunResult, Task, TaskStatus
 from agentloop.registry import Registry
+from agentloop import runner
 from agentloop.runner import MockRunner, extract_usage
 from agentloop.store import Store
 from tests.test_loop import APPROVE, REVISE  # reuse scripted verdicts
@@ -160,3 +161,215 @@ def test_cache_breakdown_persisted_and_rolled_up(store):
     assert m["cache_read_tokens"] == 14000  # worker + validator, 7000 each
     assert m["cache_creation_tokens"] == 600
     assert m["cost_usd"] > 0
+
+
+# ---------------------------------------------------------------------------
+# Slice 8: the seam's two halves must be equally total.
+#
+# Every totality guard in this module was written for slice 4's
+# `OpenAICompatRunner` and never back-fitted to the *default* `ClaudeSDKRunner`.
+# That asymmetry is a money defect, not a tidiness one: `agents._invoke` calls
+# `runner.run()` outside any transaction and reaches `finish_attempt` only on a
+# clean return, so a raise here discards a completion the provider already
+# billed — and `loop._with_retry`'s bare `except Exception` then buys it again,
+# `infra_max_retries + 1` times, reported as an `infra_error` pointing the
+# operator at their network.
+#
+# Parameterised over BOTH extractors on purpose: a third backend inherits the
+# test, and neither half can drift without the other noticing.
+# ---------------------------------------------------------------------------
+
+BAD_USAGE_VALUES = [
+    "n/a",
+    "12345",
+    {"total": 5},
+    [1, 2],
+    float("nan"),
+    float("inf"),
+    True,
+    None,
+    object(),
+]
+
+
+@pytest.mark.parametrize(
+    "extractor, field",
+    [
+        (runner.extract_usage, "input_tokens"),
+        (runner.extract_usage, "output_tokens"),
+        (runner.extract_usage, "cache_creation_input_tokens"),
+        (runner.extract_usage, "cache_read_input_tokens"),
+        (runner.extract_openai_usage, "prompt_tokens"),
+        (runner.extract_openai_usage, "completion_tokens"),
+    ],
+)
+@pytest.mark.parametrize("bad", BAD_USAGE_VALUES)
+def test_both_usage_extractors_are_total_over_the_same_bad_input_matrix(
+    extractor, field, bad
+):
+    got = extractor({field: bad})
+    assert isinstance(got, tuple) and len(got) == 4
+    assert all(isinstance(v, int) and v >= 0 for v in got)
+
+
+@pytest.mark.parametrize("bad", ["nope", 5, {"a": 1}, object(), None])
+def test_both_tool_call_extractors_are_total_over_malformed_content(bad):
+    """`extract_tool_calls` iterates `message.content` directly; a non-iterable
+    raised `TypeError` where its OpenAI twin returned `[]`."""
+
+    class Msg:
+        content = bad
+
+    assert runner.extract_tool_calls(Msg()) == []
+    assert runner.extract_openai_tool_calls({"tool_calls": bad}) == []
+
+
+def test_extract_usage_still_reads_a_well_formed_dict():
+    """The falsified control. A function that returns zeros for everything is
+    also 'total', and would be useless — so assert the real path still works."""
+    assert runner.extract_usage(
+        {
+            "input_tokens": 11,
+            "output_tokens": 22,
+            "cache_creation_input_tokens": 33,
+            "cache_read_input_tokens": 44,
+        }
+    ) == (11, 22, 33, 44)
+
+
+def test_the_sdk_runner_never_records_a_silent_zero(monkeypatch):
+    """Drive `ClaudeSDKRunner._run_async` over a fake stream whose terminal
+    message carries a NON-dict `usage` — the shape an SDK ships the day it moves
+    to a dataclass. Before this, that returned four zeros with
+    `usage_estimated=False` and `notes=""`, so `agents._invoke` logged no
+    `runner_warning` and `$0.00` reached `attempts` as a measurement."""
+    import asyncio
+
+    from agentloop.runner import ClaudeSDKRunner
+
+    class Usage:  # a dataclass-shaped usage, not a dict
+        input_tokens = 1234
+        output_tokens = 56
+
+    class Result:
+        result = "the worker output"
+        usage = Usage()
+        content = []
+
+    async def fake_query(prompt, options):
+        yield Result()
+
+    monkeypatch.setattr(runner, "query", fake_query, raising=False)
+    monkeypatch.setattr(runner, "ResultMessage", Result, raising=False)
+
+    r = ClaudeSDKRunner()
+    with pytest.warns(RuntimeWarning):
+        out = asyncio.run(
+            r._run_async("sys prompt here", "user prompt here", "claude-opus-5", None)
+        )
+
+    assert out.tokens_in > 0 and out.tokens_out > 0
+    assert out.usage_estimated is True
+    assert "estimated" in out.notes
+    assert "claude-agent-sdk" in out.notes
+
+
+def test_the_sdk_runner_reports_a_real_usage_dict_as_measured(monkeypatch):
+    """The falsified control: when usage IS readable, nothing is estimated and
+    no warning fires. Without this, a guard that always estimates would pass."""
+    import asyncio
+
+    from agentloop.runner import ClaudeSDKRunner
+
+    class Result:
+        result = "the worker output"
+        usage = {
+            "input_tokens": 900,
+            "output_tokens": 120,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 40,
+        }
+        content = []
+
+    async def fake_query(prompt, options):
+        yield Result()
+
+    monkeypatch.setattr(runner, "query", fake_query, raising=False)
+    monkeypatch.setattr(runner, "ResultMessage", Result, raising=False)
+
+    out = asyncio.run(
+        ClaudeSDKRunner()._run_async("sys", "prompt", "claude-opus-5", None)
+    )
+    assert (out.tokens_in, out.tokens_out, out.cache_read_tokens) == (900, 120, 40)
+    assert out.usage_estimated is False
+    assert out.notes == ""
+
+
+def test_an_unreadable_cache_field_is_reported_not_recorded_as_zero(monkeypatch):
+    """A usage field that is *present and unreadable* is not the same as an
+    absent one, and only the cache fields could not tell the difference.
+
+    Nothing estimates `cache_creation`/`cache_read`, so `_int_or_zero` coerced a
+    garbage `cache_read_input_tokens` to 0 and the result was recorded as a
+    measurement — `estimated` empty, `note` empty, `usage_estimated=False`, no
+    `runner_warning`. Per the decision rules the token total includes cache
+    reads and cost prices them at 0.10x, so on a cache-heavy run that is the
+    dominant term of the budget cap: the cap silently under-measures and the
+    dashboard renders the fabricated zero as spend."""
+    import asyncio
+
+    from agentloop.runner import ClaudeSDKRunner
+
+    class Result:
+        result = "the worker output"
+        usage = {
+            "input_tokens": 5000,
+            "output_tokens": 300,
+            "cache_read_input_tokens": "n/a",  # present, unreadable
+        }
+        content = []
+
+    async def fake_query(prompt, options):
+        yield Result()
+
+    monkeypatch.setattr(runner, "query", fake_query, raising=False)
+    monkeypatch.setattr(runner, "ResultMessage", Result, raising=False)
+
+    with pytest.warns(RuntimeWarning):
+        out = asyncio.run(ClaudeSDKRunner()._run_async("s", "p", "claude-opus-5", None))
+
+    # The readable fields are still measured, not estimated over.
+    assert (out.tokens_in, out.tokens_out) == (5000, 300)
+    assert out.cache_read_tokens == 0
+    # ...and the zero is declared rather than passed off as a measurement.
+    assert out.usage_estimated is True
+    assert "cache_read_input_tokens" in out.notes
+    assert "unreadable" in out.notes
+
+
+def test_a_wholly_readable_usage_dict_reports_nothing(monkeypatch):
+    """The control: the reporter must fire on garbage, not on every call."""
+    import asyncio
+
+    from agentloop.runner import ClaudeSDKRunner
+
+    class Result:
+        result = "out"
+        usage = {
+            "input_tokens": 5000,
+            "output_tokens": 300,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 120,
+        }
+        content = []
+
+    async def fake_query(prompt, options):
+        yield Result()
+
+    monkeypatch.setattr(runner, "query", fake_query, raising=False)
+    monkeypatch.setattr(runner, "ResultMessage", Result, raising=False)
+
+    out = asyncio.run(ClaudeSDKRunner()._run_async("s", "p", "claude-opus-5", None))
+    assert out.usage_estimated is False
+    assert out.notes == ""
+    assert out.cache_read_tokens == 120

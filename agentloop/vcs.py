@@ -286,10 +286,26 @@ def _git(
     config: LoopConfig, *args: str, workspace: str | Path | None = None
 ) -> list[str]:
     """argv for one invocation: the executable, the identity, the config pins,
-    optionally `-C <ws>` (defence in depth on top of the pinned cwd)."""
+    optionally `-C <ws>` (defence in depth on top of the pinned cwd).
+
+    The `-C` value is made **absolute**, and that is load-bearing rather than
+    tidy. `_run` already sets `cwd=<ws>`, so git changes into the workspace and
+    only *then* resolves `-C`; a relative path is therefore resolved a second
+    time from inside itself. The shipped default `workspace_root` is relative
+    (`.agentloop/ws`), so before this every side-effecting call on a default
+    install failed with `fatal: cannot change to '.agentloop\\ws\\task-1'` and
+    the whole durability feature was inert — visible only as one
+    `RuntimeWarning` per task. Every test in `test_vcs.py` used an absolute
+    `tmp_path`, so none of them could see it.
+
+    `os.path.abspath`, deliberately, not `Path.resolve()`: `abspath` is purely
+    lexical, so it fixes the double-resolution without following a single link.
+    `resolve()` would silently walk a junction at `<ws>`, which is exactly the
+    redirection `_guard` exists to catch — the guard must be the only thing in
+    this module that decides where a link may point."""
     argv = [config.vcs_command, *_IDENTITY, *_CONFIG_PINS]
     if workspace is not None:
-        argv += ["-C", str(workspace)]
+        argv += ["-C", os.path.abspath(str(workspace))]
     return argv + list(args)
 
 
@@ -614,9 +630,13 @@ def is_repo(workspace: str | Path, config: LoopConfig) -> bool:
 def init_repo(workspace: str | Path, config: LoopConfig, pin: str = "") -> VcsResult:
     """Create the workspace repo and its empty base commit at `BASE_REF`.
 
-    `git init` runs before the guard because it is the one command that cannot
-    reach outside the workspace — it only creates `workspace/.git` — and the
-    guard cannot pass before it. The base commit is guarded like everything
+    `git init` runs before the guard because the guard cannot pass before it,
+    and because on a workspace with no `.git` at all it only creates
+    `workspace/.git`. That claim used to be stated unconditionally and was
+    wrong: a **gitfile** at `<ws>/.git` (one line, `gitdir: elsewhere`, writable
+    by any worker) is not a directory, so it took the create branch, and `git
+    init` then reinitialised the repository the file pointed at. The create
+    branch now refuses when `<ws>/.git` exists in any form. The base commit is guarded like everything
     else.
 
     The fast path verifies the invariant it claims rather than inferring it
@@ -670,6 +690,27 @@ def init_repo(workspace: str | Path, config: LoopConfig, pin: str = "") -> VcsRe
                     return VcsResult(ok=False, reason="no-workspace")
             except Exception:
                 return VcsResult(ok=False, reason="no-workspace")
+            # `<ws>/.git` exists but is not a directory: a **gitfile**, one line
+            # of text reading `gitdir: <somewhere else>`, which any worker can
+            # write. `preexisting` tests `is_dir()`, so this fell into the
+            # create branch — and `git init` on a worktree whose `.git` points
+            # elsewhere *reinitialises the repository it points at*, rc=0.
+            # Measured against a victim repo: it ran, and the docstring above
+            # claiming init "cannot reach outside the workspace" was wrong.
+            #
+            # Real impact was small — the victim's `config` came back
+            # byte-identical, `config_pin` then returned "" and the flow failed
+            # closed — but "small because a later check happens to catch it" is
+            # not the same as contained, and `-c init.templateDir=` is the only
+            # thing keeping it from copying template files into someone else's
+            # repository. In the one module whose deliverable is precisely
+            # stated containment, a stated invariant that does not hold is the
+            # thing most likely to be built on later.
+            try:
+                if (ws / ".git").exists():
+                    return VcsResult(ok=False, reason="not-a-workspace-repo")
+            except Exception:
+                return VcsResult(ok=False, reason="not-a-workspace-repo")
             run = _run(ws, _git(config, *_INIT_PINS, "init", "-q"), config)
             if run.reason or run.code != 0:
                 return _failed(run)
