@@ -38,7 +38,7 @@ agentloop/
                redo / pause / resume / abort / events / serve / memory /
                charter / eval
 web/           Vite + React + TypeScript dashboard
-tests/         711 tests on MockRunner + real subprocesses (no API keys needed)
+tests/         854 tests on MockRunner + real subprocesses (no API keys needed)
 ```
 
 ## Quick start
@@ -64,7 +64,10 @@ agentloop plan "Build a slugify library" \
   --criteria "Published, tested, documented"
 agentloop approve-plan 1         # sign the plan off; its tasks may now run
 
-agentloop run --runner claude    # or --runner openai or --runner mock
+agentloop run --runner claude    # or --runner openai
+# `--runner mock` runs the loop with no provider and no cost, but it is a *test*
+# backend with no script: every task ends `needs_human — unparseable validator
+# output`. Useful for exercising plumbing, not for seeing the loop succeed.
 agentloop status 1               # metrics: tokens, cost, wall time, verdicts
 agentloop events 1               # immutable audit trail
 agentloop approve 1              # human sign-off for escalated/high-risk tasks
@@ -85,6 +88,22 @@ agentloop eval --mode batch      # whole-loop fixtures: does the loop still deci
 cd web && npm install && npm run build   # once
 agentloop serve                          # http://127.0.0.1:8765
 ```
+
+**The dashboard is an unauthenticated mutation API, and slice 8 closed the hole
+that made that dangerous from outside the machine.** Every request must now be
+same-origin: a `POST` carrying a foreign `Origin` is refused 403, and so is any
+request whose `Host` is a name that is not this server. Before that, any page
+the operator happened to have open could drive it with a browser *simple
+request* — measured, `POST /api/charter` from `Origin: http://evil.example`
+returned 200 and replaced the charter, which is injected verbatim into every
+worker, validator and planner prompt. A missing `Host` check made DNS rebinding
+enough to *read* `/api/tasks` and `/api/config`.
+
+What that does **not** cover, deliberately, and in the same register as the
+env-scrub tier's residual risk: anything already running on this machine. There
+is no token and no login. `--host 0.0.0.0` still works (an IP-literal `Host`
+cannot be DNS-rebound), so serving to a LAN is still your decision to make and
+still unauthenticated when you make it.
 
 Task board, agent state, cost/token tiles, verdict history with the validator's
 findings, executed test runs, a live audit feed, memory gating, the project
@@ -602,6 +621,23 @@ command runs is the real exposure. Defenses are layered:
   environment (which holds `ANTHROPIC_API_KEY` and every other secret) is never
   passed wholesale, so generated code can't read credentials from it. Extra
   vars a project genuinely needs go in `sandbox_env_allowlist`.
+- **Resource bounds are real bounds** (slice 8). Output is read into a bounded
+  ring buffer as it arrives rather than captured whole and truncated
+  afterwards — a child was measured writing 331 MB in 4 s into the
+  orchestrator's heap, extrapolating to ~9.8 GB at the default timeout, to
+  store a 4000-character tail. And the timeout now kills the whole **process
+  tree** (a Windows job kill / a POSIX process group) instead of only the direct
+  child: a surviving grandchild holding the inherited stdout pipe was measured
+  defeating a 3 s timeout for 20.3 s, and one that never exits blocked the loop
+  indefinitely while holding the task claim. Both were promises the module
+  docstring already made.
+- **The sandbox can find the interpreter's own tools** (slice 8). The child
+  `PATH` gets the running interpreter's script directory prepended, because the
+  default `test_command` is `pytest -q` and invoking `agentloop` by path (which
+  the quick start offers) left the venv's `Scripts` off `PATH`. That failure was
+  quiet in the worst way: `status="error"` is not `"fail"`, so the tests gate
+  fell back to the validator's own `TESTS:` claim — the exact thing executed
+  tests exist to replace.
 - **Isolation tier** (`sandbox_isolation`): `env` (default) is env-scrub only.
   `strict` asks for a container / no-network / read-only-fs tier when a backend
   is available and **degrades to env-scrub with a warning** when it is not.
@@ -896,3 +932,27 @@ problem. That's different from transient HTTP errors (408, 429, 5xx), which retr
       (the behaviour pre-dated this slice; slice 6 added its missing coverage)
 - [x] Batch whole-loop evaluation (`agentloop eval --mode batch`)
 - [x] Coverage captured in `test_runs`, parsed from output already collected
+- [x] Office-metaphor visualization layered on the existing dashboard data
+- [x] **Hardening and finalization pass (slice 8)** — a full adversarial review
+      before first real use, and every finding it produced. Three criticals, all
+      reproduced before they were fixed and each with a regression test that was
+      watched failing first:
+      - the dashboard accepted cross-origin mutations (a foreign `Origin` could
+        rewrite the project charter, which is injected into every agent prompt),
+        and never checked `Host`;
+      - the **default** `ClaudeSDKRunner` had neither of the two money guards its
+        OpenAI sibling shipped with — `extract_usage` raised on a wrong *type*
+        after a completion was billed, and four silent zeros could reach
+        `attempts` as a measured $0.00;
+      - `vcs._git` passed a relative `-C` on top of an already-changed cwd, so
+        with the shipped default `workspace_root` **the entire durability
+        feature was inert on every install** — and every one of ~2900 lines of
+        vcs tests used an absolute `tmp_path`, so none could see it.
+      Plus: the verdict parser rejected ordinary LLM markdown (five of six real
+      formats escalated a decision the validator had actually made); an
+      undecided tool request revoked a capability the role already held (on the
+      example the shipped prompt teaches); the sandbox captured output unbounded
+      and its timeout did not bound wall time; a missing registry role wedged the
+      whole batch; a claim failure in a parallel worker was swallowed and
+      reported as success; `resume` left the pause message on the row forever;
+      and the 500k token cap escalated a *successful* first real task.

@@ -404,6 +404,35 @@ class Loop:
         stopping = threading.Event()
 
         def drain(worker_id: str) -> None:
+            # The guard below used to cover only `run_task`, leaving
+            # `claim_next_task` — which opens a write transaction, and therefore
+            # raises `sqlite3.OperationalError: database is locked` after the
+            # busy timeout whenever two `agentloop run` processes share a
+            # database — outside it. The thread then died past the `try`,
+            # `errors` stayed empty, and `run()` returned a success count.
+            #
+            # Measured at `max_parallel_workers=3` with three pending tasks and
+            # the claim raising from the second call on:
+            #     RUN RETURNED: 1  -> reported success, no exception raised
+            #     tasks: [(1,'needs_human'), (2,'pending'), (3,'pending')]
+            # Two threads died, two tasks were silently dropped, and the only
+            # signal was a `threading.excepthook` traceback on stderr — a
+            # channel this project rules out everywhere else, because it reaches
+            # neither `agentloop events` nor the SSE feed.
+            #
+            # The comment on the inner handler already stated the property
+            # ("a thread that dies silently would leave the task claimed and the
+            # run reporting success"); this is the one place it did not hold. The
+            # sequential path propagates, so before this the two modes disagreed
+            # about what a failed batch even looks like.
+            try:
+                _drain_body(worker_id)
+            except BaseException as exc:  # noqa: BLE001 - re-raised by run()
+                errors.append(exc)
+                with cond:
+                    cond.notify_all()
+
+        def _drain_body(worker_id: str) -> None:
             while True:
                 with cond:
                     if stopping.is_set():
@@ -860,6 +889,40 @@ class Loop:
         return result
 
     def run_task(self, task: Task) -> Task:
+        # Both roles resolved up front, exactly as `plan()` resolves `planner`,
+        # and for the two reasons that rule already gives.
+        #
+        # `Registry.load` replaces the built-in defaults wholesale with no merge
+        # and no missing-role check, so a hand-edited agents.json that adds one
+        # role (the documented slice-4 "pin the validator to openai" edit, done
+        # by replacing the file) can leave `worker` undefined. `registry.get`
+        # then raised a bare `KeyError` from `_maybe_handoff`, which matches
+        # neither `except _ConfigError` nor `except _InfraError` and so escaped
+        # `run_task` entirely: measured, the batch aborted, task 1 was left
+        # `in_progress` still holding its lease with an empty
+        # `escalation_reason` — a task the dashboard shows as running that
+        # nothing is running — and every task behind it never ran. The next
+        # `agentloop run` re-claimed it and died identically: permanent
+        # starvation, with one stderr line as the only signal.
+        #
+        # A missing `validator` failed differently and no better: it was raised
+        # *inside* `_with_retry`, so it became three paid retries and an
+        # `infra_error` escalation, which CLAUDE.md names as pointing "the human
+        # at the network instead of at agents.json".
+        for role in (task.worker_role, task.validator_role):
+            try:
+                self.registry.get(role)
+            except KeyError:
+                self.store.set_status(
+                    task,
+                    TaskStatus.NEEDS_HUMAN,
+                    reason=(
+                        f"No {role!r} agent is registered; add one to agents.json "
+                        f"(or delete it to fall back to the built-in defaults)."
+                    ),
+                )
+                return self._require(task.id)
+
         feedback = ""
         test_result = TestResult()
         # Worker context consumed as of the last handoff. Measured, not reset in
@@ -882,12 +945,22 @@ class Loop:
             # Ownership first, before anything that writes. Both checks below
             # stamp a status, and a status written by a worker that no longer
             # holds the lease lands on somebody else's round.
+            # Every exit re-reads rather than returning the in-hand object.
+            # `human_approve` already documents why: "`set_status` assigns the
+            # new status onto it before the predicated write, so on a write that
+            # did not land the object claims a transition the row never took."
+            # `set_status` is lease-predicated and returns a bool, and these
+            # exits did not check it — they returned the loop's *intention*
+            # rather than the task's history. Latent only because all three
+            # `run_task` call sites discard the value; the first caller to read
+            # it (a `run --json`, a batch-eval assertion, a test) would get a
+            # falsehood with no signal, so it is closed while it is still cheap.
             if self._claim_lost(task):
                 return self._require(task.id)
             if self._control_stop(task):
-                return task
+                return self._require(task.id)
             if self._budget_tripped(task):
-                return task
+                return self._require(task.id)
 
             # Agent/executor calls are wrapped so a transient infra failure
             # (API 5xx, network blip) is retried and, if it persists, escalates
@@ -949,7 +1022,7 @@ class Loop:
                         TaskStatus.NEEDS_HUMAN,
                         reason=f"Worker ambiguity: {result.output.strip()[9:].strip()}",
                     )
-                    return task
+                    return self._require(task.id)
                 if not result.output.strip():
                     # An empty worker output is not work; it is the absence of
                     # work, and every downstream step treats it as the former.
@@ -979,7 +1052,7 @@ class Loop:
                             "attempt."
                         ),
                     )
-                    return task
+                    return self._require(task.id)
                 task.output = result.output
                 self.store.update_task(task)
                 if vcs_ready:
@@ -1091,7 +1164,7 @@ class Loop:
                             self.store.tool_requests_mark_parked(
                                 task.id, [r.id for r in pending_tools]
                             )
-                    return task
+                    return self._require(task.id)
 
                 # Tests are part of validation, executed for real (spec §5).
                 self.store.set_status(task, TaskStatus.TESTING)
@@ -1125,7 +1198,7 @@ class Loop:
                 # Escalates without a retry and without an infra_error event: a
                 # typo'd runner name is not going to resolve on the third try.
                 self.store.set_status(task, TaskStatus.NEEDS_HUMAN, reason=str(exc))
-                return task
+                return self._require(task.id)
             except _InfraError as exc:
                 self.store.set_status(
                     task,
@@ -1136,7 +1209,7 @@ class Loop:
                         f"{exc.original}"
                     ),
                 )
-                return task
+                return self._require(task.id)
             self.store.add_verdict(task.id, attempt_id, verdict)
 
             # Executed truth beats the validator's account of it. Record the
@@ -1180,7 +1253,7 @@ class Loop:
                         f"{verdict.reasoning[:500]}"
                     ),
                 )
-                return task
+                return self._require(task.id)
 
             if approved:
                 if task.risk_level >= cfg.human_review_risk_level:
@@ -1202,7 +1275,7 @@ class Loop:
                         # — that task is NEEDS_HUMAN, and its ref is written by
                         # `human_approve` instead (C4).
                         self._vcs_mark_approved(task, ws)
-                return task
+                return self._require(task.id)
 
             if task.revision_count >= cfg.max_revisions:
                 self.store.set_status(
@@ -1210,7 +1283,7 @@ class Loop:
                     TaskStatus.NEEDS_HUMAN,
                     reason=f"Exhausted {cfg.max_revisions} revisions without approval.",
                 )
-                return task
+                return self._require(task.id)
             task.revision_count += 1
             self.store.set_status(task, TaskStatus.REVISING)
             feedback = verdict.reasoning
@@ -1287,6 +1360,24 @@ class Loop:
                 # the live flag goes with it; the row stays pending, so the need
                 # is still recorded and the next round parks again.
                 self.store.tool_requests_clear_parked(task_id)
+                # Blanked explicitly, because `set_status(..., reason="")` does
+                # not: it assigns only a *truthy* reason, so the row keeps
+                # whatever it held. `pause` stamps "Paused by human; resume to
+                # continue." onto every task it touches, so before this every
+                # pause/resume cycle left that sentence on the row for the rest
+                # of its life — measured still reading it on a `done` task,
+                # asserting a suspension that had ended, directly above the
+                # dashboard's decision buttons.
+                #
+                # This is the fifth release-to-PENDING path and the only one
+                # that was missing the line: `reset_unowned_to_pending`,
+                # `approve_tool_request`, `human_redo` and `approve_plan` all
+                # blank it, and `store.py`'s own docstring explains why. Worse
+                # here than elsewhere, because CLAUDE.md names pause+resume as
+                # the *neutral* exit from a tool-request park — so the
+                # documented recovery route was the one that overwrote the
+                # park's diagnosis.
+                task.escalation_reason = ""
                 self.store.set_status(task, TaskStatus.PENDING, reason="")
         return self._require(task_id)
 

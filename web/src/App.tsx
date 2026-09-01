@@ -20,6 +20,7 @@ export default function App() {
     memory,
     toolRequests,
     events,
+    revision,
     connection,
     error,
     refresh,
@@ -67,7 +68,10 @@ export default function App() {
           {tab === 'detail' && selected !== null && (
             <TaskDetail
               taskId={selected}
-              version={events.length}
+              // A monotonic counter, not `events.length`: the feed is capped
+              // at MAX_EVENTS, so the length stops changing and this stopped
+              // being a refresh trigger at all.
+              version={revision}
               onChanged={() => void refresh()}
             />
           )}

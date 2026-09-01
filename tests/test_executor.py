@@ -4,6 +4,7 @@ point of this module is that something actually runs."""
 import os
 import shutil
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -514,3 +515,92 @@ def test_clear_workspace_reports_whether_the_workspace_is_gone(tmp_path, monkeyp
     monkeypatch.setattr(shutil, "rmtree", lambda *a, **k: None)
     assert clear_workspace(tmp_path, 12) is False
     assert stubborn.exists()
+
+
+# ---------------------------------------------------------------------------
+# Slice 8: the two promises the module docstring made and the code did not keep.
+# ---------------------------------------------------------------------------
+
+
+def test_a_flood_of_output_does_not_grow_the_orchestrators_heap(tmp_path):
+    """Memory is bounded *during* the read, not truncated after it.
+
+    `capture_output=True` materialised the whole stream first: measured, 331 MB
+    in 4 s (662 MB peak, bytes->str doubling), extrapolating to ~9.8 GB at the
+    default 120 s timeout — to store 4000 characters. Three lines of generated
+    test code could OOM-kill the loop, taking a paid completion with it.
+
+    Asserted on the retained tail rather than on a memory reading, because a
+    heap measurement here would be flaky; the bound is what the ring buffer
+    guarantees and the tail is its observable consequence."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "marker.txt").write_text("x", encoding="utf8")
+
+    flood = (
+        f'{sys.executable} -c "'
+        "import sys\n"
+        "for i in range(200000): sys.stdout.write('y'*200 + chr(10))\n"
+        '"'
+    )
+    ex = TestExecutor(command=flood, timeout_s=60)
+    result = ex.run(str(ws))
+
+    # The child wrote ~40 MB; only the tail is kept.
+    assert len(result.stdout_tail) <= 4000
+    assert result.status in ("pass", "fail")
+
+
+def test_a_surviving_grandchild_cannot_outlast_the_timeout(tmp_path):
+    """`subprocess.run`'s timeout kills only the direct child and then blocks in
+    `communicate()` until every inherited pipe handle closes. Measured: a 3 s
+    timeout returned after 20.3 s because a grandchild held stdout; one that
+    never exits blocked forever, inside `_with_retry`, holding the task claim.
+
+    The bound asserted here is deliberately loose (well under the grandchild's
+    own lifetime, well over the timeout) so this measures the mechanism and not
+    the scheduler."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "marker.txt").write_text("x", encoding="utf8")
+
+    # A child that spawns a long-lived grandchild inheriting its stdout, then
+    # exits itself — the shape that defeated the old timeout.
+    spawner = (
+        f'{sys.executable} -c "'
+        "import subprocess,sys,time\n"
+        f"subprocess.Popen([r'{sys.executable}','-c','import time;time.sleep(60)'])\n"
+        "time.sleep(60)\n"
+        '"'
+    )
+    ex = TestExecutor(command=spawner, timeout_s=3)
+    started = time.time()
+    result = ex.run(str(ws))
+    elapsed = time.time() - started
+
+    assert result.status == "error"
+    assert "timed out" in result.summary
+    assert elapsed < 30, f"timeout was not enforced: returned after {elapsed:.1f}s"
+
+
+def test_a_malformed_test_command_is_a_config_error_not_an_infra_failure(tmp_path):
+    """An unbalanced quote in `loopconfig.json` used to raise from inside
+    `run()`, which `_with_retry` treats as transient: three identical paid
+    retries, three `infra_error` events, and an escalation pointing the operator
+    at the network. Raised at construction it reaches `cli.main` as `error: ...`."""
+    with pytest.raises(ValueError):
+        TestExecutor(command='pytest -q "C:' + chr(92) + "my tests")
+
+
+def test_the_sandbox_can_resolve_the_running_interpreters_tools(tmp_path):
+    """The default `test_command` is `pytest -q`, and calling `agentloop` by its
+    path (which the README offers) leaves the venv's Scripts dir off PATH, so
+    that command could not resolve. `status="error"` is not `"fail"`, so the
+    tests gate silently fell back to the validator's own claim."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "marker.txt").write_text("x", encoding="utf8")
+
+    env = TestExecutor(command="pytest -q")._child_env()
+    scripts = str(Path(sys.executable).resolve().parent)
+    assert scripts in env["PATH"].split(os.pathsep)

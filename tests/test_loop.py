@@ -922,3 +922,134 @@ def test_a_missing_tool_name_is_recorded_as_unknown(store):
 
     call = [e for e in store.events(task.id) if e["kind"] == "tool_call"][0]
     assert call["payload"]["tool"] == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Slice 8: three defects in `loop.py`, each an incomplete application of a fix
+# this codebase had already made somewhere else.
+# ---------------------------------------------------------------------------
+
+
+def test_a_missing_worker_role_escalates_one_task_and_lets_the_batch_finish(tmp_path):
+    """`Registry.load` swaps the built-in defaults out wholesale with no merge
+    and no missing-role check, so a hand-edited agents.json (the documented
+    slice-4 "pin the validator to openai" edit) can leave `worker` undefined.
+
+    `registry.get` then raised a bare `KeyError` from `_maybe_handoff`, which
+    matches neither `except _ConfigError` nor `except _InfraError` and escaped
+    `run_task` entirely: the batch aborted, task 1 was left `in_progress` still
+    holding its lease with an empty `escalation_reason` — a task the dashboard
+    shows as running that nothing is running — and every task behind it never
+    ran. The next `agentloop run` re-claimed it and died identically.
+
+    `Loop.plan` already guards its `planner` role exactly this way."""
+    from agentloop.registry import AgentSpec, Registry
+
+    store = Store(tmp_path / "t.db")
+    first = add_task(store)
+    second = add_task(store)
+    loop, _ = make_loop(store, [APPROVE] * 10)
+    loop.registry = Registry({"validator": AgentSpec("validator", "m", "review it")})
+
+    loop.run()  # must not raise
+
+    first = store.get_task(first.id)
+    second = store.get_task(second.id)
+    assert first.status is TaskStatus.NEEDS_HUMAN
+    assert "worker" in first.escalation_reason
+    assert "agents.json" in first.escalation_reason
+    # The lease is *not* asserted here. Every escalation through `run()` leaves
+    # `claimed_by` set — measured on an ordinary `ESCALATE:` too — because
+    # `release_claim` fires only on a return to `pending`, and `agentloop redo`
+    # is the documented way back. What was wedged before this fix was not the
+    # lease but the *batch*: the raw `KeyError` escaped `run_task`, so nothing
+    # after it ran at all and no reason was ever written.
+    #
+    # So this is the assertion that matters: the second task was claimed and
+    # escalated for the same reason, instead of never running.
+    assert second.status is TaskStatus.NEEDS_HUMAN
+    store.close()
+
+
+def test_a_missing_validator_role_is_a_config_error_not_an_infra_error(tmp_path):
+    """It was raised *inside* `_with_retry`, so it became three paid retries and
+    an `infra_error` escalation — which CLAUDE.md names as pointing "the human at
+    the network instead of at agents.json"."""
+    from agentloop.registry import AgentSpec, Registry
+
+    store = Store(tmp_path / "t.db")
+    task = add_task(store)
+    loop, _ = make_loop(store, ["worker output"] * 10)
+    loop.registry = Registry({"worker": AgentSpec("worker", "m", "do it")})
+
+    loop.run_task(store.get_task(task.id))
+
+    task = store.get_task(task.id)
+    assert task.status is TaskStatus.NEEDS_HUMAN
+    assert "validator" in task.escalation_reason
+    assert "infra_error" not in task.escalation_reason
+    assert not [e for e in store.events(task.id) if e["kind"] == "infra_error"]
+    store.close()
+
+
+def test_a_claim_failure_in_a_parallel_worker_is_never_reported_as_success(tmp_path):
+    """The guard covered `run_task` but not `claim_next_task`, which opens a
+    write transaction and so raises `OperationalError: database is locked` after
+    the busy timeout whenever two `agentloop run` processes share a database.
+
+    Measured before the fix, at `max_parallel_workers=3` with three pending
+    tasks and the claim raising from the second call on: `run()` returned 1 and
+    raised nothing, two threads died, two tasks were silently dropped, and the
+    only signal was a `threading.excepthook` traceback on stderr — a channel
+    this project rules out everywhere else. The sequential path propagates, so
+    the two modes disagreed about what a failed batch even looks like."""
+    import sqlite3
+
+    store = Store(tmp_path / "t.db")
+    for _ in range(3):
+        add_task(store)
+    loop, _ = make_loop(store, [APPROVE] * 20, max_parallel_workers=3)
+
+    real_claim = store.claim_next_task
+    calls = {"n": 0}
+
+    def flaky(worker_id):
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise sqlite3.OperationalError("database is locked")
+        return real_claim(worker_id)
+
+    store.claim_next_task = flaky
+    with pytest.raises(sqlite3.OperationalError):
+        loop.run()
+    store.close()
+
+
+def test_resume_clears_the_pause_message_it_is_undoing(tmp_path):
+    """`set_status(..., reason="")` assigns only a *truthy* reason, so the row
+    kept whatever it held. `pause` stamps "Paused by human; resume to continue."
+    onto every task it touches, so before this every pause/resume cycle left
+    that sentence on the row for the rest of its life — measured still reading
+    it on a `done` task, asserting a suspension that had ended, directly above
+    the dashboard's decision buttons.
+
+    Four sibling paths (`reset_unowned_to_pending`, `approve_tool_request`,
+    `human_redo`, `approve_plan`) already blanked it; `resume` was the fifth."""
+    store = Store(tmp_path / "t.db")
+    task = add_task(store)
+    loop, _ = make_loop(store, ["worker output", APPROVE] * 4)
+
+    loop.pause(task.id)
+    assert "Paused by human" in store.get_task(task.id).escalation_reason
+
+    resumed = loop.resume(task.id)
+    assert resumed.status is TaskStatus.PENDING
+    assert resumed.escalation_reason == ""
+
+    # ...and it stays cleared through to the terminal status, which is where the
+    # stale sentence was actually being read.
+    loop.run_task(store.get_task(task.id))
+    finished = store.get_task(task.id)
+    assert finished.status is TaskStatus.DONE
+    assert "Paused by human" not in finished.escalation_reason
+    store.close()

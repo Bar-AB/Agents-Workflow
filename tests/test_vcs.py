@@ -1452,3 +1452,100 @@ def test_config_pin_never_reads_a_non_regular_file(ws, config, monkeypatch):
 
     assert vcs.config_pin(ws) == ""
     assert reads == [], f"read a non-regular .git/config: {reads}"
+
+
+# ---------------------------------------------------------------------------
+# Slice 8: the shipped default is a RELATIVE workspace_root, and every test in
+# this file uses `tmp_path`, which is absolute. That gap hid a defect that made
+# the entire durability feature inert on every default install:
+#
+#   `_run` sets `cwd=<ws>` and `_git` also appends `-C <ws>`, so git changed
+#   into the workspace and then tried to resolve the same relative path *again*
+#   from inside it. Measured on the shipped default `.agentloop/ws`:
+#     init_repo -> ok=False reason='git-failed'
+#       stderr: fatal: cannot change to '.agentloop\ws\task-1'
+#     commit / rollback -> the same
+#   with an absolute root, all three returned ok=True.
+#
+# The only signal an operator got was one `RuntimeWarning` per task saying the
+# task "ran without durability", so reject and redo silently lost the round they
+# were built to preserve.
+# ---------------------------------------------------------------------------
+
+
+def test_the_full_lifecycle_works_from_a_relative_workspace_root(tmp_path, monkeypatch):
+    """The shipped default is relative, so the shipped default is what this
+    exercises: `LoopConfig()` untouched, from a cwd that is not the repo."""
+    from agentloop.config import LoopConfig
+    from agentloop.executor import workspace_for
+
+    monkeypatch.chdir(tmp_path)
+    config = LoopConfig()  # workspace_root defaults to the relative ".agentloop/ws"
+    assert not Path(config.workspace_root).is_absolute()
+
+    ws = workspace_for(config.workspace_root, 1, create=True)
+    init = vcs.init_repo(ws, config, pin="")
+    assert init.ok, f"init failed: {init.reason} {init.stderr}"
+    assert init.pin
+
+    (ws / "util.py").write_text("def slugify(s):\n    return s\n", encoding="utf8")
+    committed = vcs.commit(ws, "round 1", config, pin=init.pin)
+    assert committed.ok, f"commit failed: {committed.reason} {committed.stderr}"
+    assert committed.sha
+
+    assert vcs.mark_approved(ws, config, pin=init.pin).ok
+    assert vcs.is_repo(ws, config)
+
+    rolled = vcs.rollback(ws, vcs.BASE_REF, config, pin=init.pin)
+    assert rolled.ok, f"rollback failed: {rolled.reason} {rolled.stderr}"
+    # The round is discarded from the tree but still reachable, which is the
+    # whole promise of the feature.
+    assert not (ws / "util.py").exists()
+    # The discarded tip is kept as a ref, so the round stays reachable from
+    # `git log --all` — the property that makes a rollback recoverable at all.
+    refs = git(ws, "for-each-ref", "--format=%(refname)").stdout
+    assert vcs.DISCARDED_REF_PREFIX in refs
+
+
+def test_a_relative_and_an_absolute_root_reach_the_same_state(tmp_path, monkeypatch):
+    """The differential that makes the test above mean something: before the
+    fix these two disagreed completely (relative failed every call, absolute
+    succeeded), which is precisely why an all-absolute suite stayed green."""
+    from agentloop.config import LoopConfig
+    from agentloop.executor import workspace_for
+
+    monkeypatch.chdir(tmp_path)
+    outcomes = []
+    for root in (".agentloop/ws", str((tmp_path / "abs-ws").resolve())):
+        config = LoopConfig(workspace_root=root)
+        ws = workspace_for(config.workspace_root, 7, create=True)
+        init = vcs.init_repo(ws, config, pin="")
+        (ws / "f.txt").write_text("x", encoding="utf8")
+        got = vcs.commit(ws, "m", config, pin=init.pin)
+        outcomes.append((init.ok, init.reason, got.ok, got.reason))
+    assert outcomes[0] == outcomes[1] == (True, "", True, "")
+
+
+def test_init_refuses_a_gitfile_pointing_at_another_repository(tmp_path, config, ws):
+    """`init_repo`'s docstring claimed git init "cannot reach outside the
+    workspace". A gitfile is not a directory, so it took the create branch, and
+    `git init` reinitialised the repo the file names — measured, rc=0.
+
+    Fails closed by design: nothing is created and the workspace is refused."""
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    git(victim, "init", "-q")
+    victim_head_before = (victim / ".git" / "HEAD").read_text(encoding="utf8")
+
+    # A worker writes one line of text inside its own workspace.
+    for entry in list(ws.iterdir()):
+        shutil.rmtree(entry) if entry.is_dir() else entry.unlink()
+    (ws / ".git").write_text(
+        f"gitdir: {victim / '.git'}\n".replace("\\", "/"), encoding="utf8"
+    )
+
+    result = vcs.init_repo(ws, config, pin="")
+    assert result.ok is False
+    assert result.reason == "not-a-workspace-repo"
+    # The control that makes the refusal mean something: the victim is untouched.
+    assert (victim / ".git" / "HEAD").read_text(encoding="utf8") == victim_head_before

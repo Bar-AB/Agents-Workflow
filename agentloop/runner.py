@@ -23,6 +23,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import warnings
+from collections.abc import Iterable
 from typing import Protocol
 
 from .models import RunResult
@@ -85,12 +86,23 @@ def extract_usage(usage: dict) -> tuple[int, int, int, int]:
     only `input_tokens`, which on a cached run reported ~2 while cache holds
     tens of thousands — a multi-thousand-fold undercount that made the budget
     cap measure almost nothing.
+
+    **Total, like `extract_openai_usage`**: it cannot raise on any input. Every
+    field goes through `_int_or_zero` rather than a bare `int()`, which raised
+    `ValueError` on `'n/a'` and `TypeError` on a nested dict — *after* the SDK
+    stream had completed and the completion was paid for. `agents._invoke`
+    reaches `finish_attempt` only on a clean return, so that raise discarded a
+    billed completion's tokens and cost and `loop._with_retry` then bought the
+    same one again. The guard existed on the second provider from the day it
+    shipped and was never back-fitted here, to the *default* backend.
     """
+    if not isinstance(usage, dict):
+        return (0, 0, 0, 0)
     return (
-        int(usage.get("input_tokens", 0) or 0),
-        int(usage.get("output_tokens", 0) or 0),
-        int(usage.get("cache_creation_input_tokens", 0) or 0),
-        int(usage.get("cache_read_input_tokens", 0) or 0),
+        _int_or_zero(usage.get("input_tokens")),
+        _int_or_zero(usage.get("output_tokens")),
+        _int_or_zero(usage.get("cache_creation_input_tokens")),
+        _int_or_zero(usage.get("cache_read_input_tokens")),
     )
 
 
@@ -206,6 +218,55 @@ def _estimate_tokens(system_prompt: str, prompt: str, output: str) -> tuple[int,
     return (max(1, -(-chars_in // 4)), max(1, -(-len(output) // 4)))
 
 
+def never_zero_usage(
+    counts: tuple[int, int, int, int],
+    system_prompt: str,
+    prompt: str,
+    output: str,
+    *,
+    source: str,
+    model: str,
+    reason: str,
+) -> tuple[tuple[int, int, int, int], str]:
+    """Substitute an estimate for any usage field a provider left at zero, and
+    say so. Returns `((in, out, cache_write, cache_read), note)`, where `note`
+    is `""` exactly when nothing was estimated.
+
+    **Checked per field**, because an attempt costing $0.00 does not trip the
+    budget cap and does not move the context-handoff measure, so a provider
+    omitting one field quietly disables both. `tokens_in == 0` alone is not
+    evidence of that, though — a fully cached prompt legitimately reports it
+    with `cache_read > 0` — so input is estimated only when *both* are zero.
+
+    Shared by both backends rather than copied into each. It was written for
+    `OpenAICompatRunner` and its reasoning is about the *loop's* invariants, not
+    about any one provider; leaving it there meant the **default** backend
+    recorded four silent zeros whenever the SDK's terminal message or its
+    `usage` shape did not match — a fabricated $0.00 landing in `attempts`
+    indistinguishable from a measured one, and rendered on the dashboard as a
+    measurement. One implementation, because a second copy of this guard would
+    drift exactly the way the coercions it sits beside already did.
+    """
+    tokens_in, tokens_out, cache_creation, cache_read = counts
+    est_in, est_out = _estimate_tokens(system_prompt, prompt, output)
+    estimated: list[str] = []
+    if tokens_in == 0 and cache_read == 0:
+        tokens_in = est_in
+        estimated.append("input")
+    if tokens_out == 0:
+        tokens_out = est_out
+        estimated.append("output")
+    note = ""
+    if estimated:
+        note = (
+            f"{source}: {reason} for model {model!r}; estimated "
+            f"{' and '.join(estimated)} tokens (~{tokens_in} in / "
+            f"{tokens_out} out) so the budget cap still measures this attempt."
+        )
+        warnings.warn(note, RuntimeWarning, stacklevel=2)
+    return (tokens_in, tokens_out, cache_creation, cache_read), note
+
+
 def extract_tool_calls(message) -> list[dict]:
     """Tool uses reported by one SDK message, as `{"tool", "input"}` dicts.
 
@@ -214,9 +275,18 @@ def extract_tool_calls(message) -> list[dict]:
     version that renames or restructures a block should cost us a record, not a
     run. Inputs are truncated — this is an index of what happened, not a copy
     of every file the agent wrote.
+
+    **Total**, for the same money reason as `extract_usage`: `content` was
+    iterated directly, so a non-iterable raised `TypeError` inside `run()` after
+    the completion was billed, where its OpenAI twin returned `[]`. Telemetry
+    must never fail an attempt, and provenance least of all — a missing
+    `tool_call` row is a gap in an index; a raise is a completion bought twice.
     """
     calls: list[dict] = []
-    for block in getattr(message, "content", None) or []:
+    content = getattr(message, "content", None) or []
+    if isinstance(content, (str, bytes)) or not isinstance(content, Iterable):
+        return calls
+    for block in content:
         if type(block).__name__ != "ToolUseBlock":
             continue
         raw = getattr(block, "input", None)
@@ -447,6 +517,11 @@ class ClaudeSDKRunner:
         chunks: list[str] = []
         tool_calls: list[dict] = []
         tokens_in = tokens_out = cache_creation = cache_read = 0
+        # Whether a terminal message ever carried usage at all. Distinguishes
+        # "the provider reported nothing" from "the provider reported zeros",
+        # which is the difference between the two `reason` strings below and the
+        # only thing the operator can act on.
+        saw_usage = False
         async for message in query(prompt=prompt, options=options):
             text = getattr(message, "result", None)
             if isinstance(text, str):
@@ -459,18 +534,48 @@ class ClaudeSDKRunner:
             # summing (the old bug) double-counts. Assign, never accumulate.
             if _is_result_message(message):
                 usage = getattr(message, "usage", None)
-                if isinstance(usage, dict):
+                if isinstance(usage, dict) and usage:
+                    saw_usage = True
                     (tokens_in, tokens_out, cache_creation, cache_read) = extract_usage(
                         usage
                     )
+        output = "\n".join(chunks)
+
+        # The same never-zero guard the OpenAI backend has always had. Without
+        # it, an SDK that ships `usage` as a dataclass rather than a dict — or a
+        # stream carrying no terminal `ResultMessage` this code can match —
+        # returned four zeros with `usage_estimated=False` and no note, so
+        # `agents._invoke` logged no `runner_warning`, `attempts` recorded
+        # $0.00, `_budget_tripped` could never fire, `_maybe_handoff` could never
+        # fire, and the dashboard rendered the fabricated zero as a measurement.
+        # Note the irony this closes: `_is_result_message` falls back to a class
+        # name so "a minor SDK version change doesn't silently break usage
+        # capture", and the `isinstance(usage, dict)` below it reintroduced
+        # exactly that silent break.
+        (tokens_in, tokens_out, cache_creation, cache_read), note = never_zero_usage(
+            (tokens_in, tokens_out, cache_creation, cache_read),
+            system_prompt,
+            prompt,
+            output,
+            source="claude-agent-sdk",
+            model=model,
+            reason=(
+                "usage reported zero"
+                if saw_usage
+                else "no usage was reported on any terminal message"
+            ),
+        )
+
         return RunResult(
-            output="\n".join(chunks),
+            output=output,
             tokens_in=tokens_in,
             tokens_out=tokens_out,
             cache_creation_tokens=cache_creation,
             cache_read_tokens=cache_read,
             model=model,
             tool_calls=tool_calls,
+            usage_estimated=bool(note),
+            notes=note,
         )
 
 
@@ -738,28 +843,15 @@ class OpenAICompatRunner:
         else:
             reason = "no usage was reported"
 
-        # Never a silent zero, and checked **per field**: an attempt costing
-        # $0.00 does not trip a budget cap and does not move the context-handoff
-        # measure, so a provider omitting one field would quietly disable both.
-        # `tokens_in == 0` alone is not evidence of that, though — a fully
-        # cached prompt legitimately reports it with `cache_read > 0` — so the
-        # input is only estimated when *both* are zero.
-        est_in, est_out = _estimate_tokens(system_prompt, prompt, output)
-        estimated: list[str] = []
-        if tokens_in == 0 and cache_read == 0:
-            tokens_in = est_in
-            estimated.append("input")
-        if tokens_out == 0:
-            tokens_out = est_out
-            estimated.append("output")
-        note = ""
-        if estimated:
-            note = (
-                f"{self.base_url}: {reason} for model {model!r}; estimated "
-                f"{' and '.join(estimated)} tokens (~{tokens_in} in / "
-                f"{tokens_out} out) so the budget cap still measures this attempt."
-            )
-            warnings.warn(note, RuntimeWarning, stacklevel=2)
+        (tokens_in, tokens_out, cache_creation, cache_read), note = never_zero_usage(
+            (tokens_in, tokens_out, cache_creation, cache_read),
+            system_prompt,
+            prompt,
+            output,
+            source=self.base_url,
+            model=model,
+            reason=reason,
+        )
 
         return RunResult(
             output=output,
@@ -778,7 +870,7 @@ class OpenAICompatRunner:
             # warning nobody sees in `agentloop events` is unrecorded, and the
             # estimate then reaches `attempts` indistinguishable from a
             # provider-measured number.
-            usage_estimated=bool(estimated),
+            usage_estimated=bool(note),
             notes=note,
         )
 

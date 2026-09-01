@@ -267,17 +267,24 @@ def test_cli_tools_list_renders_the_collateral_consequence(capsys):
 
 def test_cli_tools_list_states_the_outcome_and_not_only_the_sharing(capsys):
     """E4/F1 at the CLI. `[also decides: git -> Bash]` is a true statement about
-    the map and stays. What may not be inferred from it is the consequence: while
-    this ask is *pending* its `Bash` is already withheld, so `git` does not work
-    today — rejecting takes nothing away and approving is what restores it."""
+    the map and stays. What may not be inferred from it is the *consequence*,
+    and the consequence is what slice 8 corrected.
+
+    This test used to assert "approving grants Bash / git works again", on the
+    premise that a *pending* `shell` had already withheld `Bash` and taken the
+    worker's declared `git` down with it. That premise was the defect: an
+    undecided ask is nobody's decision and must not cost a role a capability it
+    already holds. So the honest sentence is the opposite one, and the point of
+    the test is unchanged — the screen states what the gate would really do,
+    computed from the gate's own outputs rather than from the sharing map."""
     _seed_tool_request("shell")
     main(["tools", "list"])
     out = capsys.readouterr().out
     assert "[also decides: git -> Bash]" in out  # the sharing line is untouched
-    assert "effect: approving grants Bash" in out
-    assert "git works again" in out
-    assert "rejecting takes nothing further away" in out
-    assert "git is already withheld" in out
+    assert "approving changes nothing" in out
+    assert "already has Bash" in out
+    # ...and the fail-closed half is still stated, because rejection still bites.
+    assert "rejecting also stops git working" in out
 
 
 def test_cli_tools_does_not_promise_a_grant_that_will_not_happen(capsys):

@@ -134,8 +134,23 @@ body {
   border-radius: 8px; padding: 10px; margin-bottom: 8px;
   cursor: pointer; transition: transform 0.12s, border-color 0.12s;
 }
-.card:hover { transform: translateY(-1px); border-color: var(--accent); }
-.card.selected { border-color: var(--accent); }
+/* Selection and hover must not paint over the status channel. `border-color`
+   is a shorthand for all four sides at specificity (0,2,0), while the status
+   map below sets `border-left-color` at (0,1,0) — so the *selected* card, the
+   one being decided on, lost its status colour for exactly as long as it was
+   selected. Same shorthand-kills-the-channel shape slice 7 fixed one level
+   down; naming the three other sides leaves the left edge to the status. */
+.card:hover {
+  transform: translateY(-1px);
+  border-top-color: var(--accent);
+  border-right-color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+.card.selected {
+  border-top-color: var(--accent);
+  border-right-color: var(--accent);
+  border-bottom-color: var(--accent);
+}
 .card .id { font-family: var(--mono); font-size: 11px; color: var(--muted); }
 .card .title { font-size: 13px; margin-top: 2px; word-break: break-word; }
 .card .meta {

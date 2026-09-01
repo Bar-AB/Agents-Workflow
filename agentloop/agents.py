@@ -43,12 +43,53 @@ from .toolpolicy import (
     tools_for,
 )
 
+# Decoration and/or whitespace: markdown emphasis, code ticks, spaces, newlines.
+# Interleaved rather than "decoration then whitespace", because `**VERDICT:**
+# approve` puts them in that order and `**VERDICT: approve**` in the other.
+_VERDICT_GAP = r"[\s*_`~]*"
+# The same, plus the separators a model puts *between* the three fields.
+_VERDICT_SEP = r"[\s*_`~,;|·–—-]*"
+
+# The decision-critical parser, deliberately tolerant of **decoration and
+# separators** and deliberately strict about **meaning**.
+#
+# The strict original accepted exactly one rendering, and an unparseable verdict
+# escalates at confidence 0 — below `severe_threshold`, so straight to
+# NEEDS_HUMAN with no revision round and a `reasoning` reading "Unparseable
+# validator output", which hides that the validator actually approved. Measured
+# against real formatting, five of six ordinary shapes did that: per-field
+# emphasis, comma and pipe separators, a bare `.95`, `n/a` for the value the
+# prompt spells `na`, and a percentage.
+#
+# `toolpolicy._MARKER_RE` already made this argument and won it — it tolerates a
+# markdown prefix, four reason separators, CRLF and every Unicode line
+# terminator, because LLM output is markdown. This parser drives an automatic
+# state transition and had none of that.
+#
+# What is NOT widened: the three verdict kinds, the three tests values and the
+# requirement that all three labelled fields be present stay exactly as they
+# were. Prose that merely *sounds* like an approval still escalates at 0, and
+# nothing here guesses a verdict. The two error directions are not symmetric —
+# reading past a bold marker costs nothing, while failing to read a real
+# decision spends a human's attention and is invisible in the record.
 _VERDICT_RE = re.compile(
-    r"VERDICT:\s*(approve|revise|escalate)\s*"
-    r"CONFIDENCE:\s*([01](?:\.\d+)?)\s*"
-    r"TESTS:\s*(pass|fail|na)",
+    rf"{_VERDICT_GAP}VERDICT{_VERDICT_GAP}:{_VERDICT_GAP}"
+    rf"(approve|revise|escalate){_VERDICT_SEP}"
+    rf"CONFIDENCE{_VERDICT_GAP}:{_VERDICT_GAP}"
+    # A percentage is captured separately rather than folded into the number:
+    # `95` and `95%` are the same confidence written two ways, and treating the
+    # first as 95.0 would clamp it to a *maximum* confidence.
+    rf"(\d*\.?\d+){_VERDICT_GAP}(%?){_VERDICT_SEP}"
+    rf"TESTS{_VERDICT_GAP}:{_VERDICT_GAP}"
+    # `\b` so `TESTS: nap` is not read as `na`.
+    rf"(pass|fail|n/a|na)\b",
     re.IGNORECASE,
 )
+
+# `n/a` is the same answer as `na`; the prompt asks for one and models write
+# both. `None` means "no executed result to speak of", which the loop then
+# resolves against `TestResult` rather than against this claim.
+_TESTS_VALUES = {"pass": True, "fail": False, "na": None, "n/a": None}
 
 # How much of the free-text context (feedback, or the output under review) feeds
 # the memory retrieval query alongside the task definition.
@@ -1167,8 +1208,13 @@ def parse_verdict(text: str) -> Verdict:
             reasoning=f"Unparseable validator output:\n{text}",
         )
     kind = VerdictKind(m.group(1).lower())
-    confidence = max(0.0, min(1.0, float(m.group(2))))
-    tests = {"pass": True, "fail": False, "na": None}[m.group(3).lower()]
+    raw_confidence = float(m.group(2))
+    if m.group(3):  # written as a percentage
+        raw_confidence /= 100.0
+    # Clamped, not rejected: `2.0` is a malformed confidence rather than a very
+    # confident one, and the clamp keeps it from reading as anything special.
+    confidence = max(0.0, min(1.0, raw_confidence))
+    tests = _TESTS_VALUES[m.group(4).lower()]
     reasoning = text[m.end() :].strip()
     return Verdict(
         kind=kind,

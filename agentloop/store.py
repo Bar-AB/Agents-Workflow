@@ -2412,7 +2412,19 @@ class Store:
                 " COALESCE(SUM(tokens_in),0) AS tokens_in,"
                 " COALESCE(SUM(tokens_out),0) AS tokens_out,"
                 " COALESCE(SUM(cost_usd),0.0) AS cost_usd"
-                " FROM attempts GROUP BY model ORDER BY cost_usd DESC"
+                # Same population as the headline totals above, which filter on
+                # `finished_at IS NOT NULL`. An attempt row exists from
+                # `start_attempt` and is completed only by `finish_attempt`, so
+                # every in-flight round — and every attempt whose
+                # `finish_attempt` was rolled back — was counted here and not
+                # there. `sum(by_model.attempts) > attempts` on any dashboard
+                # opened during a live run, with no explanation available to the
+                # reader, and costs and tokens agreed (the unfinished rows are
+                # 0) so only the count diverged — which reads as a rounding
+                # artefact rather than as two aggregates measuring two different
+                # things.
+                " FROM attempts WHERE finished_at IS NOT NULL"
+                " GROUP BY model ORDER BY cost_usd DESC"
             ).fetchall()
         ]
         revisions = self._conn.execute(

@@ -500,8 +500,37 @@ def effective_tools(
     # An undecided ask for something the role already holds is not a denial of
     # it; a decided one is. One filter rather than a branch inside the
     # subtraction, so `subtract_withheld` stays pure over its arguments.
+    #
+    # The exemption is decided in the **same currency as the subtraction** —
+    # concrete capabilities, not logical names. `LOGICAL_TOOL_MAP` is not
+    # injective, so a name test and a capability subtraction disagree on exactly
+    # the collision pairs this module was written around. Measured with the
+    # shipped `worker` spec and the default config (`gate_declared_tools=False`,
+    # so every declared name is held):
+    #
+    #   declares:                    ['file_io', 'git', 'search', 'task_state']
+    #   pending, optional 'shell' -> ['file_io', 'search', 'task_state']  # !!
+    #   pending, optional 'git'   -> ['file_io', 'git', 'search', 'task_state']
+    #
+    # `shell` and `git` both resolve to `Bash`, so an *undecided, non-blocking*
+    # ask — nobody's decision, never shown to a human — silently cost the role a
+    # capability it already had, for the rest of the task. The trigger is the
+    # shipped system prompt's own worked example: `registry.py` teaches
+    # `TOOL_REQUEST: shell (blocking) - the criteria require running the build`,
+    # and the worker declares `git`, not `shell`.
+    #
+    # Only the *pending* exemption widens. A **rejected** row still subtracts
+    # unconditionally, baseline or not — that is the fail-closed half, and it is
+    # what stops an agent revoking its own baseline by asking for it.
     pending = set(undecided)
-    effective_withheld = [t for t in withheld if not (t in pending and t in held)]
+    held_capabilities = set(resolve_tools(sorted(held)))
+    effective_withheld = [
+        t
+        for t in withheld
+        if not (
+            t in pending and (t in held or set(resolve_tools([t])) <= held_capabilities)
+        )
+    ]
     before = list(allowed)
     allowed, lost, capability = subtract_withheld(allowed, effective_withheld)
     return ToolEffect(

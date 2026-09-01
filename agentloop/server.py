@@ -16,6 +16,7 @@ Binds to localhost by default. Mutations are POST-only.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import mimetypes
 import threading
@@ -35,6 +36,9 @@ from .toolpolicy import declared_tools, decision_effect
 # Where the built frontend lands (`npm run build` in web/).
 _WEB_DIST = Path(__file__).resolve().parent.parent / "web" / "dist"
 
+# Hostnames that mean "this machine" and cannot be re-pointed by a DNS answer.
+_LOOPBACK_NAMES = frozenset({"localhost", "localhost.localdomain", ""})
+
 
 class DashboardServer(ThreadingHTTPServer):
     daemon_threads = True
@@ -47,6 +51,11 @@ class DashboardServer(ThreadingHTTPServer):
         self.loop = loop
         self.registry = registry
         self.config = config
+        # The name the operator asked to be reachable at, kept verbatim for the
+        # `Host` check. `server_address` holds the *resolved* bind address, which
+        # for a hostname bind is an IP and so cannot answer "was this the name
+        # the operator chose?".
+        self.bound_host = str(addr[0] or "").lower()
         self._shutdown_flag = threading.Event()
         super().__init__(addr, _Handler)
 
@@ -87,6 +96,84 @@ class _Handler(BaseHTTPRequestHandler):
     def _error(self, status: int, message: str) -> None:
         self._send_json({"error": message}, status=status)
 
+    # -- same-origin enforcement ---------------------------------------------
+    #
+    # This is an unauthenticated mutation API on a documented default port, so
+    # the only thing standing between it and any page the operator happens to
+    # have open is these two checks. Measured before they existed: a browser
+    # *simple request* (`Content-Type: text/plain`, no preflight, permitted
+    # cross-origin without asking) reached `POST /api/charter` and replaced the
+    # charter body — and `agents._charter_block` injects that body verbatim into
+    # every worker, validator and planner prompt, so a stranger's page could
+    # write the standing instructions for an agent holding `file_io`, `git` and
+    # Bash. Task approval, tool-request approval and `abort` are the same shape.
+    #
+    # Two conditions, because they stop two different attacks, and neither
+    # subsumes the other:
+    #   * `Origin` catches the ordinary cross-site request — the browser knows
+    #     it is somewhere else and says so.
+    #   * `Host` catches DNS rebinding, where the browser believes the attacker's
+    #     name *is* this server, so the request is same-origin by its reckoning
+    #     and carries no foreign `Origin` at all.
+    #
+    # Deliberately not a token: the operator chose the cheapest guard that
+    # closes the remote attacker, and a token would also have to be threaded
+    # through the frontend, the CLI and every curl example in the README.
+    # An attacker who is already executing code on this machine is out of scope
+    # here, as they are for `executor.py`'s env scrub.
+
+    def _host_ok(self) -> bool:
+        """Whether `Host` names this machine rather than a re-resolvable name.
+
+        An IP literal is accepted whatever it is: rebinding needs a *name* whose
+        DNS answer can be changed after the page loads, so a bare address cannot
+        be the vehicle — and refusing them would break `serve --host 0.0.0.0`
+        reached over the LAN, which is a supported setup."""
+        raw = (self.headers.get("Host") or "").strip()
+        # `[::1]:8765` -> `::1`; `127.0.0.1:8765` -> `127.0.0.1`.
+        if raw.startswith("["):
+            name = raw[1:].split("]", 1)[0]
+        else:
+            name = raw.rsplit(":", 1)[0] if ":" in raw else raw
+        name = name.lower()
+        if name in _LOOPBACK_NAMES or name == self.bound_host:
+            return True
+        try:
+            ipaddress.ip_address(name)
+        except ValueError:
+            return False
+        return True
+
+    def _origin_ok(self) -> bool:
+        """Whether `Origin`, *if the client sent one*, is this same server.
+
+        An absent `Origin` is accepted, and that is not a hole: only a browser
+        sets it, and a browser cannot omit it on a cross-origin request. curl,
+        the CLI and every scripted client send nothing, so requiring it would
+        break every non-browser caller in order to stop nothing."""
+        origin = (self.headers.get("Origin") or "").strip()
+        if not origin or origin.lower() == "null":
+            return True
+        host = (self.headers.get("Host") or "").strip().lower()
+        return urlparse(origin).netloc.lower() == host
+
+    def _same_origin(self) -> bool:
+        """Both conditions, fail-closed, checked before any routing. Applied to
+        GET as well as POST because rebinding's payoff on this server is the
+        *read*: `/api/tasks` carries goals and worker output, and `/api/config`
+        carries `test_command`."""
+        if not self._host_ok():
+            self._safe_error(403, "Forbidden: Host is not this server")
+            return False
+        if not self._origin_ok():
+            self._safe_error(403, "Forbidden: cross-origin request")
+            return False
+        return True
+
+    @property
+    def bound_host(self) -> str:
+        return getattr(self.server, "bound_host", "")
+
     def _safe_error(self, status: int, message: str) -> None:
         """Send an error response, but never raise while doing so — the socket
         may already be dead (a generic handler must not blow up trying to
@@ -115,6 +202,8 @@ class _Handler(BaseHTTPRequestHandler):
     # -- routing -------------------------------------------------------------
 
     def do_GET(self) -> None:
+        if not self._same_origin():
+            return
         url = urlparse(self.path)
         path, query = url.path, parse_qs(url.query)
         try:
@@ -179,6 +268,13 @@ class _Handler(BaseHTTPRequestHandler):
                 )
             elif path == "/api/stream":
                 self._stream(query)
+            elif path.startswith("/api/"):
+                # Before this, an unmatched `/api/*` fell through to the static
+                # handler, which answers anything that is not a file with
+                # `index.html` — so `GET /api/tsaks` returned 200 and a page of
+                # HTML, and a client could not tell a typo'd endpoint from a
+                # real one that happened to return no data.
+                self._error(404, f"No such endpoint: {path}")
             else:
                 self._serve_static(path)
         except ConnectionError:  # client navigated away mid-response
@@ -190,6 +286,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._safe_error(500, f"{type(exc).__name__}: {exc}")
 
     def do_POST(self) -> None:
+        if not self._same_origin():
+            return
         url = urlparse(self.path)
         parts = [p for p in url.path.split("/") if p]
         try:
@@ -473,9 +571,17 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _stream(self, query: dict) -> None:
         """SSE: replay everything after the cursor, then tail the audit log."""
-        cursor = int(
-            self.headers.get("Last-Event-ID") or (query.get("since") or ["0"])[0]
-        )
+        # Same 400-not-500 rule `/api/events` already applies, and this is the
+        # endpoint that needs it more: `Last-Event-ID` is client-supplied on
+        # *every* EventSource reconnect, so a bad cursor here is a routine
+        # client state, not an exotic one. A bare `int()` here answered 500,
+        # which tells the caller the server is broken for what is a bad request.
+        raw = self.headers.get("Last-Event-ID") or (query.get("since") or ["0"])[0]
+        try:
+            cursor = int(raw)
+        except (TypeError, ValueError):
+            self._error(400, f"Bad cursor: {raw!r}")
+            return
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -527,7 +633,16 @@ class _Handler(BaseHTTPRequestHandler):
 
         rel = path.lstrip("/") or "index.html"
         target = (_WEB_DIST / rel).resolve()
-        if not str(target).startswith(str(_WEB_DIST.resolve())):
+        # Containment, not a string prefix. `startswith` treated the parent as a
+        # *text* prefix, so a sibling directory whose name merely begins with
+        # the same characters passed: measured, `/../dist-backup/secret.txt`
+        # resolved outside `dist` and was served. `vcs._is_within` already got
+        # this right two modules over; this is the same predicate.
+        try:
+            contained = target.is_relative_to(_WEB_DIST.resolve())
+        except (OSError, ValueError):
+            contained = False  # a guard that errors is a guard that says no
+        if not contained:
             self._error(403, "Forbidden")  # path traversal attempt
             return
         if not target.is_file():
