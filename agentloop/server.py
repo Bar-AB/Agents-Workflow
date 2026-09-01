@@ -37,7 +37,27 @@ from .toolpolicy import declared_tools, decision_effect
 _WEB_DIST = Path(__file__).resolve().parent.parent / "web" / "dist"
 
 # Hostnames that mean "this machine" and cannot be re-pointed by a DNS answer.
-_LOOPBACK_NAMES = frozenset({"localhost", "localhost.localdomain", ""})
+# `""` is deliberately **not** here: an absent `Host` used to pass, and while
+# HTTP/1.1 makes the header mandatory so no browser can produce that request, it
+# is the same fail-open shape as the `Origin: null` hole one function down and
+# costs nothing to close.
+_LOOPBACK_NAMES = frozenset({"localhost", "localhost.localdomain"})
+
+
+def _own_hostname() -> str:
+    """This machine's own name, lowercased, or `""` if it cannot be determined.
+
+    Resolved once at import: `gethostname` reads a local setting, it does not
+    perform a DNS lookup, so this costs nothing per request and cannot hang."""
+    try:
+        import socket
+
+        return socket.gethostname().strip().lower()
+    except Exception:
+        return ""
+
+
+_OWN_HOST = _own_hostname()
 
 
 class DashboardServer(ThreadingHTTPServer):
@@ -136,7 +156,14 @@ class _Handler(BaseHTTPRequestHandler):
         else:
             name = raw.rsplit(":", 1)[0] if ":" in raw else raw
         name = name.lower()
-        if name in _LOOPBACK_NAMES or name == self.bound_host:
+        # This machine's own hostname, so `serve --host 0.0.0.0` reached from
+        # the LAN as `http://devbox:8765` still works. Without it `bound_host`
+        # is the literal `"0.0.0.0"`, which no browser ever sends, so every
+        # route — including `GET /` — answered 403 and the operator got a JSON
+        # blob where their dashboard should be. It does not weaken the
+        # rebinding guard: an attacker's domain is still a name that is neither
+        # loopback, nor this host, nor an IP literal.
+        if name in _LOOPBACK_NAMES or name == self.bound_host or name == _OWN_HOST:
             return True
         try:
             ipaddress.ip_address(name)
@@ -147,15 +174,60 @@ class _Handler(BaseHTTPRequestHandler):
     def _origin_ok(self) -> bool:
         """Whether `Origin`, *if the client sent one*, is this same server.
 
-        An absent `Origin` is accepted, and that is not a hole: only a browser
-        sets it, and a browser cannot omit it on a cross-origin request. curl,
-        the CLI and every scripted client send nothing, so requiring it would
-        break every non-browser caller in order to stop nothing."""
+        An **absent** `Origin` is accepted, and that is not a hole: only a
+        browser sets it, and a browser cannot omit it on a cross-origin request.
+        curl, the CLI and every scripted client send nothing, so requiring it
+        would break every non-browser caller in order to stop nothing.
+
+        `Origin: null` is **not** an absent one, and treating it as one was a
+        hole that reopened the exact attack this guard exists to close.
+        Measured on the first version of this check: a raw cross-origin `POST
+        /api/charter` carrying `Origin: null` returned 200 and replaced the
+        charter body. A browser sends the literal string `null` for an *opaque*
+        origin — from a sandboxed iframe (`<iframe sandbox="allow-scripts">`),
+        and after any redirect chain that crossed origins, which preserves
+        method and body on a 307. So `null` is a real cross-origin request that
+        declines to name itself, and an opaque origin can never be this server;
+        the one thing it must not be is treated as "the client sent nothing"."""
         origin = (self.headers.get("Origin") or "").strip()
-        if not origin or origin.lower() == "null":
+        if not origin:
             return True
         host = (self.headers.get("Host") or "").strip().lower()
-        return urlparse(origin).netloc.lower() == host
+        return bool(host) and urlparse(origin).netloc.lower() == host
+
+    def _refuse(self, why: str) -> None:
+        """403, **and a row in the audit log**.
+
+        Both halves are load-bearing and for different readers. A refusal here
+        is either an attack or a misconfiguration, and this handler could
+        report neither: `_safe_error` writes to the socket and returns, and
+        `log_message` is overridden to a no-op to keep the CLI clean, so the
+        refusal reached no event, no REST response, no SSE frame, not even
+        stderr. In a project whose stated invariant is that the append-only
+        audit log is load-bearing, the security control was the one thing on
+        zero channels — an operator had no way to learn that a page had tried
+        to rewrite their charter, and no way to see why their own dashboard was
+        answering 403.
+
+        `task_id=None`, like every other project-wide event: this is a fact
+        about the server, not about a task. Total by construction — a failure
+        to record must never take the refusal with it, since refusing is the
+        part that matters."""
+        try:
+            self.server.store.log_event(
+                None,
+                "dashboard_refused",
+                {
+                    "reason": why,
+                    "path": str(self.path)[:200],
+                    "host": str(self.headers.get("Host") or "")[:200],
+                    "origin": str(self.headers.get("Origin") or "")[:200],
+                    "method": self.command,
+                },
+            )
+        except Exception:
+            pass
+        self._safe_error(403, f"Forbidden: {why}")
 
     def _same_origin(self) -> bool:
         """Both conditions, fail-closed, checked before any routing. Applied to
@@ -163,10 +235,10 @@ class _Handler(BaseHTTPRequestHandler):
         *read*: `/api/tasks` carries goals and worker output, and `/api/config`
         carries `test_command`."""
         if not self._host_ok():
-            self._safe_error(403, "Forbidden: Host is not this server")
+            self._refuse("Host is not this server")
             return False
         if not self._origin_ok():
-            self._safe_error(403, "Forbidden: cross-origin request")
+            self._refuse("cross-origin request")
             return False
         return True
 

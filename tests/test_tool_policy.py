@@ -3982,3 +3982,61 @@ def test_a_pending_ask_for_an_unheld_capability_is_not_granted_by_the_exemption(
     effect = effective_tools(config, "worker", WORKER_DECLARES, [], ["web"], ["web"])
     assert effect.allowed == WORKER_DECLARES
     assert "web" not in effect.allowed
+
+
+def test_a_pending_ask_whose_footprint_only_overlaps_still_costs_nothing():
+    """The boundary the first version of this exemption got wrong, and the one
+    its tests could not see.
+
+    `LOGICAL_TOOL_MAP` has *partial* overlaps as well as exact collisions:
+    `file_io` -> [Read, Write, Edit] and `file_read` -> [Read], and the shipped
+    **planner** declares `file_read`. The first fix tested `subset`, so
+    `{Read, Write, Edit} <= {Read, ...}` was False, the row was not exempt, and
+    `subtract_withheld` removed every name overlapping `Read` — measured:
+
+        planner declares:          ['file_read', 'search', 'task_state']
+        pending optional file_io -> ['search']   lost ['file_read']
+
+    Same self-revocation as the `git`/`shell` case, one collision pair over.
+    """
+    config = LoopConfig()
+    declared = ["file_read", "search", "task_state"]
+    effect = effective_tools(config, "planner", declared, [], ["file_io"], ["file_io"])
+    assert effect.allowed == declared
+    assert effect.lost == []
+
+
+def test_a_rejected_partially_overlapping_ask_still_subtracts():
+    """The control, and the half that must not widen: a human's denial of
+    `file_io` still takes `file_read` down with it, because that is the
+    fail-closed direction."""
+    config = LoopConfig()
+    declared = ["file_read", "search", "task_state"]
+    effect = effective_tools(config, "planner", declared, [], ["file_io"], [])
+    assert "file_read" not in effect.allowed
+    assert effect.lost == ["file_read"]
+
+
+def test_a_pending_ask_sharing_nothing_is_still_withheld():
+    """The other control, and the one that makes the exemption non-vacuous: a
+    suite that passed with the exemption removed entirely would prove nothing,
+    so pin the case where the row genuinely *is* withheld."""
+    config = LoopConfig()
+    declared = ["search", "task_state"]  # Glob/Grep only: shares nothing with Bash
+    effect = effective_tools(config, "worker", declared, [], ["shell"], ["shell"])
+    assert "shell" not in effect.allowed
+    assert effect.withheld == ["shell"]
+
+
+def test_a_pending_ask_cannot_revoke_a_capability_a_human_just_granted():
+    """`held` was built only from the declared paths, so a granted capability
+    was not exempt. With `gate_declared_tools=True` a human approves `git`, and
+    the agent's next `TOOL_REQUEST: shell` — the registry's own worked example,
+    undecided and never shown to anyone — subtracted the `Bash` that human had
+    just granted. A grant is the strongest form of "already holds" there is."""
+    config = LoopConfig(gate_declared_tools=True)
+    effect = effective_tools(
+        config, "worker", ["search"], ["git"], ["shell"], ["shell"]
+    )
+    assert "git" in effect.allowed
+    assert effect.lost == []

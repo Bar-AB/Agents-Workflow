@@ -222,14 +222,24 @@ def _unquote(token: str) -> str:
     return token
 
 
-def _kill_tree(proc: subprocess.Popen) -> None:
+def _kill_tree(proc: subprocess.Popen) -> bool:
     """Kill the child **and everything it started**. Never raises.
 
     `Popen.kill()` signals only the direct child, so a test that shells out
     leaves its grandchildren running — and they hold the inherited stdout pipe,
     which is what makes the read below never end. On Windows `taskkill /T`
     walks the tree; elsewhere the child is its own session leader (see
-    `start_new_session` at the call site) so one `killpg` reaches all of it."""
+    `start_new_session` at the call site) so one `killpg` reaches all of it.
+
+    Returns **whether the child is confirmed gone**, and the return value is the
+    point rather than a convenience. Both arms below can fail for ordinary
+    reasons — `taskkill` answers "Access is denied" for an elevated or
+    job-held child, `os.getpgid` raises `ProcessLookupError` — and swallowing
+    that is correct (a failed kill must not raise into a paid round) only if
+    somebody upstream can still tell. Returning `None` and then rendering
+    "killed the process tree" was a string asserting more than its inputs
+    proved, which is the one thing this project's conventions forbid outright.
+    """
     try:
         if os.name == "nt":
             subprocess.run(
@@ -246,6 +256,13 @@ def _kill_tree(proc: subprocess.Popen) -> None:
         proc.kill()
     except Exception:
         pass
+    # `returncode` is set only once the process has actually been reaped, so
+    # this is the observation rather than a hope about the two calls above.
+    try:
+        proc.wait(timeout=10)
+    except Exception:
+        pass
+    return proc.returncode is not None
 
 
 def _run_bounded(
@@ -332,27 +349,47 @@ def _run_bounded(
 
     started = time.time()
     timed_out = False
+    killed = True
     try:
         proc.wait(timeout=timeout_s)
     except subprocess.TimeoutExpired:
         timed_out = True
-        _kill_tree(proc)
-        try:
-            proc.wait(timeout=10)
-        except Exception:
-            pass
+        killed = _kill_tree(proc)
     waited = time.time() - started
 
-    # Bounded join: the pump ends when the pipe closes, and the tree is dead by
-    # now, but a daemon thread that somehow lingers must not hold up the loop.
+    # The pump ends when the pipe closes, which happens when the last holder of
+    # the inherited stdout handle exits — *not* when the direct child does. So a
+    # bounded join, and its result is read.
     reader.join(timeout=5)
+    lingering = reader.is_alive()
+
+    if lingering and not timed_out:
+        # The child exited normally within its timeout while a grandchild it
+        # spawned kept the pipe open. `_kill_tree` used to run only on the
+        # timeout branch, so this case leaked the grandchild (holding workspace
+        # files open on Windows, which is what `clear_workspace`'s rmtree needs
+        # released) and leaked one daemon thread per round — and `raw` below was
+        # whatever had arrived by that instant, returned as though it were the
+        # whole output. Kill it here too, then re-join.
+        killed = _kill_tree(proc)
+        reader.join(timeout=5)
+        lingering = reader.is_alive()
 
     raw = b"".join(chunks)[-cap:]
+    # `degraded` is "" exactly when nothing degraded — the same convention
+    # `VcsResult.reason` uses, so a caller can render the honest sentence
+    # instead of one that assumes the happy path.
+    degraded = ""
+    if not killed:
+        degraded = "could not confirm the process tree was killed"
+    elif lingering:
+        degraded = "output may be incomplete: a child kept the pipe open"
     return (
         raw.decode("utf8", "replace"),
         proc.returncode if proc.returncode is not None else -1,
         timed_out,
         waited,
+        degraded,
     )
 
 
@@ -423,7 +460,7 @@ class TestExecutor:
 
         started = time.time()
         try:
-            combined, code, timed_out, waited = _run_bounded(
+            combined, code, timed_out, waited, degraded = _run_bounded(
                 argv,
                 cwd=str(ws),
                 timeout_s=self.timeout_s,
@@ -443,6 +480,26 @@ class TestExecutor:
             )
 
         duration = round(time.time() - started, 3)
+
+        # A degradation is stated in the `summary`, which `Store.add_test_run`
+        # persists and the REST API and dashboard both render — so it reaches a
+        # human the way every other recorded degradation in this project does,
+        # rather than living only in a warning nobody sees. It also warns, for
+        # the operator watching a terminal.
+        #
+        # It deliberately does **not** touch `status`. `status` feeds the tests
+        # gate, and no decision rule may start reading a durability signal; an
+        # unconfirmed kill is a statement about our cleanup, not about whether
+        # the tests passed.
+        if degraded:
+            warnings.warn(
+                f"test execution degraded ({degraded}); "
+                f"the recorded result for this round says so.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        note = f" [{degraded}]" if degraded else ""
+
         if timed_out:
             return TestResult(
                 status="error",
@@ -450,9 +507,17 @@ class TestExecutor:
                 # handler reported `self.timeout_s` unconditionally, so a call
                 # that had actually blocked for an hour still said "120s" — a
                 # rendered string asserting more than its inputs prove.
+                #
+                # The kill is reported the same way: `_kill_tree` answers
+                # whether the child was actually reaped, and this sentence says
+                # what happened rather than what was attempted. `taskkill`
+                # answers "Access is denied" for an elevated or job-held child
+                # and `os.getpgid` raises `ProcessLookupError`; swallowing those
+                # is right, claiming success after them is not.
                 summary=(
                     f"Tests timed out after {self.timeout_s}s "
-                    f"(killed the process tree at {waited:.1f}s)."
+                    f"(gave up at {waited:.1f}s; "
+                    f"{'process tree killed' if not degraded else degraded})."
                 ),
                 stdout_tail=combined[-_MAX_TAIL_CHARS:],
                 duration_s=duration,
@@ -460,10 +525,13 @@ class TestExecutor:
         return TestResult(
             status="pass" if code == 0 else "fail",
             exit_code=code,
-            summary=_summarize(combined, code),
+            summary=_summarize(combined, code) + note,
             stdout_tail=combined[-_MAX_TAIL_CHARS:],
             duration_s=duration,
-            coverage_percent=parse_coverage(combined),
+            # `None` when the output may be truncated: a coverage number parsed
+            # from a partial stream is a fabricated measurement, which is the
+            # one thing `parse_coverage` contracts never to produce.
+            coverage_percent=None if degraded else parse_coverage(combined),
         )
 
     def _child_env(self) -> dict[str, str]:
@@ -486,12 +554,15 @@ class TestExecutor:
         # default `test_command` of `pytest -q` could not resolve. Measured on a
         # real run: `Test command not found: pytest`.
         #
-        # That failure is quiet in the worst way. `status="error"` is not
-        # `"fail"`, so the tests gate falls back to the validator's own `TESTS:`
-        # claim — and "tests really run, and the executed result is
-        # authoritative" is this project's headline guarantee. It degraded into
-        # the exact thing it was built to replace, with the only trace a line
-        # inside the validator's prose.
+        # That failure is quiet, though not in the way an earlier version of
+        # this comment claimed. `TestResult.passed` returns `False` for both
+        # `"fail"` and `"error"` (only `"na"` returns `None` and falls back to
+        # the validator's claim), so an unresolvable command does **not** become
+        # auto-approvable — it fails *every* round and burns `max_revisions` on
+        # a gap no worker can close, escalating with a reason about test
+        # failures that never ran. The correction matters because in this repo
+        # the comments are the spec: a future reader trusting the old wording
+        # would conclude that a timeout or a missing binary is auto-approvable.
         #
         # The interpreter running the loop is the one whose tools the default
         # command means. Prepended, not appended, so a venv's `pytest` wins over

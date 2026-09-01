@@ -488,6 +488,7 @@ def effective_tools(
             continue
         if name in granted:
             allowed.append(name)
+            held.add(name)
             continue
         queued.append(name)
 
@@ -496,6 +497,16 @@ def effective_tools(
         # is never returned however the row was decided.
         if tool not in allowed and tool in LOGICAL_TOOL_MAP:
             allowed.append(tool)
+        # ...and a granted name is **held**, which is what the pending exemption
+        # below is asking about. `held` was built only from the declared paths,
+        # so with `gate_declared_tools=True` a human could approve `git` and the
+        # agent's next `TOOL_REQUEST: shell` — the registry's own worked example,
+        # undecided, never shown to anyone — would subtract the `Bash` that human
+        # had just granted. A grant is the strongest form of "already holds"
+        # there is; leaving it out made the exemption weakest exactly where a
+        # human had been most explicit.
+        if tool in LOGICAL_TOOL_MAP:
+            held.add(tool)
 
     # An undecided ask for something the role already holds is not a denial of
     # it; a decided one is. One filter rather than a branch inside the
@@ -524,12 +535,39 @@ def effective_tools(
     # what stops an agent revoking its own baseline by asking for it.
     pending = set(undecided)
     held_capabilities = set(resolve_tools(sorted(held)))
+
+    def _pending_costs_nothing(tool: str) -> bool:
+        """Whether subtracting this undecided row would take away a capability
+        the role already holds.
+
+        **Intersection, not subset**, and the difference is a live defect one
+        collision pair over from the one this exemption was written for.
+        `LOGICAL_TOOL_MAP` has *partial* overlaps as well as exact collisions:
+        `file_io` resolves to `[Read, Write, Edit]` and `file_read` to `[Read]`,
+        and the shipped **planner** declares `file_read`. Under a subset test
+        `{Read, Write, Edit} <= {Read, ...}` is False, so the row was not exempt
+        and `subtract_withheld` removed every name overlapping `Read` — measured:
+
+            planner declares:          ['file_read', 'search', 'task_state']
+            pending optional file_io -> ['search']   lost ['file_read']
+
+        An **optional, undecided** ask — never shown to a human, nobody's
+        decision — silently cost the planner the `Read` it already had. That is
+        the same self-revocation CLAUDE.md's rule forbids, and the same one the
+        `git`/`shell` fix closed; only the exact-collision case had been
+        measured.
+
+        Exempting cannot fail open. A pending row's tool is in `queued`, never
+        in `allowed`, so skipping the subtraction can only *keep* capabilities
+        the role independently declared — it can never hand over a new one. And
+        only the **pending** side is widened: a rejected row is not in
+        `pending`, so a human's denial still subtracts unconditionally."""
+        if tool in held:
+            return True
+        return bool(set(resolve_tools([tool])) & held_capabilities)
+
     effective_withheld = [
-        t
-        for t in withheld
-        if not (
-            t in pending and (t in held or set(resolve_tools([t])) <= held_capabilities)
-        )
+        t for t in withheld if not (t in pending and _pending_costs_nothing(t))
     ]
     before = list(allowed)
     allowed, lost, capability = subtract_withheld(allowed, effective_withheld)

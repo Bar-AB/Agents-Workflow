@@ -1228,7 +1228,7 @@ the project was used against a live provider for the first time, plus every
 finding it produced. The framing that matters: **the repo's own database held 0
 tasks and 0 attempts**, so nothing here had ever been driven end to end by a
 real model — and three of the criticals sat on exactly that path, invisible to
-740 passing mock-based tests. 854 tests now; every fix landed with a regression
+740 passing mock-based tests. 871 tests now; every fix landed with a regression
 test that was watched failing first, and the two guards worth doubting were
 falsified by neutering the mechanism and confirming the test went red.
 
@@ -1324,7 +1324,7 @@ falsified by neutering the mechanism and confirming the test went red.
   handle closes: a grandchild holding stdout defeated a 3 s timeout for 20.3 s,
   and one that never exits blocked forever, inside `_with_retry`, holding the
   claim. `_run_bounded` now reads into a bounded ring buffer in a daemon thread
-  and kills the whole process tree (Windows job kill / POSIX process group).
+  and kills the whole **process tree** (`taskkill /F /T` on Windows, a POSIX process group elsewhere).
   The timeout summary reports the *measured* wait as well as the requested one.
 - **A missing registry role wedged the whole batch.** `Registry.load` replaces
   the defaults wholesale with no merge and no missing-role check, so a
@@ -1387,6 +1387,55 @@ falsified by neutering the mechanism and confirming the test went red.
   --runner` was an inert flag that read as "the dashboard will drive real work";
   and CLI output raised `UnicodeEncodeError` when redirected on Windows, which
   `main`'s `(KeyError, ValueError)` handler swallowed into `error: charmap`.
+
+**A second review round, and what it caught in the first round's own fixes.**
+The fixes above were themselves put through two independent reviewers, and that
+round found three defects *introduced by the repairs* — which is the argument for
+the round, not against it.
+- **The widened verdict parser had turned a fail-safe non-match into a
+  fail-open maximum.** The pattern accepts any magnitude, and the first version
+  *clamped* out-of-range values instead of rejecting them — so `CONFIDENCE: 95`
+  (a percentage with the sign dropped) became `1.0`, the top of the scale,
+  clearing both thresholds and marking a task DONE with no human. `CONFIDENCE:
+  40` rewrote a validator's severe-threshold judgement into certainty the same
+  way. A clamp is not a rejection: it substitutes the **most permissive legal
+  value** for one the model never wrote. Out-of-range is now an unparseable
+  verdict, exactly as it was before the widening. The test that let this
+  through asserted `v.confidence <= 1.0`, which cannot fail for a clamped
+  value — a hollow assertion is worse than none, because it reads as coverage.
+  Its replacement asserts against the **decision thresholds** and was watched
+  going red on all five inputs with the clamp restored.
+- **The same-origin guard accepted `Origin: null`.** Measured on the first
+  version: a cross-origin `POST /api/charter` carrying `null` returned 200 and
+  replaced the charter — the very attack the guard was written to close. A
+  browser sends the literal `null` for an *opaque* origin (a sandboxed iframe,
+  and any redirect chain that crossed origins, which a 307 survives with method
+  and body intact), so it is a real cross-origin request that declines to name
+  itself, not an absent one. An absent `Host` passed for the same reason and is
+  closed with it.
+- **The tool-capability exemption was a subset test where it needed to be an
+  intersection.** `LOGICAL_TOOL_MAP` has *partial* overlaps as well as exact
+  collisions: `file_io` -> `[Read, Write, Edit]`, `file_read` -> `[Read]`, and
+  the shipped **planner** declares `file_read`. So an undecided, optional
+  `TOOL_REQUEST: file_io` still stripped the planner's `Read` — the same
+  self-revocation, one collision pair over from the `git`/`shell` case that had
+  been measured. A capability held through a human's **grant** was not exempt
+  either, so with `gate_declared_tools=True` a pending ask could revoke what a
+  human had just approved. The reviewer also proved the tool-policy suite could
+  not see any of this: with the exemption removed entirely, all 215 tests still
+  passed. It now fails in *both* directions — too permissive and too strict —
+  and that was verified by neutering each way.
+
+Two smaller ones from the same round, both places the code and its own prose had
+drifted apart: the `` added to stop `TESTS: nap` reading as `na` had silently
+narrowed `TESTS: passed` / `failed` out of the grammar, on a slice whose stated
+purpose is surviving ordinary formatting; and the executor comment justifying the
+`PATH` fix claimed `status="error"` falls back to the validator's `TESTS:` claim,
+when `TestResult.passed` returns `False` for it — the honest consequence is that
+an unresolvable command fails every round and burns `max_revisions`. The
+documented "Windows job kill" is `taskkill /F /T`, which walks the live
+parent-PID chain and therefore misses a reparented orphan; that residual is now
+named rather than claimed away.
 
 **What was checked and found sound**, because a review naming no confirmed
 property is not a review: all 43 `store.py` write sites are transactionally

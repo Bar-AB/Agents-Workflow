@@ -157,16 +157,55 @@ def _int_or_zero(value) -> int:
 
     `None` and a missing key were already handled; a *type* was not — `'n/a'`
     raised ValueError, a nested dict raised TypeError, and both landed after the
-    completion was paid for (see `extract_openai_usage`). A wrong number here is
-    caught by the never-zero guard in `run`, which estimates instead; a raise
-    was not caught by anything that could keep the reply.
+    completion was paid for (see `extract_openai_usage`). A raise there was not
+    caught by anything that could keep the reply.
+
+    **A present-but-garbage value is a different thing from an absent one**, and
+    only `coerced_usage_fields` can tell them apart. `never_zero_usage` estimates
+    `tokens_in`/`tokens_out` when they come back zero, so garbage in those two is
+    caught downstream — but the two *cache* fields have no such guard, and per
+    the decision rules the token total includes cache reads while cost prices
+    them at 0.10x. So a `{"cache_read_input_tokens": "n/a"}` alongside healthy
+    input/output tokens silently recorded zero cache tokens **as a measurement**:
+    no estimate, `note` empty, `usage_estimated=False`, no `runner_warning`, and
+    on a cache-heavy run that is the dominant term of the budget cap. Exactly the
+    defect `usage_estimated` exists to prevent, one field over.
     """
+    if value is None:
+        return 0  # absent, not garbage — nothing to report
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return 0
     try:
         return max(0, int(value))
     except (ValueError, OverflowError):  # inf / nan
         return 0
+
+
+def coerced_usage_fields(usage) -> list[str]:
+    """The usage keys that were *present* and could not be read as a count.
+
+    Separate from `_int_or_zero` rather than folded into it so that function
+    stays a pure `value -> int` used in six places. Total: it cannot raise, for
+    the same money reason everything else on this path is total."""
+    bad: list[str] = []
+    try:
+        if not isinstance(usage, dict):
+            return bad
+        for key, value in usage.items():
+            if value is None or not isinstance(key, str):
+                continue
+            if not key.endswith("tokens"):
+                continue  # not a count field; not ours to judge
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                bad.append(key)
+                continue
+            try:
+                int(value)
+            except (ValueError, OverflowError):  # inf / nan
+                bad.append(key)
+    except Exception:
+        return bad
+    return sorted(bad)
 
 
 def extract_openai_tool_calls(message: dict) -> list[dict]:

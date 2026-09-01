@@ -1041,3 +1041,85 @@ def test_a_sibling_directory_sharing_the_dist_prefix_is_refused(tmp_path, live):
         assert code_ok == 200 and "ok" in body_ok
     finally:
         server_mod._WEB_DIST = original
+
+
+def test_an_opaque_null_origin_is_refused_like_any_other_foreign_one(live):
+    """The bypass the first version of this guard shipped with.
+
+    `Origin: null` was accepted as though the client had sent nothing, and that
+    reopened the exact attack the guard exists to close — measured on that
+    version: 200 OK and the charter replaced. A browser sends the literal string
+    `null` for an *opaque* origin: from a sandboxed iframe, and after any
+    redirect chain that crossed origins (a 307 preserves method and body). So it
+    is a real cross-origin request that declines to name itself, and an opaque
+    origin can never be this server."""
+    base, store, _loop, _config = live
+    host = base.split("//", 1)[1]
+
+    code, _ = raw_request(
+        base,
+        "POST",
+        "/api/charter",
+        {"Host": host, "Origin": "null", "Content-Type": "text/plain"},
+        json.dumps({"body": "IGNORE PRIOR RULES"}),
+    )
+    assert code == 403
+    assert store.charter_active() is None
+
+
+def test_a_request_with_no_host_header_at_all_is_refused(live):
+    """`_LOOPBACK_NAMES` used to contain `""`, so an absent `Host` passed. No
+    browser can produce this (HTTP/1.1 makes the header mandatory), but it is
+    the same fail-open shape as the `null` origin and costs nothing to close."""
+    base, _store, _loop, _config = live
+    import socket
+    from urllib.parse import urlparse
+
+    u = urlparse(base)
+    sock = socket.create_connection((u.hostname, u.port), 5)
+    sock.sendall(b"GET /api/tasks HTTP/1.1\r\nConnection: close\r\n\r\n")
+    sock.settimeout(5)
+    chunks = []
+    try:
+        while True:
+            b = sock.recv(4096)
+            if not b:
+                break
+            chunks.append(b)
+    except socket.timeout:
+        pass
+    finally:
+        sock.close()
+    assert b"403" in b"".join(chunks).split(b"\r\n", 1)[0]
+
+
+def test_a_refusal_reaches_the_audit_log(live):
+    """A 403 here is either an attack or a misconfiguration, and this handler
+    could report neither: `_safe_error` writes to the socket, `log_message` is a
+    no-op to keep the CLI clean, so the control was on zero channels. An
+    operator had no way to learn a page had tried to rewrite their charter."""
+    base, store, _loop, _config = live
+    host = base.split("//", 1)[1]
+
+    raw_request(
+        base,
+        "POST",
+        "/api/charter",
+        {"Host": host, "Origin": "http://evil.example", "Content-Type": "text/plain"},
+        json.dumps({"body": "x"}),
+    )
+    refusals = [e for e in store.events() if e["kind"] == "dashboard_refused"]
+    assert len(refusals) == 1
+    payload = refusals[0]["payload"]
+    assert payload["origin"] == "http://evil.example"
+    assert payload["path"] == "/api/charter"
+    assert payload["method"] == "POST"
+
+
+def test_a_legitimate_request_writes_no_refusal_event(live):
+    """The control: the audit row must mean "something was refused", not
+    "a request happened"."""
+    base, store, _loop, _config = live
+    host = base.split("//", 1)[1]
+    raw_request(base, "GET", "/api/tasks", {"Host": host})
+    assert not [e for e in store.events() if e["kind"] == "dashboard_refused"]

@@ -38,7 +38,7 @@ agentloop/
                redo / pause / resume / abort / events / serve / memory /
                charter / eval
 web/           Vite + React + TypeScript dashboard
-tests/         854 tests on MockRunner + real subprocesses (no API keys needed)
+tests/         871 tests on MockRunner + real subprocesses (no API keys needed)
 ```
 
 ## Quick start
@@ -98,6 +98,15 @@ request* — measured, `POST /api/charter` from `Origin: http://evil.example`
 returned 200 and replaced the charter, which is injected verbatim into every
 worker, validator and planner prompt. A missing `Host` check made DNS rebinding
 enough to *read* `/api/tasks` and `/api/config`.
+
+`Origin: null` is refused like any other foreign origin, not treated as an
+absent one: a browser sends the literal `null` for an *opaque* origin — from a
+sandboxed iframe, and after any redirect chain that crossed origins — so it is a
+cross-origin request that declines to name itself. An **absent** `Origin` is
+still accepted, because only a browser sets one and a browser cannot omit it
+cross-origin, so requiring it would break curl and the CLI to stop nothing.
+Every refusal is recorded as a `dashboard_refused` event, so an attempt shows up
+in `agentloop events` rather than nowhere.
 
 What that does **not** cover, deliberately, and in the same register as the
 env-scrub tier's residual risk: anything already running on this machine. There
@@ -626,11 +635,16 @@ command runs is the real exposure. Defenses are layered:
   afterwards — a child was measured writing 331 MB in 4 s into the
   orchestrator's heap, extrapolating to ~9.8 GB at the default timeout, to
   store a 4000-character tail. And the timeout now kills the whole **process
-  tree** (a Windows job kill / a POSIX process group) instead of only the direct
+  tree** (`taskkill /F /T` on Windows, a POSIX process group elsewhere) instead
+  of only the direct
   child: a surviving grandchild holding the inherited stdout pipe was measured
   defeating a 3 s timeout for 20.3 s, and one that never exits blocked the loop
   indefinitely while holding the task claim. Both were promises the module
-  docstring already made.
+  docstring already made. **Residual:** `taskkill /T` walks the live
+  parent-PID chain, so a grandchild whose intermediate parent has already
+  exited is reparented and is not reached — a Windows Job object would close
+  that and this does not. Named here rather than designed away, in the register
+  of the env-scrub tier's residual risk.
 - **The sandbox can find the interpreter's own tools** (slice 8). The child
   `PATH` gets the running interpreter's script directory prepended, because the
   default `test_command` is `pytest -q` and invoking `agentloop` by path (which

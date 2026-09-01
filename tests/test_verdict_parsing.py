@@ -127,11 +127,53 @@ def test_a_reply_without_a_real_verdict_still_escalates_at_zero(reply):
     assert v.reasoning.startswith("Unparseable validator output")
 
 
-def test_confidence_above_one_is_clamped_not_accepted_as_written():
-    """`2.0` is a malformed confidence, not a very confident one. It must never
-    read as clearing the 0.70 approve threshold on its own terms."""
-    v = parse_verdict("VERDICT: approve CONFIDENCE: 2.0 TESTS: pass")
-    assert v.confidence <= 1.0
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "VERDICT: approve CONFIDENCE: 95 TESTS: pass",  # a percentage, sign dropped
+        "VERDICT: approve CONFIDENCE: 2.0 TESTS: pass",
+        "VERDICT: approve CONFIDENCE: 8 TESTS: pass",
+        "VERDICT: revise CONFIDENCE: 55 TESTS: pass",
+        "VERDICT: approve CONFIDENCE: 150% TESTS: pass",
+    ],
+)
+def test_an_out_of_range_confidence_escalates_rather_than_reading_as_certainty(reply):
+    """The regression this file exists to prevent, and the direction that costs
+    real money.
+
+    An earlier version of the widened parser *clamped* instead of rejecting, and
+    a clamp substitutes the most permissive legal value: every out-of-range
+    number became `1.0`, the top of the scale, which unconditionally clears both
+    `approve_threshold` (0.70) and `severe_threshold` (0.40). Measured:
+    `CONFIDENCE: 95` parsed as APPROVE at 1.0, so the task went DONE with no
+    human and released its dependents. Widening the pattern had turned a
+    fail-safe non-match into a fail-open maximum on the one gate CLAUDE.md rules
+    "never guess-approve".
+
+    The assertion is deliberately against the **decision thresholds**, not
+    against the clamp bound. The test that missed this asserted
+    `v.confidence <= 1.0`, which cannot fail for a clamped value — a hollow
+    assertion is worse than none, because it reads as coverage."""
+    v = parse_verdict(reply)
+    assert v.kind is VerdictKind.ESCALATE
+    assert v.confidence == 0.0
+    assert v.confidence < 0.40  # below severe: no revision loop, straight to human
+    assert "Unparseable" in v.reasoning
+
+
+def test_a_confidence_at_the_edges_of_the_range_is_still_accepted():
+    """The control. Rejecting out-of-range must not reject the boundary values
+    themselves, or the fix would be a different bug."""
+    for reply, expected in (
+        ("VERDICT: approve CONFIDENCE: 1 TESTS: pass", 1.0),
+        ("VERDICT: approve CONFIDENCE: 1.0 TESTS: pass", 1.0),
+        ("VERDICT: escalate CONFIDENCE: 0 TESTS: na", 0.0),
+        ("VERDICT: approve CONFIDENCE: 100% TESTS: pass", 1.0),
+        ("VERDICT: approve CONFIDENCE: 95% TESTS: pass", 0.95),
+    ):
+        v = parse_verdict(reply)
+        assert v.confidence == pytest.approx(expected), reply
+        assert v.kind is not VerdictKind.ESCALATE or "escalate" in reply
 
 
 def test_the_reasoning_tail_is_still_whole():
@@ -143,3 +185,30 @@ def test_the_reasoning_tail_is_still_whole():
     )
     assert "The empty-input case is unhandled." in v.reasoning
     assert "checked the guard" in v.findings
+
+
+@pytest.mark.parametrize(
+    "reply, tests",
+    [
+        ("VERDICT: approve CONFIDENCE: 0.85 TESTS: passed", True),
+        ("VERDICT: revise CONFIDENCE: 0.5 TESTS: failed", False),
+        ("VERDICT: revise CONFIDENCE: 0.5 TESTS: failing", False),
+    ],
+)
+def test_the_word_forms_of_the_tests_values_are_accepted(reply, tests):
+    """`passed`/`failed` is at least as ordinary an LLM rendering as the shapes
+    this parser was widened for. The `\b` added to stop `TESTS: nap` reading as
+    `na` had silently narrowed them out — a slice whose purpose is surviving
+    ordinary formatting must not lose a form on the way."""
+    v = parse_verdict(reply)
+    assert v.kind is not VerdictKind.ESCALATE
+    assert v.tests_passed is tests
+
+
+def test_the_nap_protection_the_word_forms_had_to_preserve():
+    """The control for the test above: widening to `passed` must not reopen the
+    prefix match `\b` was added to close."""
+    assert (
+        parse_verdict("VERDICT: approve CONFIDENCE: 0.85 TESTS: nap").kind
+        is VerdictKind.ESCALATE
+    )
