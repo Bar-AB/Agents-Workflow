@@ -32,7 +32,7 @@ class ControllingRunner:
         self.n = 0
         self.calls = []
 
-    def run(self, system_prompt, prompt, model, tools=None):
+    def run(self, system_prompt, prompt, model, tools=None, cwd=None):
         self.calls.append({"prompt": prompt})
         self.n += 1
         if self.n == self.at_call:
@@ -233,7 +233,7 @@ class EvictingRunner:
         self.calls = []
         self.peer_claim = None
 
-    def run(self, system_prompt, prompt, model, tools=None):
+    def run(self, system_prompt, prompt, model, tools=None, cwd=None):
         self.calls.append({"prompt": prompt})
         if len(self.calls) == self.at_call:
             self.loop.pause(self.task_id)
@@ -419,7 +419,7 @@ class RedoingRunner:
         self.at_call = at_call
         self.calls = []
 
-    def run(self, system_prompt, prompt, model, tools=None):
+    def run(self, system_prompt, prompt, model, tools=None, cwd=None):
         self.calls.append({"prompt": prompt})
         if len(self.calls) == self.at_call:
             self.loop.human_redo(self.task_id)
@@ -472,7 +472,19 @@ def test_a_redo_landing_mid_round_is_not_half_undone_by_the_evicted_worker(store
     # And the round really was interrupted mid-flight — otherwise the assertions
     # above would be measuring a run that never wrote anything.
     assert [e["kind"] for e in store.events(task.id)].count("human_redo") == 1
-    assert len(runner.calls) >= 2, "the evicted round went on to call the validator"
+    # It went on *past the worker's own writes* — `task.output = ...` and
+    # `set_status(REVISING)`, the two that used to put the redone context back —
+    # and reached the stage after them, which is what this test measures. The
+    # test-run row is the proof: it is written between the worker and the
+    # validator and is not lease-predicated.
+    assert len(store.test_runs(task.id)) == 1
+    # It stops short of the validator, and that is a *deliberate* consequence of
+    # the slice-9 cwd fix rather than a weakened assertion: `human_redo` wipes
+    # the workspace, which is now the directory the validator would run in, so
+    # the loop refuses that call as a config error instead of invoking an agent
+    # in a directory that is gone. Re-creating it would hand the validator an
+    # empty tree and hide the wipe.
+    assert len(runner.calls) == 1
 
 
 def test_a_worker_holding_its_lease_still_writes_its_output(store):

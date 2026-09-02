@@ -135,6 +135,7 @@ is recorded as a `test_disagreement` event — the loop measures its validators.
 
 from __future__ import annotations
 
+import os
 import shutil
 import threading
 import time
@@ -1050,6 +1051,7 @@ class Loop:
                     if not init.ok and init.reason not in ("already", "disabled"):
                         self._vcs_degraded(task.id, "init", init)
                 worker_runner = self._runner_for(task.worker_role)
+                self._require_workspace("worker", ws)
                 result = self._with_retry(
                     task,
                     "worker",
@@ -1230,6 +1232,7 @@ class Loop:
                 # another family than produced it. Nothing below this line
                 # changes — the verdict path is identical either way.
                 validator_runner = self._runner_for(task.validator_role)
+                self._require_workspace("validator", ws)
                 verdict, attempt_id = self._with_retry(
                     task,
                     "validator",
@@ -1242,6 +1245,15 @@ class Loop:
                         memory=self.memory,
                         test_result=test_result,
                         config=self.config,
+                        # The same workspace the worker was given, for the same
+                        # reason: the validator declares `file_io` and was
+                        # reading the orchestrator's own directory while
+                        # reviewing work that lives here. Spelled `cwd` and not
+                        # `workspace` because it changes the validator's working
+                        # directory *only* — the prompt is byte-for-byte what it
+                        # was, and the worker's identically-valued `workspace=`
+                        # eight lines up also feeds a prompt block.
+                        cwd=str(ws),
                     ),
                 )
             except _ConfigError as exc:
@@ -1973,6 +1985,40 @@ class Loop:
             backend = self._runners[name]
         _check_model_for_backend(role, spec.model, backend)
         return backend
+
+    def _require_workspace(self, stage: str, ws) -> None:
+        """Refuse to invoke an agent whose working directory is not there.
+
+        Since slice 9's P1 the workspace is the agent's actual `cwd`, so its
+        absence is now a *precondition* of the call rather than a detail of the
+        prompt. The SDK's own answer is a `CLIConnectionError` ("Working
+        directory does not exist"), an ordinary `Exception` — so `_with_retry`'s
+        transient branch took it: three retries with backoff at full model cost,
+        three `infra_error` rows, then NEEDS_HUMAN blaming the network for a
+        permanent condition. Reachable in one round, because the worker holds
+        `file_io` and Bash: a worker that removes or renames its own workspace
+        leaves the validator pointing at a directory that no longer exists.
+
+        Classified exactly as CLAUDE.md already classifies a missing API key or
+        a 404 — config error, no retry, no `infra_error` event — and raised
+        **outside** `_with_retry`, since `_ConfigError` is an `Exception` and
+        that function's bare `except Exception` would otherwise retry it.
+
+        The empty string is refused with the same breath: the SDK's `if
+        self._cwd:` swallows it back to the orchestrator's own directory, which
+        is the fail-open default this whole fix exists to close. Not reachable
+        from today's callers; a guard that says no costs nothing.
+        """
+        path = str(ws or "")
+        if path and os.path.isdir(path):
+            return
+        raise _ConfigError(
+            f"{stage}: working directory does not exist: {path!r}. The task "
+            f"workspace is where this agent's file tools resolve every relative "
+            f"path, so the call was refused rather than made against the "
+            f"orchestrator's own directory. Check `workspace_root` and whether "
+            f"anything removed the workspace mid-task."
+        )
 
     def _with_retry(self, task: Task, stage: str, fn):
         """Call `fn`, retrying transient failures with exponential backoff.

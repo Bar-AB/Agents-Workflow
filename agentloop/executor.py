@@ -576,9 +576,25 @@ class TestExecutor:
 
 
 def workspace_for(root: str | Path, task_id: int, create: bool = False) -> Path:
-    """Per-task workspace. Isolated so a redo can wipe it for a true fresh
-    start rather than rerunning over dirty state."""
-    ws = Path(root) / f"task-{task_id}"
+    """Per-task workspace, always **absolute**. Isolated so a redo can wipe it
+    for a true fresh start rather than rerunning over dirty state.
+
+    Absolutised here, at the one place a workspace path is produced, because
+    since slice 9's P1 that path is read from *two different directories*: the
+    orchestrator's, when the loop resolves it, and the workspace itself, when
+    the agent reads the `## Workspace` instruction naming it after `cwd` has
+    put it there. `workspace_root` ships relative (`.agentloop/ws`), so the
+    same string denoted two directories — the agent created
+    `<ws>/.agentloop/ws/task-N`, pytest's `norecursedirs` skipped the dotted
+    directory, nothing was collected, and the tests gate blocked approval every
+    round until the revisions ran out, escalating with a reason about tests
+    rather than about a path.
+
+    `os.path.abspath`, **lexically, and deliberately not `Path.resolve()`** —
+    the same choice `vcs._git` documents for its `-C` value: resolve follows a
+    junction at the workspace and would quietly take over the one decision
+    `vcs._guard` exists to make."""
+    ws = Path(os.path.abspath(Path(root) / f"task-{task_id}"))
     if create:
         ws.mkdir(parents=True, exist_ok=True)
     return ws

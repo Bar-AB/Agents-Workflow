@@ -14,13 +14,42 @@ and model-agnostic (roadmap #5: second-provider cross-validator).
 
 ```python
 class ModelRunner(Protocol):
-    def run(self, system_prompt: str, prompt: str, model: str) -> RunResult: ...
+    def run(
+        self,
+        system_prompt: str,
+        prompt: str,
+        model: str,
+        tools: list[str] | None = None,
+        cwd: str | None = None,
+    ) -> RunResult: ...
 ```
 
 `run()` executes exactly one agent invocation and returns a `RunResult`
-(`agentloop/models.py`): `output`, `tokens_in`, `tokens_out`, `model`. That is
-the entire surface. The loop handles prompts, verdicts, retries, and budgets;
-your runner only turns (system, prompt, model) into text + token usage.
+(`agentloop/models.py`): `output`, `tokens_in`, `tokens_out`, `model`, plus the
+prompt-cache counts. That is the entire surface. The loop handles prompts,
+verdicts, retries, and budgets; your runner turns
+(system, prompt, model, tools, cwd) into text + token usage.
+
+**All five arguments are passed positionally by `agents._invoke`**, so a runner
+written to the three-argument shape this document used to publish raises
+`TypeError` inside `loop._with_retry` — three paid retries and an `infra_error`
+pointing the operator at their network.
+
+- `tools` is the agent's allowlist and is the **entire enforcement surface** of
+  the tool-approval gate (slice 5): an SDK backend runs tools *inside* this
+  call, so nothing downstream can withhold a capability. Honor it, or degrade
+  loudly — `OpenAICompatRunner` drops it with a `RuntimeWarning` because a
+  chat-completions call has no execution loop.
+- `cwd` is the directory the agent's tools resolve relative paths against — the
+  task workspace for a worker or a validator, `None` for a role with nowhere
+  honest to point. A backend with no filesystem may ignore it *silently*
+  (`OpenAICompatRunner` does): unlike `tools`, ignoring it withholds nothing
+  from anyone. It is a **call argument, never constructor state** — one backend
+  instance is shared across roles and threads, so a `self.cwd` set before each
+  call is a data race whose losing task writes into another task's workspace.
+
+`agentloop/runner.py`'s `ModelRunner` protocol docstring is the authority; this
+block is a copy and must be re-checked against it when the seam widens.
 
 ## Checklist
 
@@ -63,3 +92,8 @@ enforced by `parse_verdict` in `agentloop/agents.py`.
 - Returning `tokens_*` as 0 → budget caps never trip; cost metrics read $0.00.
 - `RunResult.model` not matching a `MODEL_PRICING` key → cost silently wrong.
 - Forgetting the `cli.py` `choices` list → `--runner yours` errors out.
+- Writing `run()` to a narrower signature than the protocol → `TypeError`
+  inside `_with_retry`, which reports it as three `infra_error` retries.
+- Storing `cwd` (or `tools`) on `self` between calls → one shared backend
+  instance serves every role and thread; the loser of the race writes into
+  another task's workspace, silently.

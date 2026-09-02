@@ -211,8 +211,24 @@ def _invoke(
     retrieval: dict | None = None,
     charter_version: int | None = None,
     config: LoopConfig | None = None,
+    cwd: str | None = None,
 ) -> tuple[RunResult, int]:
     """Run one agent invocation with full attempt/metrics bookkeeping.
+
+    `cwd` is the directory this invocation's tools resolve relative paths
+    against, handed straight to the seam (`ModelRunner.run`) and recorded in the
+    `{kind}_prompt` event beside `tools`. It goes there for the same reason
+    `tools` does: it is an **enforcement surface**, the one that decides where a
+    `Write` lands, and a second one is not derivable from the first. An earlier
+    version of this docstring argued it was derivable from the task id and the
+    workspace root and left it unlogged — true only while every role's cwd is
+    `workspace_for(root, id)`, which slice 9's P3 ends by handing the planner
+    `repo_root`. Which role got which directory is then a fact no other row
+    carries, and it would be invisible in `agentloop events`, the REST API and
+    the SSE feed. It is a bounded string, so it adds no telemetry risk to the
+    one `json.dumps` at `log_event` time. Every caller passes it by keyword and
+    it defaults to `None`, so a role with no workspace to name (the summarizer,
+    and the planner until P3) records `None` and is otherwise unchanged.
 
     `charter_version` is which version of the project charter the caller put in
     `prompt`. It is a column on the attempt rather than an event: one scalar per
@@ -252,9 +268,14 @@ def _invoke(
         store.log_event(
             task.id,
             f"{kind}_prompt",
-            {"role": role, "prompt": prompt, "tools": list(tools or [])},
+            {
+                "role": role,
+                "prompt": prompt,
+                "tools": list(tools or []),
+                "cwd": cwd,
+            },
         )
-    result = runner.run(system, prompt, model, tools)
+    result = runner.run(system, prompt, model, tools, cwd)
     # The completion is now paid for, and every statement between here and the end
     # of the closing transaction runs over that payment: a raise discards the
     # tokens and cost the provider billed and `_with_retry` buys the same
@@ -899,6 +920,10 @@ def run_worker(
         retrieval,
         charter_version,
         config,
+        # The workspace is now the agent's actual working directory, not only
+        # a path named in the prompt above. The `## Workspace` block stays: it
+        # tells the worker *what* the directory is for, which a cwd cannot.
+        cwd=workspace,
     )
     return result
 
@@ -972,8 +997,18 @@ def run_planner(
     plan_task: Task,
     memory: MemoryService | None = None,
     config: LoopConfig | None = None,
+    cwd: str | None = None,
 ) -> RunResult:
     """Decompose a goal into a task graph (roadmap slice 3).
+
+    `cwd` is a seam left open for slice 9's P3, and it is `None` from every
+    caller today. A plan row has no task workspace — there is no `task-<id>`
+    directory for a goal that has not been decomposed yet - so in scratch mode
+    there is nothing honest to point the planner at, and pointing it at the
+    orchestrator's directory is the bug the rest of this change removes. In
+    worktree mode P3 will pass `repo_root`, which is the *operator's* repo
+    read-only: the planner declares `file_read`, not `file_io`, so surveying a
+    codebase it may not modify is exactly what the role is for.
 
     Recorded as its own attempt (kind='planner') against the plan row, so the
     decomposition is auditable and its cost is attributed like any other agent
@@ -1011,6 +1046,7 @@ def run_planner(
         retrieval,
         charter_version,
         config,
+        cwd=cwd,
     )
     return result
 
@@ -1146,7 +1182,23 @@ def run_validator(
     memory: MemoryService | None = None,
     test_result: TestResult | None = None,
     config: LoopConfig | None = None,
+    cwd: str | None = None,
 ) -> tuple[Verdict, int]:
+    """Review the worker's output and return a parsed verdict.
+
+    `cwd` is used for **one** thing: it becomes the validator's working
+    directory at the seam. It is named for what it does, and named *differently*
+    from `run_worker`'s `workspace`, which does two things — the same value also
+    goes into that prompt's `## Workspace` block. Here an absent value must
+    leave this prompt byte-for-byte what it was, and the validator is told what
+    to review by the `## Worker output` section, not by a path, so an added
+    `if cwd:` prompt line below must read as obviously wrong.
+
+    The validator declares `file_io`, so before this it read and wrote in the
+    orchestrator's own directory while nominally reviewing work that lives in
+    the workspace. The same bug as the worker's and quieter, since a validator
+    that finds nothing where it looked still returns a verdict.
+    """
     spec = registry.get(task.validator_role)
     prompt = (
         f"# Task under review: {task.title}\n\n"
@@ -1177,6 +1229,7 @@ def run_validator(
         retrieval,
         charter_version,
         config,
+        cwd=cwd,
     )
     return parse_verdict(result.output), attempt_id
 

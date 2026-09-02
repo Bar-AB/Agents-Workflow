@@ -752,7 +752,7 @@ class ParallelWritingRunner:
         self.active = 0
         self.max_active = 0
 
-    def run(self, system_prompt, prompt, model, tools=None):
+    def run(self, system_prompt, prompt, model, tools=None, cwd=None):
         if prompt.startswith("# Task under review"):
             return RunResult(output=APPROVE, tokens_in=10, tokens_out=5, model="mock")
         ws = Path(prompt.split("Write your files and tests under `")[1].split("`")[0])
