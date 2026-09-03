@@ -1787,6 +1787,138 @@ def remove_worktree(
         return VcsResult(ok=False, stderr=_clip(str(exc)), reason="git-failed")
 
 
+def _parse_worktree_list_porcelain(output: str) -> list[dict[str, object]]:
+    """`git worktree list --porcelain` into one dict per entry (`path`,
+    `branch` when the worktree is on one, `detached`/`bare` flags). Entries
+    are blank-line separated; total over malformed input (an unrecognised
+    line is ignored, never raised on)."""
+    entries: list[dict[str, object]] = []
+    current: dict[str, object] = {}
+    for line in output.splitlines():
+        if not line.strip():
+            if current:
+                entries.append(current)
+                current = {}
+            continue
+        if line.startswith("worktree "):
+            current["path"] = line[len("worktree ") :].strip()
+        elif line.startswith("branch "):
+            current["branch"] = line[len("branch ") :].strip()
+        elif line == "detached":
+            current["detached"] = True
+        elif line == "bare":
+            current["bare"] = True
+    if current:
+        entries.append(current)
+    return entries
+
+
+def prune_worktrees(
+    repo_root: str | Path,
+    config: LoopConfig,
+    branch_prefix: str = DEFAULT_BRANCH_PREFIX,
+) -> VcsResult:
+    """Clear the admin entries `git worktree list` still reports for an
+    **agentloop** worktree whose directory is already gone (P3, `agentloop
+    workspace prune`'s repo-wide half).
+
+    `remove_worktree` correctly *refuses* this case rather than repairing it
+    (see `test_remove_worktree_against_a_stale_admin_entry`): with `<ws>`
+    already deleted the guard cannot establish anything about the workspace, so
+    it answers `no-workspace` and leaves the stale entry standing. That is the
+    right shape for a guarded, per-workspace call, but it means the stale entry
+    survives every ordinary path and the operator-facing repair is this
+    command.
+
+    **P3 remediation cycle 3, HIGH 2.** A bare `git worktree prune` is
+    repo-wide by git's own design — it has no branch/owner scoping, so it
+    clears the admin entry for *any* worktree whose directory is currently
+    unreachable, whether agentloop created it or not. Measured: an operator's
+    own, manually-created worktree (`operator/manual-feature`, not
+    `agentloop/task-N`) with its directory removed lost its admin entry to a
+    bare `worktree prune` exactly as agentloop's own stale entry did — the
+    operator's branch survives, but the worktree registration does not, so a
+    directory that reappears later (a remounted drive, a restored backup) is
+    orphaned: its `.git` gitlink points at a deleted admin directory and every
+    git command inside it fails until manually repaired.
+
+    `git worktree prune` itself takes no scoping flag, so the fix is one layer
+    up: enumerate `git worktree list --porcelain` first, keep only the entries
+    whose branch is `refs/heads/<branch_prefix>...` (agentloop's own, never
+    the main worktree — which has no branch matching that prefix) and whose
+    directory no longer exists, and remove **only those** admin entries via a
+    targeted `git worktree remove --force <path>` rather than the catch-all.
+    An entry that does not match the prefix is left untouched, whether or not
+    its directory is reachable — this function never decides that an
+    operator's own work is stale.
+
+    No `ws` to guard for the *enumeration* — `worktree list --porcelain` only
+    reads the admin directory, it does not check anything out or invoke any
+    file-triggered git config, so it takes no pin, unlike the targeted
+    `worktree remove` below (which spawns inside `<repo_root>`, the same
+    execution-axis surface every side-effecting call in this module defends).
+    Kept pin-free anyway, in the same register as `is_repo`: a non-mutating
+    observation needs no pin, only a mutation does; here that mutation is the
+    per-entry `worktree remove`, which is only ever pointed at a *literal
+    admin path git itself just reported*, never at anything a worker could
+    have written. `config.vcs_enabled=False` still refuses, matching every
+    other entry point here. Total (DD-6): any exception during enumeration or
+    a single entry's removal is folded into the returned reason rather than
+    raised, and one entry's failure does not stop the rest."""
+    try:
+        if not config.vcs_enabled:
+            return VcsResult(ok=False, reason="disabled")
+        root = Path(repo_root)
+        try:
+            if not (root / ".git").is_dir():
+                return VcsResult(ok=False, reason="no-workspace")
+        except Exception:
+            return VcsResult(ok=False, reason="no-workspace")
+        listed = _run(
+            root,
+            _git(config, "worktree", "list", "--porcelain", workspace=root),
+            config,
+        )
+        if listed.reason or listed.code != 0:
+            return _failed(listed)
+        prefix_ref = f"refs/heads/{branch_prefix}"
+        any_failed = False
+        last_failed: _Run | None = None
+        for entry in _parse_worktree_list_porcelain(listed.out):
+            branch = entry.get("branch")
+            path = entry.get("path")
+            if not isinstance(branch, str) or not branch.startswith(prefix_ref):
+                continue  # not agentloop's own — never touched, reachable or not
+            if not isinstance(path, str) or not path:
+                continue
+            try:
+                stale = not Path(path).exists()
+            except Exception:
+                stale = False
+            if not stale:
+                continue
+            removed = _run(
+                root,
+                _git(
+                    config,
+                    "worktree",
+                    "remove",
+                    "--force",
+                    os.path.abspath(path),
+                    workspace=root,
+                ),
+                config,
+            )
+            if removed.reason or removed.code != 0:
+                any_failed = True
+                last_failed = removed
+        if any_failed and last_failed is not None:
+            return _failed(last_failed)
+        return VcsResult(ok=True)
+    except Exception as exc:  # totality (DD-6)
+        return VcsResult(ok=False, stderr=_clip(str(exc)), reason="git-failed")
+
+
 def working_tree_state(
     workspace: str | Path,
     config: LoopConfig,

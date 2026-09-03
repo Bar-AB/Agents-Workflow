@@ -1816,6 +1816,43 @@ class Store:
         ).fetchall()
         return rows[0]["fingerprint"] if rows else ""
 
+    def rebless_vcs_repo_pin(
+        self, repo_root: str, fingerprint: str, note: str = ""
+    ) -> str:
+        """The human-only re-bless surface `_init_worktree`'s docstring names
+        as deliberately absent from P2: once a repository has a recorded
+        baseline, a legitimate operator edit to `<repo_root>/.git/config`
+        makes every later `init_repo` refuse forever with `config-changed`,
+        because nothing else re-blesses it. This is that surface, and it is
+        never automatic — `agentloop workspace rebless` is the only caller,
+        an explicit human action, never something `vcs.py` or `loop.py` may
+        invoke on their own (that would launder exactly the edit the pin
+        exists to catch, the same reasoning `init_repo` uses for "mint only on
+        the branch that creates the repository").
+
+        Unlike `set_vcs_repo_pin` (the machine path `init_repo` mints
+        through, silent because a mint is not a degradation), a re-bless is a
+        human decision about a repository's trust boundary and is audited
+        like one: `vcs_repo_pin_reblessed` carries the old and new
+        **fingerprints** (never the `.git/config` bytes — a hash is not a
+        secret and the config may name one) and the operator's note.
+        `task_id=None`: this is a fact about a repository, not about any one
+        task. Returns the fingerprint that is now in force."""
+        old = self.vcs_repo_pin(repo_root)
+        with self.transaction():
+            self.set_vcs_repo_pin(repo_root, fingerprint)
+            self.log_event(
+                None,
+                "vcs_repo_pin_reblessed",
+                {
+                    "repo_key": self._repo_key(repo_root),
+                    "old_fingerprint": old,
+                    "new_fingerprint": fingerprint,
+                    "note": note,
+                },
+            )
+        return fingerprint
+
     # -- agent tool requests (roadmap slice 5) --------------------------------
 
     # Which event kind records a fresh row, by the status it was created with. A

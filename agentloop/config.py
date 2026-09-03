@@ -19,10 +19,34 @@ All values are tunable globally here or via loopconfig.json.
 from __future__ import annotations
 
 import json
+import os
 import re
 import warnings
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
+
+
+def _is_within(child: str, parent: str) -> bool:
+    """Whether `child` resolves inside `parent`, following symlinks/junctions.
+
+    Realpath, not `os.path.abspath` — this is a pure containment *comparison*
+    with no subprocess to spawn, so it is unlike `vcs._git`'s `-C` value (which
+    stays lexical precisely so a junction cannot substitute the directory git
+    is asked to run in). Here there is nothing to substitute; a junction is
+    exactly the case a lexical compare would miss, and it is the shape of
+    escape `vcs._same_path`/`vcs._is_within` were built to close (see their
+    docstrings) — `worktree_root` outside `repo_root` is the same class of
+    security boundary residual 2 depends on, so it gets the same comparison
+    method. `normcase` after `realpath` matches Windows' case-insensitive,
+    separator-normalised filesystem; it is identity on POSIX. Any error (a
+    mixed-drive path, an unresolvable UNC share) refuses by returning True —
+    fail closed, since this guards a config refusal, not a git spawn."""
+    try:
+        c = Path(os.path.normcase(os.path.realpath(os.path.expanduser(str(child)))))
+        p = Path(os.path.normcase(os.path.realpath(os.path.expanduser(str(parent)))))
+        return c.is_relative_to(p)
+    except Exception:
+        return True
 
 
 def _coerced(name: str, declared: str, value: object) -> object:
@@ -138,6 +162,34 @@ class LoopConfig:
     vcs_enabled: bool = True
     vcs_command: str = "git"
     vcs_timeout_s: int = 30
+
+    # Existing-repository workspaces (roadmap slice 9). 'scratch' (the default)
+    # is a **proven** behavioral no-op, in the same register as slice 6's
+    # `vcs_enabled=False`: `worktree_root`/`repo_root`/`vcs_base_ref`/
+    # `vcs_branch_prefix` go unread and `workspace_root` behaves exactly as it
+    # did before this slice. 'worktree' gives each task a real `git worktree`
+    # checkout of `repo_root` on its own branch instead of a blank directory —
+    # see `vcs.init_repo`'s worktree branch and `executor.workspace_for`.
+    workspace_mode: str = "scratch"
+    # The repository a worktree-mode task checks out. Unread in scratch mode.
+    repo_root: str = "."
+    # Where worktree-mode workspaces are created — deliberately **outside**
+    # `repo_root` (enforced below, not merely defaulted). A workspace inside
+    # the repository turns `executor.py`'s already-documented `..`-escape into
+    # a write on the operator's real working tree, bypassing every recovery
+    # path (review, `vcs.rollback`, the audit log) this slice exists to add —
+    # see the plan's residual 2. Layout: `<worktree_root>/<repo-name>-<hash>/
+    # task-<id>`, the hash over the *absolute* `repo_root` so two checkouts of
+    # one repository, or two repositories sharing a basename, cannot collide
+    # in one shared root.
+    worktree_root: str = "~/.agentloop/ws"
+    # What each task's worktree branches from. `HEAD`, not `main`: a ticket
+    # usually branches from where the operator is standing.
+    vcs_base_ref: str = "HEAD"
+    # Branch naming is derived from this prefix plus the task id, never stored
+    # — avoids a schema migration for a value `f"{prefix}{task_id}"` already
+    # reconstructs.
+    vcs_branch_prefix: str = "agentloop/task-"
 
     # Memory (spec §7): a project fact read this often is promoted to the
     # cross-project loop tier.
@@ -255,6 +307,34 @@ class LoopConfig:
         """
         for f in fields(self):
             setattr(self, f.name, _coerced(f.name, f.type, getattr(self, f.name)))
+        # An unknown mode raises rather than degrading to 'scratch' (the
+        # `memory_retrieval_backend` precedent): which mode ran is part of how
+        # the run behaved, and silently substituting one is exactly the kind
+        # of drift the audit log exists to prevent.
+        if self.workspace_mode not in ("scratch", "worktree"):
+            raise ValueError(
+                f"workspace_mode must be 'scratch' or 'worktree', not "
+                f"{self.workspace_mode!r}."
+            )
+        # Scoped to worktree mode: in scratch mode `worktree_root`/`repo_root`
+        # are unread (the proven-no-op contract above), so refusing on their
+        # values there would make an irrelevant knob able to break a scratch
+        # config. Checked at load time, before it reaches a paid attempt — the
+        # same reasoning as the bare-string allowlist check `_coerced`
+        # documents.
+        if self.workspace_mode == "worktree" and _is_within(
+            self.worktree_root, self.repo_root
+        ):
+            raise ValueError(
+                f"worktree_root ({self.worktree_root!r}) resolves inside "
+                f"repo_root ({self.repo_root!r}). Worktree-mode workspaces "
+                f"must live outside the repository they check out — inside, "
+                f"the executor's documented `..`-escape (see executor.py) "
+                f"lands writes in the operator's real working tree instead "
+                f"of an agentloop-owned directory, bypassing review, "
+                f"vcs.rollback and the audit log. Point worktree_root "
+                f"somewhere else, e.g. '~/.agentloop/ws'."
+            )
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2)

@@ -857,6 +857,35 @@ def _gated_tools(
     return tools_for(store, config, spec, task_id, agent_kind)
 
 
+def _workspace_block(workspace: str, config: LoopConfig | None) -> str:
+    """The `## Workspace` block. Scratch mode's wording (the `config is None`
+    or `config.workspace_mode != 'worktree'` case) is kept **byte-for-byte**
+    what it was before slice 9's P3 — the same "cleared vs never-set must be
+    indistinguishable" discipline `_charter_block`/`_memory_block` already use
+    in this file, applied to a new axis: an absent or scratch-mode config must
+    leave this prompt exactly what it was.
+
+    Worktree mode tells the worker something scratch mode's wording would be
+    actively wrong about: the directory is a real checkout of the operator's
+    repository, not blank space to create files in. "Write your files ... "
+    reads as an invitation to scaffold a project from nothing; the worktree
+    wording says to read first, match what is already there, and not
+    restructure it wholesale."""
+    if config is not None and config.workspace_mode == "worktree":
+        return (
+            f"\n## Workspace\n`{workspace}` is a checkout of the project's "
+            f"existing repository, on its own branch. Read the code that is "
+            f"already there before writing: follow its existing conventions "
+            f"(style, structure, test layout) and make the smallest change "
+            f"that satisfies the task — do not restructure or rewrite what "
+            f"already works. Tests run there automatically after you finish.\n"
+        )
+    return (
+        f"\n## Workspace\nWrite your files and tests under `{workspace}`. "
+        f"They are executed there automatically after you finish.\n"
+    )
+
+
 def run_worker(
     store: Store,
     runner: ModelRunner,
@@ -883,10 +912,7 @@ def run_worker(
     prompt += memory_block
     prompt += _upstream_block(store, task)
     if workspace:
-        prompt += (
-            f"\n## Workspace\nWrite your files and tests under `{workspace}`. "
-            f"They are executed there automatically after you finish.\n"
-        )
+        prompt += _workspace_block(workspace, config)
     if handoff_summary is not None:
         # Context-budget handoff (slice 1): the prior worker's context grew past
         # its budget, so a fresh instance continues from a compacted summary in
@@ -1001,14 +1027,15 @@ def run_planner(
 ) -> RunResult:
     """Decompose a goal into a task graph (roadmap slice 3).
 
-    `cwd` is a seam left open for slice 9's P3, and it is `None` from every
-    caller today. A plan row has no task workspace — there is no `task-<id>`
+    `cwd` is a seam left open for slice 9, and it is `None` from every caller
+    today. A plan row has no task workspace — there is no `task-<id>`
     directory for a goal that has not been decomposed yet - so in scratch mode
     there is nothing honest to point the planner at, and pointing it at the
     orchestrator's directory is the bug the rest of this change removes. In
-    worktree mode P3 will pass `repo_root`, which is the *operator's* repo
-    read-only: the planner declares `file_read`, not `file_io`, so surveying a
-    codebase it may not modify is exactly what the role is for.
+    worktree mode P4 will pass `repo_root` here (loop integration; P3 only
+    wires `config`/`executor`/the worker prompt), which is the *operator's*
+    repo read-only: the planner declares `file_read`, not `file_io`, so
+    surveying a codebase it may not modify is exactly what the role is for.
 
     Recorded as its own attempt (kind='planner') against the plan row, so the
     decomposition is auditable and its cost is attributed like any other agent
