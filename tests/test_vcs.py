@@ -466,7 +466,11 @@ def test_without_the_discarded_ref_the_round_leaves_git_log_all(
     write(repo, "out.txt", "worker output")
     round_sha = vcs.commit(repo, "round 1", config, pin=_pin(repo)).sha
     monkeypatch.setattr(
-        vcs, "_write_discarded_ref", lambda ws, head, cfg: vcs._Run(0, "", "", "")
+        vcs,
+        "_write_discarded_ref",
+        # Slice 9 gave this a fourth argument (the per-task ref prefix); the
+        # control is unchanged - step 4 still does nothing.
+        lambda ws, head, cfg, prefix=vcs.DISCARDED_REF_PREFIX: vcs._Run(0, "", "", ""),
     )
 
     assert vcs.rollback(repo, vcs.BASE_REF, config, pin=_pin(repo)).ok is True
@@ -506,7 +510,7 @@ def test_a_second_rollback_writes_no_second_discarded_ref(repo, config):
 
     # Idempotence, which the sha naming buys and a counter did not: writing the
     # ref twice for one tip leaves one ref, not a duplicate of its content.
-    vcs._write_discarded_ref(repo, sha2, config)
+    vcs._write_discarded_ref(repo, sha2, config, vcs.DISCARDED_REF_PREFIX)
     assert len(discarded_refs(repo)) == 2
 
 

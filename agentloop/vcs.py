@@ -5,6 +5,41 @@ Every task workspace is its own throwaway git repository, so `redo` and
 shared timeline and no remote: one repo per `.agentloop/ws/task-{id}/`, created
 by the loop, never seen by a human unless they go looking.
 
+**Slice 9 adds a second legal repository shape, and it is a second shape rather
+than a widened first one.** In *worktree* mode — selected per call by passing
+`repo_root=`, never by a module-level flag — the workspace is a `git worktree`
+of the operator's own repository on branch `agentloop/task-<id>`, so the task
+starts from their code instead of an empty directory. Four things differ, and
+each was measured before it was written rather than assumed:
+
+- **`_guard` gets its own branch** (`_guard_worktree`). A worktree's `.git` is
+  a regular *file*, its `--absolute-git-dir` is
+  `<repo_root>/.git/worktrees/<name>` and its `--git-common-dir` is
+  `<repo_root>/.git`, so **every** scratch condition fails on the shape. The
+  discipline is unchanged — four conditions, all by identity after resolution,
+  all fail-closed, any error refuses — but the anchor moves from `<ws>` (inside
+  the agent-writable workspace) to `repo_root` (operator config), which is
+  strictly the stronger anchor.
+- **The pin fingerprints the *common* config.** Measured: `git config --local`
+  run from inside a worktree writes `<repo_root>/.git/config`, which is where
+  `filter.<name>.clean` and `core.fsmonitor` — programs git runs on an ordinary
+  `add` — would land. `<ws>/.git` is a file and has no config to fingerprint.
+  The escalation this implies is real and is named in the plan's residuals: a
+  worker can write the operator's actual `.git/config`. The pin *detects* that
+  before the next side-effecting call and refuses; detection is not prevention.
+- **Refs are per task** (`base_ref`/`approved_ref`/`discarded_ref_prefix`).
+  Worktrees share one ref namespace, so the fixed names that cannot collide
+  when every task owns a repository collide on *every* task here.
+- **Base is the starting commit and the round commit does not force ignored
+  files in.** Both are recovery-contract changes, named on the result
+  (`ignored_unrecoverable`) rather than argued away.
+
+`init_repo`'s worktree parameters (`repo_root`, `task_id`, `start_ref`,
+`branch_prefix`) are **arguments, not config**: P3 of slice 9 is what reads
+`workspace_mode`/`repo_root`/`vcs_base_ref`/`vcs_branch_prefix` out of
+`LoopConfig` and passes them down, so the mode decision lives in one place.
+A call that passes no `repo_root` is the pre-slice-9 module exactly.
+
 Threat model — and the reason this is not in `executor.py`. `executor.py` runs
 **arbitrary AI-generated code**; this module runs its own fixed commands, but
 it runs them *inside a directory that code writes to*, so both axes are in
@@ -135,6 +170,41 @@ APPROVED_REF = "refs/agentloop/approved"
 # this ref exists to keep, reported as ok=True.
 DISCARDED_REF_PREFIX = "refs/agentloop/discarded"
 
+# Worktree mode's branch names. `<prefix><task id>`, derived and never stored,
+# so there is no schema migration and no second source of truth for it.
+DEFAULT_BRANCH_PREFIX = "agentloop/task-"
+
+
+def _task_ns(task_id: int | None) -> str:
+    return f"refs/agentloop/task-{task_id}"
+
+
+def base_ref(task_id: int | None = None) -> str:
+    """The ref a rollback returns to. Per task in worktree mode; the shared
+    constant in scratch mode, where every task owns its own repository and the
+    fixed name cannot collide.
+
+    Measured (slice 9, probe 1): worktrees share **one** ref namespace, and a
+    `update-ref refs/agentloop/base` written inside one is immediately visible
+    from the main repo and from every sibling worktree. With the fixed name,
+    task 2's `init_repo` would overwrite task 1's base and task 1's rollback
+    would reset onto task 2's starting commit."""
+    return BASE_REF if task_id is None else f"{_task_ns(task_id)}/base"
+
+
+def approved_ref(task_id: int | None = None) -> str:
+    """The bookmark a human's approval leaves behind. Per task in worktree
+    mode, for the reason `base_ref` documents."""
+    return APPROVED_REF if task_id is None else f"{_task_ns(task_id)}/approved"
+
+
+def discarded_ref_prefix(task_id: int | None = None) -> str:
+    """Where a rollback saves the tip it is about to discard. Still named for
+    the sha rather than a counter — the namespacing changes *whose* history it
+    is, not how the ref is named."""
+    return DISCARDED_REF_PREFIX if task_id is None else f"{_task_ns(task_id)}/discarded"
+
+
 # Bounded before it can reach an event payload: telemetry must never fail an
 # attempt, and `log_event` has one `json.dumps` for every payload in the system.
 _MAX_STDERR_CHARS = 500
@@ -193,7 +263,14 @@ class VcsResult:
     is drawn from a closed vocabulary and is `""` exactly when nothing
     degraded: `"disabled"`, `"git-missing"`, `"no-workspace"`, `"git-failed"`,
     `"timeout"`, `"not-a-workspace-repo"`, `"config-unpinned"`,
-    `"config-changed"`, `"already"`, `"residue"`, `"unrecorded"`."""
+    `"config-changed"`, `"already"`, `"residue"`, `"unrecorded"`,
+    `"no-task-id"`.
+
+    `"no-task-id"` is slice 9's one addition, and it is deliberate rather than
+    convenient: worktree mode namespaces every ref by task (probe 1), so a
+    worktree call with no task id has no ref to write. Falling back to the
+    shared scratch constants would produce exactly the cross-task collision the
+    namespacing exists to prevent, silently, so it refuses instead."""
 
     ok: bool
     sha: str = ""
@@ -212,6 +289,28 @@ class VcsResult:
     # contents are *not* in the discarded ref: this names the gap so no caller
     # has to claim a recovery surface that does not hold them.
     nested_repos: tuple[str, ...] = ()
+    # Worktree mode only: ignored paths present before a rollback's reset. The
+    # round commit there stages with `add -A` and **not** `-f` (forcing them in
+    # would put `node_modules`/`.venv` — 441 MB on this repository — into the
+    # operator's task branch every round), so `clean -ffdqx` deletes these and
+    # no ref carries them. Same register as `nested_repos`: the gap is named
+    # per-rollback rather than left for the audit log to overclaim.
+    ignored_unrecoverable: tuple[str, ...] = ()
+    # `working_tree_state` only: porcelain **entries** for the workspace —
+    # `"<XY> <path>"`, the two-character status code and the path together,
+    # bounded because they reach an event payload. The code is carried and not
+    # dropped because a caller diffing two snapshots is asking "what did this
+    # step write", and a path-only diff cannot see an *overwrite* of a path
+    # that was already dirty (`?? x` -> ` M x`, ` M x` -> `MM x`): same name,
+    # real write, invisible.
+    changed_entries: tuple[str, ...] = ()
+    # Which of the bounded lists above hit their cap on this call, by field
+    # name. **Silence must never mean "nothing appeared".** Every list here is
+    # capped so telemetry cannot flood an event payload, and a cap that does
+    # not announce itself turns a detection into a quiet blind spot — over a
+    # real checkout more than `_MAX_REPORTED_PATHS` changed paths is ordinary,
+    # not exotic.
+    truncated: tuple[str, ...] = ()
 
 
 class _Run(NamedTuple):
@@ -343,8 +442,198 @@ def _resolved(ws: Path, value: str) -> Path:
     return path if path.is_absolute() else ws / path
 
 
-def _guard(workspace: str | Path, config: LoopConfig) -> bool:
+def _rev_parse_locations(ws: Path, config: LoopConfig) -> tuple[str, str, str] | None:
+    """`(toplevel, absolute-git-dir, git-common-dir)` as git resolved them from
+    inside `ws`, or None if anything about the question failed. One spawn, and
+    the only source of truth either branch of `_guard` consults about where git
+    actually is — every filesystem path test is a *guess* at what git will make
+    of the path, which is the mistake slice 6 made twice."""
+    run = _run(
+        ws,
+        _git(
+            config,
+            "rev-parse",
+            "--show-toplevel",
+            "--absolute-git-dir",
+            "--git-common-dir",
+        ),
+        config,
+    )
+    if run.reason or run.code != 0:
+        return None
+    lines = run.out.splitlines()
+    if len(lines) != 3:
+        return None
+    return lines[0].strip(), lines[1].strip(), lines[2].strip()
+
+
+# `<admin>/gitdir` is a single line holding an absolute path. Bounding the read
+# is the same discipline as `_MAX_CONFIG_BYTES`: it caps the work on the hot
+# path and fails closed, and the regularity check is what makes the bound total
+# (a FIFO reports `st_size == 0`, so the size test alone would pass one and then
+# block forever with no timeout).
+_MAX_GITDIR_BYTES = 1 << 12
+
+
+def _read_gitdir_backpointer(admin: Path) -> Path | None:
+    """The path `<admin>/gitdir` names, or None if it cannot be read.
+
+    This is the file **git writes** when it creates a worktree, and it is the
+    only thing in this shape that ties an admin directory back to one specific
+    workspace. It lives inside `<repo_root>/.git`, which is operator-side: a
+    worker can rewrite `<ws>/.git` (an ordinary file in its own workspace) but
+    not this. Total -- any error is None, and None never compares equal to
+    anything under `_same_path`, so a guard that cannot read it says no."""
+    try:
+        path = admin / "gitdir"
+        st = path.stat()
+        if not stat.S_ISREG(st.st_mode) or st.st_size > _MAX_GITDIR_BYTES:
+            return None
+        text = path.read_text(encoding="utf-8", errors="replace").strip()
+        return Path(text) if text else None
+    except Exception:
+        return None
+
+
+def _guard_worktree(
+    ws: Path,
+    repo_root: Path,
+    config: LoopConfig,
+    task_id: int | None,
+    branch_prefix: str,
+) -> bool:
+    """The second legal repository shape (slice 9): `ws` is a git **worktree**
+    of the operator's repository rather than a throwaway repo of its own.
+
+    Every condition the scratch branch checks fails on this shape, measured
+    (probe 4): `<ws>/.git` is a regular **file** of ~174 bytes holding a
+    `gitdir:` pointer, `--absolute-git-dir` is
+    `<repo_root>/.git/worktrees/<name>` and `--git-common-dir` is
+    `<repo_root>/.git`. So the branch is separate rather than a widening of the
+    old conditions — a condition loosened to admit both shapes would admit
+    things that are neither.
+
+    What does *not* change is the discipline. Four conditions, all fail-closed,
+    any error refuses, and the two that matter are anchored by **identity**
+    against a location the agent cannot write: `repo_root` is operator config,
+    where scratch mode's anchor (`<ws>`) sits inside the agent-writable
+    workspace. Concretely:
+
+    - `<ws>/.git` is a regular file. A directory here is the scratch shape and
+      must take the scratch branch.
+    - git's toplevel for that cwd **is** `<ws>` — the workspace is the worktree
+      it claims to be, not a subdirectory of somebody else's checkout.
+    - the resolved `--absolute-git-dir` is a directory
+      `<repo_root>/.git/worktrees/<name>`. The leaf is git's to choose (it
+      dedups names), so *this* condition is asserted on the parent: the admin
+      directory belongs to this repository. A gitfile pointing at another
+      repository, or at an ordinary directory, fails here.
+    - **and the admin directory points back at this workspace.** The condition
+      above is containment, not identity, and containment in a shared parent is
+      the escape slice 6 measured twice: `<repo_root>/.git/worktrees` is the
+      parent of *every* task's admin directory exactly as `workspace_root` is
+      the parent of every task workspace. Measured, with nothing fabricated,
+      because **a sibling worktree already exists**: task 2's worker rewrites
+      only `<ws2>/.git` to name task 1's admin directory, the guard returned
+      True, and task 2's round commit moved `agentloop/task-1` and destroyed
+      task 1's work, after which its rollback reset task 1's branch onto task
+      2's base. So the identity is anchored on the back-pointer **git itself
+      writes**: `<admin>/gitdir` holds the path of `<ws>/.git`, it lives inside
+      `<repo_root>/.git` where no agent has a write path, and requiring it to
+      *be* `<ws>/.git` closes the sibling case, any future entry under
+      `worktrees/`, and reuse of a stale admin directory in one condition. The
+      parent check stays: it is what rules out a gitfile aimed at
+      `<repo_root>/.git` itself.
+    - the resolved `--git-common-dir` **is** `<repo_root>/.git`. This is the
+      condition a `commondir` write moves, and it is the reason the guard asks
+      git rather than reading `.git`: git resolves its ref and object store
+      through that file, so the location it *reports* is the only thing that
+      describes where a `commit` or a `reset --hard` will actually land.
+
+    - **and HEAD is this task's own branch.** Every condition above establishes
+      *where git's object and ref stores are*. In scratch mode that was the
+      same fact as "which history is at risk", because the store *was* the
+      throwaway repo; here the ref store is legitimately the operator's, so
+      the location conditions say nothing about the ref a `commit` moves or a
+      `reset --hard` rewrites. Measured with **only** the shipped worker
+      spec's declared `git` tool, from inside its own workspace: `git switch
+      main` and `git checkout main` are refused by git's own worktree lock,
+      and `git symbolic-ref HEAD refs/heads/main` is not -- one plumbing call,
+      rc=0, after which the guard passed, `commit` and `rollback` both
+      returned `ok=True, reason=""`, and the operator's `main` was moved to
+      the task's work while `_vcs_degraded` never fired and the audit log
+      recorded a clean rollback. So HEAD must be a *symbolic* ref (a detached
+      HEAD names no branch and refuses) and it must be
+      `refs/heads/<branch_prefix><task_id>`. This is what makes `task_id` part
+      of containment in this mode rather than a routing argument: "which task
+      owns this workspace" is now a thing the guard has to know, so a worktree
+      call without one refuses (`no-task-id`).
+
+    Note what is deliberately **not** here: no containment in
+    `config.workspace_root`. In this mode the workspace lives outside the
+    repository (and, in P3, outside `workspace_root`'s scratch meaning), and
+    containment in a shared parent was itself an escape in slice 6 — it admits
+    every sibling task. Identity against `repo_root` is strictly stronger."""
+    if task_id is None:
+        return False
+    gitfile = ws / ".git"
+    if gitfile.is_dir() or not gitfile.is_file():
+        return False
+    common = repo_root / ".git"
+    if not common.is_dir():
+        # A `repo_root` that is not an ordinary repository root cannot anchor
+        # anything. Refuse rather than guess at a bare or nested layout.
+        return False
+    located = _rev_parse_locations(ws, config)
+    if located is None:
+        return False
+    toplevel, git_dir, common_dir = located
+    if not _same_path(toplevel, ws):
+        return False
+    resolved_git_dir = _resolved(ws, git_dir)
+    try:
+        if not resolved_git_dir.is_dir():
+            return False
+    except Exception:
+        return False
+    if not _same_path(resolved_git_dir.parent, common / "worktrees"):
+        return False
+    back = _read_gitdir_backpointer(resolved_git_dir)
+    # Explicitly, not by relying on `_same_path("None", ...)` failing: an
+    # unreadable back-pointer is a guard that cannot answer, and a guard that
+    # cannot answer says no.
+    if back is None or not _same_path(back, gitfile):
+        return False
+    if not _same_path(_resolved(ws, common_dir), common):
+        return False
+    # A second spawn rather than a fourth output on `_rev_parse_locations`:
+    # that call is shared with the scratch branch, which runs it against an
+    # unborn HEAD immediately after `git init`, where asking about HEAD fails
+    # and would take the whole guard down with it.
+    head = _run(
+        ws, _git(config, "symbolic-ref", "--quiet", "HEAD", workspace=ws), config
+    )
+    if head.reason or head.code != 0:
+        return False
+    return head.out.strip() == f"refs/heads/{branch_prefix}{task_id}"
+
+
+def _guard(
+    workspace: str | Path,
+    config: LoopConfig,
+    repo_root: str | Path | None = None,
+    task_id: int | None = None,
+    branch_prefix: str = DEFAULT_BRANCH_PREFIX,
+) -> bool:
     """DD-16: four conditions, all fail-closed.
+
+    `repo_root` selects the repository shape: `None` (the default, and every
+    pre-slice-9 caller) is the scratch shape documented below — the workspace
+    is its own throwaway repository. A `repo_root` selects `_guard_worktree`,
+    where the workspace is a git worktree of that repository. The scratch
+    branch below is untouched by slice 9, and that is a requirement rather than
+    an accident: all five escapes measured against it stay closed exactly as
+    they were.
 
     The first two prove "this workspace is its own repo root" and say nothing
     about *which* root — a junction at `workspace_root/task-N` pointing at
@@ -383,30 +672,19 @@ def _guard(workspace: str | Path, config: LoopConfig) -> bool:
     destructive command aimed at another task's history)."""
     try:
         ws = Path(workspace)
+        if repo_root is not None:
+            return _guard_worktree(ws, Path(repo_root), config, task_id, branch_prefix)
         if not (ws / ".git").is_dir():
             return False
         if not _is_within(ws, config.workspace_root):
             return False
         if not _is_within(ws / ".git", config.workspace_root):
             return False
-        run = _run(
-            ws,
-            _git(
-                config,
-                "rev-parse",
-                "--show-toplevel",
-                "--absolute-git-dir",
-                "--git-common-dir",
-            ),
-            config,
-        )
-        if run.reason or run.code != 0:
+        located = _rev_parse_locations(ws, config)
+        if located is None:
             return False
-        lines = run.out.splitlines()
-        if len(lines) != 3:
-            return False
-        toplevel, git_dir, common_dir = lines
-        if not _same_path(toplevel.strip(), ws):
+        toplevel, git_dir, common_dir = located
+        if not _same_path(toplevel, ws):
             return False
         # Identity with `<ws>/.git`, not containment in `workspace_root`.
         # Containment pins a *region*; only identity pins the *location*, and
@@ -438,9 +716,18 @@ def _guard(workspace: str | Path, config: LoopConfig) -> bool:
 _MAX_CONFIG_BYTES = 1 << 16
 
 
-def config_pin(workspace: str | Path) -> str:
-    """Fingerprint `<workspace>/.git/config`, or `""` when there is nothing
-    readable to fingerprint.
+def config_pin(workspace: str | Path, repo_root: str | Path | None = None) -> str:
+    """Fingerprint the git config this workspace's commands will run under, or
+    `""` when there is nothing readable to fingerprint.
+
+    **Which config that is depends on the repository shape**, and getting it
+    wrong would leave the execution axis wide open. Scratch mode fingerprints
+    `<workspace>/.git/config`. Worktree mode fingerprints
+    `<repo_root>/.git/config`: `<ws>/.git` is a *file* there and has no config
+    under it at all, and measured (slice 9, probe 2) `git config --local` run
+    from inside a worktree writes the **main** repository's config — which is
+    where `filter.<name>.clean` and `core.fsmonitor`, the programs git executes
+    on an ordinary `add`/`commit`, would land.
 
     Pure, total and cheap: one bounded file read and a hash, no subprocess, so
     it can sit in front of every side-effecting command on the per-round path.
@@ -461,7 +748,8 @@ def config_pin(workspace: str | Path) -> str:
     the kind that is easy to get subtly wrong on a path this hot, and the
     remaining exposure is a self-inflicted hang, not an escape."""
     try:
-        path = Path(workspace) / ".git" / "config"
+        anchor = Path(workspace) if repo_root is None else Path(repo_root)
+        path = anchor / ".git" / "config"
         st = path.stat()
         if not stat.S_ISREG(st.st_mode):
             return ""
@@ -472,7 +760,9 @@ def config_pin(workspace: str | Path) -> str:
         return ""
 
 
-def _pin_refusal(workspace: str | Path, pin: str) -> str:
+def _pin_refusal(
+    workspace: str | Path, pin: str, repo_root: str | Path | None = None
+) -> str:
     """`""` if this workspace's git config is still the one that was pinned.
 
     Three ways to fail closed, and no way to pass by accident: no pin recorded
@@ -482,13 +772,20 @@ def _pin_refusal(workspace: str | Path, pin: str) -> str:
     matching `""` against `""`."""
     if not pin:
         return "config-unpinned"
-    actual = config_pin(workspace)
+    actual = config_pin(workspace, repo_root)
     if not actual or actual != pin:
         return "config-changed"
     return ""
 
 
-def _refusal(workspace: str | Path, config: LoopConfig, pin: str) -> str:
+def _refusal(
+    workspace: str | Path,
+    config: LoopConfig,
+    pin: str,
+    repo_root: str | Path | None = None,
+    task_id: int | None = None,
+    branch_prefix: str = DEFAULT_BRANCH_PREFIX,
+) -> str:
     """`""` if this workspace may be acted on, else the reason it may not.
 
     Distinct terms in a vocabulary documented as closed and exhaustive.
@@ -507,38 +804,118 @@ def _refusal(workspace: str | Path, config: LoopConfig, pin: str) -> str:
         ws = Path(workspace)
         if not ws.is_dir():
             return "no-workspace"
-        if not (ws / ".git").is_dir():
+        # The shape decides what `<ws>/.git` must be: a directory in scratch
+        # mode, a gitfile in worktree mode (probe 4). Neither branch accepts
+        # the other's shape — a worktree reaching the scratch checks would be
+        # measured against a `.git` that is not the config git parses.
+        if repo_root is None:
+            if not (ws / ".git").is_dir():
+                return "not-a-workspace-repo"
+        elif task_id is None:
+            # Containment in worktree mode includes *which task owns this
+            # workspace* (the HEAD condition), so an absent id is not a
+            # defaultable argument -- it is a question the guard cannot
+            # answer, and a guard that cannot answer says no.
+            return "no-task-id"
+        elif not (ws / ".git").is_file():
             return "not-a-workspace-repo"
     except Exception:
         return "no-workspace"
-    refusal = _pin_refusal(ws, pin)
+    refusal = _pin_refusal(ws, pin, repo_root)
     if refusal:
         return refusal
-    return "" if _guard(ws, config) else "not-a-workspace-repo"
+    if _guard(ws, config, repo_root, task_id, branch_prefix):
+        return ""
+    return "not-a-workspace-repo"
 
 
-def _nested_repos(ws: Path) -> tuple[str, ...]:
+def _nested_repos(ws: Path, repo_root: Path | None = None) -> tuple[str, ...]:
     """Workspace-relative directories that hold a repository of their own.
 
     A commit records these as bare gitlinks, so the discarded ref does not
     carry their contents and the rollback removes them unrecoverably. Named,
     not fixed: git cannot nest repositories this way. Total — an unreadable
-    subtree reports nothing rather than raising."""
+    subtree reports nothing rather than raising.
+
+    **The operator's own submodules are excluded** (M-e). A submodule checkout
+    has a `.git` *file* whose `gitdir:` resolves to a `modules/` directory
+    inside `<repo_root>/.git`, so without this every rollback on a repository
+    holding submodules named tracked gitlinks the operator's own history
+    carries as unrecoverable. That is the mirror of the overclaim this field
+    exists to prevent: an audit log calling recoverable work destroyed is wrong
+    in the direction that stops a human going to look for it.
+
+    Measured, and the obvious form of the check is wrong: inside a **worktree**
+    git puts a submodule's gitdir at
+    `<repo_root>/.git/worktrees/<name>/modules/<sub>`, not at
+    `<repo_root>/.git/modules/<sub>`, so anchoring on the latter excluded
+    nothing on the one shape this whole slice is about.
+
+    **Bounded** at `_MAX_REPORTED_PATHS`, like `_porcelain` (M-f): this list
+    reaches an event payload and its sibling was capped for exactly that
+    reason. `rollback` reports the cap on `VcsResult.truncated`, because a cap
+    that does not announce itself is a blind spot rather than a bound."""
     try:
-        found = sorted(
-            str(p.parent.relative_to(ws)).replace(os.sep, "/")
-            for p in ws.rglob(".git")
-            if p.parent != ws
-        )
+        common = None
+        if repo_root is not None:
+            try:
+                common = repo_root / ".git"
+            except Exception:
+                common = None
+        found = []
+        for p in sorted(ws.rglob(".git")):
+            if p.parent == ws:
+                continue
+            if common is not None and _is_submodule_gitdir(p, common):
+                continue
+            found.append(str(p.parent.relative_to(ws)).replace(os.sep, "/"))
         # A nested repo's own `.git` subtree can contain further `.git` paths;
         # only the outermost is a distinct repository the caller can act on.
-        return tuple(
+        outermost = [
             name
             for name in found
             if not any(name.startswith(f"{other}/") for other in found if other != name)
-        )
+        ]
+        return tuple(outermost[:_MAX_REPORTED_PATHS])
     except Exception:
         return ()
+
+
+def _is_submodule_gitdir(gitpath: Path, common: Path) -> bool:
+    """Whether `<dir>/.git` is a **gitfile** naming a submodule's git directory
+    inside `common` (`<repo_root>/.git`) — that is, one this repository's own
+    history records and a rollback therefore does not destroy.
+
+    Two conditions, and the second is not decoration: the target must lie
+    inside `<repo_root>/.git` *and* pass through a `modules` component. Git
+    puts submodule gitdirs at `<common>/modules/<sub>` from the main checkout
+    and at `<common>/worktrees/<name>/modules/<sub>` from a worktree (measured),
+    so neither a fixed prefix nor bare containment says the right thing —
+    containment alone would also exclude a `.git` aimed at, say, another
+    worktree's admin directory, and that is not a submodule.
+
+    Total; any error is False, which reports the directory *as* a nested repo,
+    and over-reporting a gap is the safe direction for a field whose whole job
+    is naming what is not recoverable."""
+    try:
+        if not gitpath.is_file():
+            return False
+        st = gitpath.stat()
+        if not stat.S_ISREG(st.st_mode) or st.st_size > _MAX_GITDIR_BYTES:
+            return False
+        text = gitpath.read_text(encoding="utf-8", errors="replace").strip()
+        if not text.startswith("gitdir:"):
+            return False
+        target = Path(text.split(":", 1)[1].strip())
+        if not target.is_absolute():
+            target = gitpath.parent / target
+        if not _is_within(target, common):
+            return False
+        resolved = Path(os.path.normcase(os.path.realpath(str(target))))
+        root = Path(os.path.normcase(os.path.realpath(str(common))))
+        return "modules" in resolved.relative_to(root).parts
+    except Exception:
+        return False
 
 
 def _count_files(ws: Path) -> int:
@@ -564,7 +941,12 @@ def _head(workspace: Path, config: LoopConfig) -> _Run:
     )
 
 
-def _write_discarded_ref(workspace: Path, head: str, config: LoopConfig) -> _Run:
+def _write_discarded_ref(
+    workspace: Path,
+    head: str,
+    config: LoopConfig,
+    prefix: str,
+) -> _Run:
     """Save the tip under a ref named for its own sha, before anything moves.
 
     `reset --hard` moves the branch off the round commits, and with only the
@@ -578,7 +960,7 @@ def _write_discarded_ref(workspace: Path, head: str, config: LoopConfig) -> _Run
         _git(
             config,
             "update-ref",
-            f"{DISCARDED_REF_PREFIX}/{head}",
+            f"{prefix}/{head}",
             head,
             workspace=workspace,
         ),
@@ -586,32 +968,99 @@ def _write_discarded_ref(workspace: Path, head: str, config: LoopConfig) -> _Run
     )
 
 
-def _is_dirty(workspace: Path, config: LoopConfig) -> bool:
-    """Whether the working tree holds anything `clean -ffdqx` would delete.
+def _status(workspace: Path, config: LoopConfig, *, ignored: bool = False) -> _Run:
+    args = ["status", "--porcelain", "--untracked-files=all"]
+    if ignored:
+        args.append("--ignored")
+    return _run(workspace, _git(config, *args, workspace=workspace), config)
 
-    `--ignored` and `-uall` because the clean removes ignored and untracked
-    files too, and the whole point of asking is that everything it deletes is
-    reachable from a ref afterwards. A status that cannot be taken reports
-    **dirty**: the capture that follows is non-destructive, and its own failure
-    aborts the rollback before anything is removed."""
-    run = _run(
-        workspace,
-        _git(
-            config,
-            "status",
-            "--porcelain",
-            "--untracked-files=all",
-            "--ignored",
-            workspace=workspace,
-        ),
-        config,
-    )
+
+def _is_dirty(workspace: Path, config: LoopConfig, *, ignored: bool = True) -> bool:
+    """Whether the working tree holds anything the capture below should carry.
+
+    `--ignored` and `-uall` in scratch mode because the clean removes ignored
+    and untracked files too, and the whole point of asking is that everything
+    it deletes is reachable from a ref afterwards. A status that cannot be
+    taken reports **dirty**: the capture that follows is non-destructive, and
+    its own failure aborts the rollback before anything is removed.
+
+    The two worktree-mode call sites pass **different** values, and the
+    docstring used to claim `ignored=False` unconditionally (M-d). What
+    actually holds:
+
+    - `rollback`'s **capture** decision passes `ignored=not worktree`, i.e.
+      `False` in worktree mode. The capture there stages with `add -A` and
+      cannot carry ignored files at all, so counting them as dirty would commit
+      an empty capture and report a recovery that did not happen. What it does
+      instead is *name* them (`ignored_unrecoverable`).
+    - `rollback`'s post-reset **residue** check passes `ignored=True`. That one
+      is asking a different question — "did `clean -ffdqx` actually remove
+      everything?" — and the clean removes ignored files, so excluding them
+      would report a workspace as clean while the thing the clean was supposed
+      to delete is still sitting in it.
+
+    Same helper, two questions; the argument is what distinguishes them, which
+    is why it is per-call and not derived from the mode."""
+    run = _status(workspace, config, ignored=ignored)
     if run.reason or run.code != 0:
         return True
     return bool(run.out.strip())
 
 
-def is_repo(workspace: str | Path, config: LoopConfig) -> bool:
+# Bounded: this list reaches an event payload, and telemetry must never fail an
+# attempt or flood one.
+_MAX_REPORTED_PATHS = 50
+
+
+def _porcelain(out: str, marker: str = "", *, with_code: bool = False):
+    """Entries out of `status --porcelain`, optionally only those whose status
+    code is `marker` (`"!!"` = ignored). Total: an unparseable line is skipped,
+    never raised on. Renames (`a -> b`) report the destination.
+
+    Returns `(entries, truncated)`. `with_code` keeps the two-character status
+    code on the front of each entry, which is what lets a caller diffing two
+    snapshots see an *overwrite* of an already-dirty path rather than only a
+    newly-named one."""
+    entries: list[str] = []
+    truncated = False
+    for line in out.splitlines():
+        if len(line) < 4:
+            continue
+        code, path = line[:2], line[3:].strip()
+        if marker and code != marker:
+            continue
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1]
+        path = path.strip(chr(34))
+        entries.append(f"{code} {path}" if with_code else path)
+        if len(entries) >= _MAX_REPORTED_PATHS:
+            # The list is capped *and says so*: a silent cap made the caller's
+            # diff blind past the 50th entry with no signal at all.
+            truncated = True
+            break
+    return tuple(entries), truncated
+
+
+def _ignored_paths(workspace: Path, config: LoopConfig) -> tuple[str, ...]:
+    """Ignored paths a worktree rollback is about to delete unrecoverably.
+
+    Reported rather than prevented: `clean -ffdqx` still removes them, because
+    weakening the clean would leave a "fresh start" that is not one. Total — a
+    status that cannot be taken names nothing rather than raising."""
+    run = _status(workspace, config, ignored=True)
+    if run.reason or run.code != 0:
+        return ()
+    return _porcelain(run.out, "!!")[0]
+
+
+def is_repo(
+    workspace: str | Path,
+    config: LoopConfig,
+    *,
+    repo_root: str | Path | None = None,
+    task_id: int | None = None,
+    branch_prefix: str = DEFAULT_BRANCH_PREFIX,
+) -> bool:
     """Whether this workspace is a repository agentloop may act on. Total: it
     returns a `bool` for every input and never raises.
 
@@ -622,13 +1071,177 @@ def is_repo(workspace: str | Path, config: LoopConfig) -> bool:
     try:
         if not config.vcs_enabled:
             return False
-        return _guard(workspace, config)
+        return _guard(workspace, config, repo_root, task_id, branch_prefix)
     except Exception:
         return False
 
 
-def init_repo(workspace: str | Path, config: LoopConfig, pin: str = "") -> VcsResult:
+def _init_worktree(
+    ws: Path,
+    config: LoopConfig,
+    pin: str,
+    repo_root: Path,
+    task_id: int,
+    start_ref: str,
+    branch_prefix: str,
+) -> VcsResult:
+    """Worktree mode's half of `init_repo`: `git worktree add <ws> -b
+    <prefix><id> <start_ref>`, then this task's own base ref at the commit the
+    checkout started from.
+
+    **Base is the starting commit, never an empty one**, and that is the single
+    most dangerous difference from scratch mode. There, base is deliberately
+    empty because a rollback must not resurrect whatever happened to be in a
+    throwaway directory. Here the same choice would make `reset --hard base`
+    delete the operator's entire checkout on the task branch — a real branch of
+    a real repository — so `rollback` returning to `start_ref` is the *whole*
+    recovery contract rather than a detail of it.
+
+    **The pin is a repository-level baseline here, not a per-task mint**, and
+    the distinction is the whole of remediation C3. `init_repo`'s mint rule --
+    "minted only on the branch that creates the workspace, never on one found
+    already there" -- is stated per *workspace*, and in scratch mode workspace
+    and config were 1:1, so per-task minting satisfied it. In worktree mode
+    every task shares one `<repo_root>/.git/config` (probe 2), which is
+    pre-existing and agent-writable: so "never re-pinned" was true of the
+    worktree and false of the config, which is the thing the pin is about.
+
+    Measured before the fix, with a control proving the execution channel is
+    live: task 1 poisons `filter.pwn.clean` and is correctly refused on its
+    next round; task 2 -- a different task, an ordinary `init_repo`, no attack
+    of its own -- minted a fresh pin over the poison and executed it on its
+    first round commit. Arbitrary command execution outside every workspace,
+    under `allow_test_exec=False`, reported as `ok=True, reason=""`. The same
+    laundering ran within one task through `human_redo`, so the one recovery
+    action an operator takes on a `config-changed` refusal was the action that
+    armed it.
+
+    So a caller that has a recorded baseline (`pin`) gets it **verified**, and
+    only a caller with none mints one. That makes the residual narrow and
+    stateable: the *first* task on a repository blesses the operator's
+    pre-existing config, and every task after it is measured against that. A
+    human re-blessing a legitimately changed baseline needs a CLI surface,
+    which is a P3/P4 item and deliberately not here.
+
+    **Verified before `git worktree add` spawns, not after.** That command runs
+    a checkout, and a checkout runs smudge filters -- so a refusal after the
+    spawn would be no refusal at all: the first git command of worktree mode
+    would be unconditionally unpinned."""
+    try:
+        preexisting = (ws / ".git").exists()
+    except Exception:
+        preexisting = False
+
+    if preexisting:
+        # Verified before *any* git command runs here, including the
+        # `rev-parse` below — the point of the pin is that nothing spawns
+        # under a config this module did not watch being written.
+        refusal = _refusal(ws, config, pin, repo_root, task_id, branch_prefix)
+        if refusal:
+            return VcsResult(ok=False, reason=refusal)
+        ref = base_ref(task_id)
+        found = _run(
+            ws,
+            _git(config, "rev-parse", "--verify", "--quiet", ref, workspace=ws),
+            config,
+        )
+        if not found.reason and found.code == 0:
+            return VcsResult(ok=True, sha=found.out.strip(), reason="already")
+        # A worktree that exists without its base ref falls through and
+        # *completes* its initialisation, exactly as the scratch branch does —
+        # otherwise `reason="already"` reports success while every later
+        # rollback fails, permanently and for that task only.
+        head = _head(ws, config)
+        if head.reason or head.code != 0:
+            return _failed(head)
+        sha = head.out.strip()
+        written = _run(ws, _git(config, "update-ref", ref, sha, workspace=ws), config)
+        if written.reason or written.code != 0:
+            return _failed(written)
+        return VcsResult(ok=True, sha=sha)
+
+    try:
+        if not (repo_root / ".git").is_dir():
+            # Nothing to make a worktree of. `no-workspace` rather than
+            # `git-failed` for the same reason `_run` separates them: it names
+            # the missing directory instead of blaming a git that is installed.
+            return VcsResult(ok=False, reason="no-workspace")
+    except Exception:
+        return VcsResult(ok=False, reason="no-workspace")
+
+    # `git worktree add` creates the directory itself and refuses a non-empty
+    # existing one, which is the fail-closed answer to a workspace holding
+    # something already.
+    # C3: nothing spawns before the baseline is settled. A caller replaying a
+    # recorded baseline is verified against the config as it is *now*; a caller
+    # with none is the first task on this repository and mints it.
+    if pin:
+        refusal = _pin_refusal(ws, pin, repo_root)
+        if refusal:
+            return VcsResult(ok=False, reason=refusal)
+        minted = pin
+    else:
+        minted = config_pin(ws, repo_root)
+        if not minted:
+            # Nothing readable to fingerprint: refuse rather than proceed
+            # unpinned, the same answer a mismatch gets.
+            return VcsResult(ok=False, reason="git-failed")
+
+    added = _run(
+        repo_root,
+        _git(
+            config,
+            "worktree",
+            "add",
+            os.path.abspath(str(ws)),
+            # `-b`, never `-B`: a branch that already exists means a previous
+            # incarnation of this task, and force-resetting it would discard
+            # commits no human asked to discard. It fails loudly instead.
+            "-b",
+            f"{branch_prefix}{task_id}",
+            start_ref,
+            workspace=repo_root,
+        ),
+        config,
+    )
+    if added.reason or added.code != 0:
+        return _failed(added)
+
+    if not _guard(ws, config, repo_root, task_id, branch_prefix):
+        return VcsResult(ok=False, reason="not-a-workspace-repo", pin=minted)
+
+    head = _head(ws, config)
+    if head.reason or head.code != 0:
+        return _failed(head, pin=minted)
+    sha = head.out.strip()
+    written = _run(
+        ws, _git(config, "update-ref", base_ref(task_id), sha, workspace=ws), config
+    )
+    if written.reason or written.code != 0:
+        return _failed(written, pin=minted)
+    return VcsResult(ok=True, sha=sha, pin=minted)
+
+
+def init_repo(
+    workspace: str | Path,
+    config: LoopConfig,
+    pin: str = "",
+    *,
+    repo_root: str | Path | None = None,
+    task_id: int | None = None,
+    start_ref: str = "HEAD",
+    branch_prefix: str = DEFAULT_BRANCH_PREFIX,
+) -> VcsResult:
     """Create the workspace repo and its empty base commit at `BASE_REF`.
+
+    Slice 9: passing `repo_root` selects the **worktree** shape instead — the
+    workspace becomes a checkout of that repository on its own branch, and base
+    is the commit it started from (see `_init_worktree`). `repo_root`,
+    `task_id`, `start_ref` and `branch_prefix` are **arguments and not config
+    knobs** on purpose: P3 of this slice is what reads `workspace_mode`,
+    `repo_root`, `vcs_base_ref` and `vcs_branch_prefix` out of `LoopConfig` and
+    passes them here. Inventing the knob in this module would put the mode
+    decision in two places.
 
     `git init` runs before the guard because the guard cannot pass before it,
     and because on a workspace with no `.git` at all it only creates
@@ -658,6 +1271,18 @@ def init_repo(workspace: str | Path, config: LoopConfig, pin: str = "") -> VcsRe
         if not config.vcs_enabled:
             return VcsResult(ok=False, reason="disabled")
         ws = Path(workspace)
+        if repo_root is not None:
+            if task_id is None:
+                return VcsResult(ok=False, reason="no-task-id")
+            return _init_worktree(
+                ws,
+                config,
+                pin,
+                Path(repo_root),
+                task_id,
+                start_ref,
+                branch_prefix,
+            )
         minted = ""
         try:
             preexisting = (ws / ".git").is_dir()
@@ -753,20 +1378,42 @@ def init_repo(workspace: str | Path, config: LoopConfig, pin: str = "") -> VcsRe
 
 
 def commit(
-    workspace: str | Path, message: str, config: LoopConfig, pin: str = ""
+    workspace: str | Path,
+    message: str,
+    config: LoopConfig,
+    pin: str = "",
+    *,
+    repo_root: str | Path | None = None,
+    task_id: int | None = None,
+    branch_prefix: str = DEFAULT_BRANCH_PREFIX,
 ) -> VcsResult:
     """Commit the whole workspace. `--allow-empty`, so a round that changed
     nothing still produces a sha.
 
+    Slice 9: in worktree mode (`repo_root` given) the stage is `add -A` with
+    **no `-f`**. See the comment at the `add` below — this is a real change to
+    the recovery contract, not a tidy-up, and `rollback` names the cost on
+    every result rather than letting the audit log overclaim.
+
     `pin` is the fingerprint `init_repo` minted for this workspace, replayed
     from wherever the caller recorded it. There is no default that works: an
     empty one refuses, because a commit under a config nobody vetted is how a
-    worker gets `filter.<name>.clean` executed."""
+    worker gets `filter.<name>.clean` executed.
+
+    Slice 9 remediation C1: `task_id` and `branch_prefix` are **containment
+    arguments** in worktree mode, not routing. The guard requires HEAD to be
+    `refs/heads/<branch_prefix><task_id>`, because nothing else in the shape
+    constrains which ref this command moves -- measured, a worker's single
+    `git symbolic-ref HEAD refs/heads/main` moved the operator's branch through
+    an `ok=True, reason=""` commit and rollback. An absent id refuses
+    (`no-task-id`)."""
     try:
         if not config.vcs_enabled:
             return VcsResult(ok=False, reason="disabled")
         ws = Path(workspace)
-        refusal = _refusal(ws, config, pin)
+        if repo_root is not None and task_id is None:
+            return VcsResult(ok=False, reason="no-task-id")
+        refusal = _refusal(ws, config, pin, repo_root, task_id, branch_prefix)
         if refusal:
             return VcsResult(ok=False, reason=refusal)
 
@@ -776,7 +1423,25 @@ def commit(
         # the files that were destroyed. Measured: `build/artifact.bin` and
         # `secrets.env` deleted, neither recoverable. Capture everything the
         # rollback can delete; do not weaken the clean.
-        run = _run(ws, _git(config, "add", "-A", "-f", workspace=ws), config)
+        #
+        # **Worktree mode drops the `-f`, and pays for it in the result.** The
+        # branch is the operator's, so forcing ignored files in would commit
+        # `node_modules` and `.venv` — 441 MB on this repository — every round,
+        # forever, into history a human is meant to merge. What that costs is
+        # exactly the property `-f` buys above: ignored files are **not**
+        # recoverable after a worktree rollback. `rollback` puts them on
+        # `VcsResult.ignored_unrecoverable` per call.
+        #
+        # **That is not yet parity with `nested_repos`, and saying it was is
+        # the kind of overclaim this field exists to prevent** (M-g).
+        # `nested_repos` reaches an audit event, the REST API and the dashboard
+        # through `loop._vcs_rollback_to_base`'s payload;
+        # `ignored_unrecoverable` reaches none of them, so today it is a field
+        # a caller *may* read and nothing does. Wiring it needs a `loop.py`
+        # call-site change, which is P3's scope and not P2's, so the honest
+        # state is recorded here rather than repaired by a sentence.
+        stage = ("add", "-A") if repo_root is not None else ("add", "-A", "-f")
+        run = _run(ws, _git(config, *stage, workspace=ws), config)
         if run.reason or run.code != 0:
             return _failed(run)
 
@@ -811,16 +1476,28 @@ def commit(
 
 
 def mark_approved(
-    workspace: str | Path, config: LoopConfig, pin: str = ""
+    workspace: str | Path,
+    config: LoopConfig,
+    pin: str = "",
+    *,
+    repo_root: str | Path | None = None,
+    task_id: int | None = None,
+    branch_prefix: str = DEFAULT_BRANCH_PREFIX,
 ) -> VcsResult:
-    """Point `APPROVED_REF` at the current tip. Additive and non-destructive:
-    it moves a ref and nothing else — but it still runs git in the workspace,
-    so it is pinned like everything else."""
+    """Point this task's approved ref at the current tip. Additive and
+    non-destructive: it moves a ref and nothing else — but it still runs git in
+    the workspace, so it is pinned like everything else.
+
+    The ref is `APPROVED_REF` in scratch mode and `approved_ref(task_id)` in
+    worktree mode, where every task writes into one shared namespace and a
+    fixed name would have task 2's approval overwrite task 1's bookmark."""
     try:
         if not config.vcs_enabled:
             return VcsResult(ok=False, reason="disabled")
         ws = Path(workspace)
-        refusal = _refusal(ws, config, pin)
+        if repo_root is not None and task_id is None:
+            return VcsResult(ok=False, reason="no-task-id")
+        refusal = _refusal(ws, config, pin, repo_root, task_id, branch_prefix)
         if refusal:
             return VcsResult(ok=False, reason=refusal)
 
@@ -829,9 +1506,8 @@ def mark_approved(
             return _failed(head)
         sha = head.out.strip()
 
-        run = _run(
-            ws, _git(config, "update-ref", APPROVED_REF, sha, workspace=ws), config
-        )
+        ref = approved_ref(task_id) if repo_root is not None else APPROVED_REF
+        run = _run(ws, _git(config, "update-ref", ref, sha, workspace=ws), config)
         if run.reason or run.code != 0:
             return _failed(run)
         return VcsResult(ok=True, sha=sha)
@@ -840,9 +1516,23 @@ def mark_approved(
 
 
 def rollback(
-    workspace: str | Path, ref: str, config: LoopConfig, pin: str = ""
+    workspace: str | Path,
+    ref: str,
+    config: LoopConfig,
+    pin: str = "",
+    *,
+    repo_root: str | Path | None = None,
+    task_id: int | None = None,
+    branch_prefix: str = DEFAULT_BRANCH_PREFIX,
 ) -> VcsResult:
     """Return the workspace to `ref`, keeping what it discards.
+
+    In worktree mode the caller passes `base_ref(task_id)` as `ref` and the
+    discarded tip is saved under this task's own namespace. Two differences
+    from scratch mode, both named on the result rather than argued away: the
+    target is the **starting commit** (an empty base would delete the
+    operator's checkout on the task branch), and ignored files are not carried
+    by the capture, so they are named in `ignored_unrecoverable`.
 
     The order is the point: the discarded tip is recorded *before* anything
     moves, and a rollback that cannot record what it is about to discard does
@@ -853,11 +1543,19 @@ def rollback(
         if not config.vcs_enabled:
             return VcsResult(ok=False, reason="disabled")
         ws = Path(workspace)
-        refusal = _refusal(ws, config, pin)
+        worktree = repo_root is not None
+        if worktree and task_id is None:
+            return VcsResult(ok=False, reason="no-task-id")
+        refusal = _refusal(ws, config, pin, repo_root, task_id, branch_prefix)
         if refusal:
             return VcsResult(ok=False, reason=refusal)
 
         before = _count_files(ws)
+
+        # Worktree mode: what the clean is about to delete unrecoverably,
+        # measured before anything moves. Empty in scratch mode, where `add -A
+        # -f` carries ignored files into the discarded ref.
+        ignored = _ignored_paths(ws, config) if worktree else ()
 
         head = _head(ws, config)
         if head.reason or head.code != 0:
@@ -870,7 +1568,17 @@ def rollback(
         # Named before anything moves, and reported whatever happens next: a
         # nested repository is recorded as a bare gitlink, so the discarded ref
         # does not carry its objects and `clean -ffdqx` removes them for good.
-        nested = _nested_repos(ws)
+        nested = _nested_repos(ws, Path(repo_root) if worktree else None)
+        # Both bounded lists are diffed or rendered by a caller, so a cap that
+        # does not announce itself would read as "there were none".
+        capped = tuple(
+            name
+            for name, values in (
+                ("nested_repos", nested),
+                ("ignored_unrecoverable", ignored),
+            )
+            if len(values) >= _MAX_REPORTED_PATHS
+        )
 
         # The capture is **unconditional**, and that is the whole invariant:
         # everything the clean deletes is reachable from a ref. Gated on
@@ -881,7 +1589,7 @@ def rollback(
         # `clean -ffdqx` delete the working tree: measured `files_removed=1`
         # with `sha=""` and `reason=""`, a destruction the audit called a clean
         # rollback. `add -A -f` makes it likelier still, not less.
-        if _is_dirty(ws, config):
+        if _is_dirty(ws, config, ignored=not worktree):
             # Nested repositories are excluded by pathspec, because git
             # refuses to index one that has no commit checked out ("unable to
             # index file 'sub/'") and one failed path element would otherwise
@@ -891,11 +1599,18 @@ def rollback(
             exclusions = (
                 ["--", ".", *[f":(exclude){name}" for name in nested]] if nested else []
             )
-            run = _run(
-                ws, _git(config, "add", "-A", "-f", *exclusions, workspace=ws), config
-            )
+            # `-f` in scratch mode only, for the reason `commit` documents:
+            # forcing ignored files into the operator's task branch is worse
+            # than losing them, and losing them is *named* rather than hidden.
+            stage = ("add", "-A") if worktree else ("add", "-A", "-f")
+            run = _run(ws, _git(config, *stage, *exclusions, workspace=ws), config)
             if run.reason or run.code != 0:
-                return _failed(run, nested_repos=nested)
+                return _failed(
+                    run,
+                    nested_repos=nested,
+                    ignored_unrecoverable=ignored,
+                    truncated=capped,
+                )
             run = _run(
                 ws,
                 _git(
@@ -910,15 +1625,30 @@ def rollback(
                 config,
             )
             if run.reason or run.code != 0:
-                return _failed(run, nested_repos=nested)
+                return _failed(
+                    run,
+                    nested_repos=nested,
+                    ignored_unrecoverable=ignored,
+                    truncated=capped,
+                )
             head = _head(ws, config)
             if head.reason or head.code != 0:
-                return _failed(head, nested_repos=nested)
+                return _failed(
+                    head,
+                    nested_repos=nested,
+                    ignored_unrecoverable=ignored,
+                    truncated=capped,
+                )
             head_sha = head.out.strip()
 
         preserved = ""
         if head_sha != target_sha:
-            written = _write_discarded_ref(ws, head_sha, config)
+            written = _write_discarded_ref(
+                ws,
+                head_sha,
+                config,
+                discarded_ref_prefix(task_id) if worktree else DISCARDED_REF_PREFIX,
+            )
             if written.reason or written.code != 0:
                 # Losing the history is the failure this step exists to
                 # prevent, so nothing destructive runs.
@@ -932,7 +1662,13 @@ def rollback(
 
         run = _run(ws, _git(config, "reset", "--hard", ref, workspace=ws), config)
         if run.reason or run.code != 0:
-            return _failed(run, sha=preserved, nested_repos=nested)
+            return _failed(
+                run,
+                sha=preserved,
+                nested_repos=nested,
+                ignored_unrecoverable=ignored,
+                truncated=capped,
+            )
 
         # The second `-f` removes untracked *nested* repositories: a worker
         # that ran `git init` in its own workspace would otherwise leave files
@@ -940,7 +1676,13 @@ def rollback(
         # touches this repo's own `.git`, which is not working-tree content.
         run = _run(ws, _git(config, "clean", "-ffdqx", workspace=ws), config)
         if run.reason or run.code != 0:
-            return _failed(run, sha=preserved, nested_repos=nested)
+            return _failed(
+                run,
+                sha=preserved,
+                nested_repos=nested,
+                ignored_unrecoverable=ignored,
+                truncated=capped,
+            )
 
         after = _count_files(ws)
         removed = max(0, before - after)
@@ -950,7 +1692,17 @@ def rollback(
         # resolved to the target and nothing was discarded.
         discarded = head_sha if head_sha != target_sha else ""
         reason = ""
-        if after:
+        if worktree:
+            # A worktree's target commit *has* a tree — the operator's tracked
+            # files, which surviving is the entire point (see the docstring's
+            # "starting commit, never an empty one"). So residue cannot be a
+            # file count here; it is whatever the clean failed to remove, asked
+            # of git. Counting files would report every healthy worktree
+            # rollback as a degradation, and `_vcs_degraded` turns a reason
+            # into a warning and an event on every round.
+            if _is_dirty(ws, config, ignored=True):
+                reason = "residue"
+        elif after:
             reason = "residue"
         if removed and not discarded:
             # A floor under the invariant above, and **not** a substitute for
@@ -965,6 +1717,113 @@ def rollback(
             files_removed=removed,
             reason=reason,
             nested_repos=nested,
+            ignored_unrecoverable=ignored,
+            truncated=capped,
+        )
+    except Exception as exc:  # totality (DD-6)
+        return VcsResult(ok=False, stderr=_clip(str(exc)), reason="git-failed")
+
+
+def remove_worktree(
+    workspace: str | Path,
+    config: LoopConfig,
+    pin: str = "",
+    *,
+    repo_root: str | Path,
+    task_id: int | None = None,
+    branch_prefix: str = DEFAULT_BRANCH_PREFIX,
+) -> VcsResult:
+    """Remove a worktree and prune the admin entry it leaves behind.
+
+    `git worktree remove` and **then** `git worktree prune`, never an `rmtree`:
+    deleting the directory alone leaves the entry under
+    `<repo_root>/.git/worktrees/<name>`, so `git worktree list` keeps reporting
+    a workspace that is gone and a later `worktree add` at the same path is
+    refused as already registered. This is why `executor.clear_workspace` may
+    not be reused for the worktree shape (P3 routes it here).
+
+    `--force`, because a workspace holds a worker's uncommitted output by
+    construction and `remove` refuses a dirty tree; the caller's contract
+    (`human_redo`) is precisely that the tree is discarded, and `rollback` is
+    what preserves it first when preserving is wanted.
+
+    Pinned like every other side-effecting entry point: it spawns git in the
+    operator's repository, so it must not run under a config this module did
+    not watch being written. Total, like its siblings.
+
+    The **branch outlives the worktree** — `agentloop/task-<id>` lives in the
+    operator's ref store — so a removed workspace is still mergeable. Nothing
+    here deletes a branch or a ref."""
+    try:
+        if not config.vcs_enabled:
+            return VcsResult(ok=False, reason="disabled")
+        ws = Path(workspace)
+        root = Path(repo_root)
+        if task_id is None:
+            return VcsResult(ok=False, reason="no-task-id")
+        refusal = _refusal(ws, config, pin, root, task_id, branch_prefix)
+        if refusal:
+            return VcsResult(ok=False, reason=refusal)
+
+        removed = _run(
+            root,
+            _git(
+                config,
+                "worktree",
+                "remove",
+                "--force",
+                os.path.abspath(str(ws)),
+                workspace=root,
+            ),
+            config,
+        )
+        if removed.reason or removed.code != 0:
+            return _failed(removed)
+        pruned = _run(root, _git(config, "worktree", "prune", workspace=root), config)
+        if pruned.reason or pruned.code != 0:
+            return _failed(pruned)
+        return VcsResult(ok=True)
+    except Exception as exc:  # totality (DD-6)
+        return VcsResult(ok=False, stderr=_clip(str(exc)), reason="git-failed")
+
+
+def working_tree_state(
+    workspace: str | Path,
+    config: LoopConfig,
+    pin: str = "",
+    *,
+    repo_root: str | Path | None = None,
+    task_id: int | None = None,
+    branch_prefix: str = DEFAULT_BRANCH_PREFIX,
+) -> VcsResult:
+    """What is currently uncommitted in the workspace, as porcelain entries.
+
+    Read-only — it runs `status` and nothing else — but pinned and guarded like
+    the rest, because it still spawns git inside a directory an agent writes
+    to. Ignored paths are excluded: they are noise in a real checkout
+    (`.venv`, `node_modules`, a build directory) and nothing here is a
+    recovery claim.
+
+    This exists for one caller: comparing the tree either side of a step, so
+    that a write nobody expected is **detected and recorded**. It detects; it
+    prevents nothing, and no caller may describe it as a barrier."""
+    try:
+        if not config.vcs_enabled:
+            return VcsResult(ok=False, reason="disabled")
+        ws = Path(workspace)
+        if repo_root is not None and task_id is None:
+            return VcsResult(ok=False, reason="no-task-id")
+        refusal = _refusal(ws, config, pin, repo_root, task_id, branch_prefix)
+        if refusal:
+            return VcsResult(ok=False, reason=refusal)
+        run = _status(ws, config)
+        if run.reason or run.code != 0:
+            return _failed(run)
+        entries, capped = _porcelain(run.out, with_code=True)
+        return VcsResult(
+            ok=True,
+            changed_entries=entries,
+            truncated=("changed_entries",) if capped else (),
         )
     except Exception as exc:  # totality (DD-6)
         return VcsResult(ok=False, stderr=_clip(str(exc)), reason="git-failed")

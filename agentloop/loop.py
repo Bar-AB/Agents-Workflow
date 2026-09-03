@@ -865,6 +865,98 @@ class Loop:
         elif result.reason != "disabled":
             self._vcs_degraded(task.id, "mark_approved", result)
 
+    def _vcs_detect_validator_writes(self, task_id: int, ws, pin: str, before) -> None:
+        """Record what the validator changed in the workspace after the round
+        was snapshotted (H3). **Detection, not prevention.**
+
+        The shipped validator declares `file_io` (Read + Write + Edit) and
+        slice 9 P1 pointed that write surface at the task workspace, while
+        `run_task`'s order is worker -> round commit -> tests -> validator. So
+        a validator write lands *after* the snapshot: the approved ref can be
+        moved to a tip whose tree lacks it, `clean -ffdqx` deletes it with no
+        discarded ref covering it, and a revision round starts from a tree
+        `task.output` does not describe.
+
+        Two things this deliberately does not do. It does not **prevent** the
+        write - narrowing a shipped agent's declared capability has tool-gate
+        blast radius and is a human's decision, not this call's. And it does
+        not **commit** the write, which would be worse: it would make a
+        validator's silent edits to the worker's output part of the approved
+        tree. Naming the gap honestly is the same posture as
+        `nested_repos` and `ignored_unrecoverable`.
+
+        Call, log, discard, like every other `vcs.*` site: nothing here is read
+        by a status transition, a threshold, a revision count or a budget
+        check. Test-run artefacts are excluded by construction - the `before`
+        snapshot is taken *after* the executor has run - so what is left is
+        attributable to the validator.
+
+        The name carries the `_vcs_` prefix because the AST guard's taint
+        walker is per-function and keyed on it: without the prefix `before`
+        arrives untainted and a future status write branching on it would not
+        be caught. One word, and it is the difference between an enforced
+        invariant and an argued one.
+
+        Two things it compares, and both were wrong before this remediation.
+        It diffs porcelain **entries** (`"<XY> <path>"`), not bare paths, so an
+        *overwrite* of a path the worker had already left dirty is visible
+        (` M x` -> `MM x` is a real write with an unchanged name). And it
+        records when either snapshot was **truncated** by the reporting cap, or
+        when the `after` snapshot could not be taken at all: over a real
+        checkout more than the cap's worth of changed paths is ordinary, and a
+        detection that silently stops looking is worse than none."""
+        if before is None or not before.ok:
+            return
+        after = vcs.working_tree_state(ws, self.config, pin=pin)
+        if not after.ok:
+            # A failed detection is still a fact about the detection, and it
+            # used to return in silence - so a reader of the audit log could
+            # not tell "the validator wrote nothing" from "nobody looked".
+            self.store.log_event(
+                task_id,
+                "validator_write_detection_failed",
+                {
+                    "reason": after.reason,
+                    "note": (
+                        "The workspace could not be re-read after the "
+                        "validator ran, so whether it wrote anything is "
+                        "unknown. This is not a claim that it did not."
+                    ),
+                },
+            )
+            return
+        appeared = [
+            entry
+            for entry in after.changed_entries
+            if entry not in before.changed_entries
+        ]
+        blind = tuple(
+            f"{when}.{field}"
+            for when, snapshot in (("before", before), ("after", after))
+            for field in snapshot.truncated
+        )
+        if not appeared and not blind:
+            return
+        self.store.log_event(
+            task_id,
+            "validator_wrote_workspace",
+            {
+                "entries": appeared,
+                "truncated": list(blind),
+                "prevented": False,
+                "note": (
+                    "The validator changed the workspace after this round was "
+                    "committed, so these entries are outside the round "
+                    "snapshot and outside the discarded ref a later rollback "
+                    "writes. This is a detection only: nothing stopped or "
+                    "undid the write, and the validator's declared file_io "
+                    "capability is unchanged. Where 'truncated' is non-empty "
+                    "the named snapshot hit its reporting cap, so this list is "
+                    "incomplete rather than exhaustive."
+                ),
+            },
+        )
+
     def _vcs_rollback_to_base(self, task_id: int) -> vcs.VcsResult:
         """Return a task's workspace to `refs/agentloop/base` (C5 and C6).
 
@@ -1233,6 +1325,16 @@ class Loop:
                 # changes — the verdict path is identical either way.
                 validator_runner = self._runner_for(task.validator_role)
                 self._require_workspace("validator", ws)
+                # H3: the tree as the executor left it, so anything that
+                # appears below is the validator's own doing. Taken here and
+                # not before the tests for exactly that reason - a pytest cache
+                # attributed to the validator would be noise, and noise is how
+                # a real detection gets ignored.
+                tree_before = (
+                    vcs.working_tree_state(ws, self.config, pin=vcs_pin)
+                    if vcs_ready
+                    else None
+                )
                 verdict, attempt_id = self._with_retry(
                     task,
                     "validator",
@@ -1273,6 +1375,7 @@ class Loop:
                 )
                 return self._require(task.id)
             self.store.add_verdict(task.id, attempt_id, verdict)
+            self._vcs_detect_validator_writes(task.id, ws, vcs_pin, tree_before)
 
             # Executed truth beats the validator's account of it. Record the
             # mismatch: a validator that rubber-stamps failing tests is a

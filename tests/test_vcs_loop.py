@@ -956,8 +956,19 @@ def test_no_status_write_is_downstream_of_a_vcs_result():
     # exactly what a broken import or a rename produces. A later phase that
     # legitimately changes the count changes this number in the same commit.
     names = vcs_call_names(tree)
-    assert len(names) == 4, f"expected 4 vcs.* call expressions, found {names}"
-    assert set(names) == {"init_repo", "commit", "mark_approved", "rollback"}
+    # Slice 9 P2 adds `working_tree_state` twice (H3: the validator-write
+    # detection takes the tree either side of the validator call). It is the
+    # same call-log-discard shape as the other four, and the count is changed
+    # here in the same commit that changes it in `loop.py`, which is what this
+    # control exists to force.
+    assert len(names) == 6, f"expected 6 vcs.* call expressions, found {names}"
+    assert set(names) == {
+        "init_repo",
+        "commit",
+        "mark_approved",
+        "rollback",
+        "working_tree_state",
+    }
 
     # Control 2 - walker liveness, the inverted predicate.
     assert len(vcs_call_names(tree, inverted=True)) > 0
