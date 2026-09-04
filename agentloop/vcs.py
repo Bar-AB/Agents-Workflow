@@ -1787,6 +1787,77 @@ def remove_worktree(
         return VcsResult(ok=False, stderr=_clip(str(exc)), reason="git-failed")
 
 
+def remove_task_branch(
+    repo_root: str | Path,
+    config: LoopConfig,
+    pin: str = "",
+    *,
+    task_id: int,
+    branch_prefix: str = DEFAULT_BRANCH_PREFIX,
+) -> VcsResult:
+    """Delete a task's branch from the operator's repository. Slice 9 P4.
+
+    P2's `init_repo` always creates a worktree with `-b`, never `-B` (a branch
+    that already exists means a previous incarnation of this task, and
+    force-resetting it would discard commits no human asked to discard) — a
+    deliberate refusal P2 flagged and left for P4 to resolve, because
+    `human_redo`'s worktree-mode fresh start (`remove_worktree` then
+    `init_repo`) hits that exact refusal on a task's *second* redo: the branch
+    `init_repo` created the first time is still there.
+
+    The decision: delete the stale branch first. `human_redo`'s whole contract
+    is a fresh start with no carried-over context, and by the time this runs
+    `_vcs_rollback_to_base` has already written
+    `refs/agentloop/task-<id>/discarded/<sha>` at the branch's prior tip (the
+    caller's ordering, not this function's), so the branch's commits stay
+    reachable from that ref (`git log --all`) after the branch name pointing
+    at them is deleted — recoverability was never a property of the branch
+    name, only of what is reachable, which is the same distinction
+    `vcs.rollback`'s own docstring rests on. Deleting the branch is therefore
+    not a second copy of "discard the work"; the work was already discarded
+    (or preserved) by the rollback that ran first, and this only clears the
+    name so the next `worktree add -b` can reuse it.
+
+    `-D`, not `-d`: nothing in this project ever merges a task branch, so
+    "unmerged" is the normal case, not a warning to respect.
+
+    Pinned like every other repo-level mutation (`_init_worktree`'s baseline
+    check): this spawns git under `<repo_root>/.git/config` too, and a branch
+    name derived from config is not agent-writable, but the config it runs
+    under still is. A branch that does not exist is not treated specially —
+    `git branch -D` on a missing name fails, and a caller that only wanted "no
+    stale branch in the way" may ignore a failed result exactly as every other
+    `vcs` entry point's callers already do."""
+    try:
+        if not config.vcs_enabled:
+            return VcsResult(ok=False, reason="disabled")
+        root = Path(repo_root)
+        try:
+            if not (root / ".git").is_dir():
+                return VcsResult(ok=False, reason="no-workspace")
+        except Exception:
+            return VcsResult(ok=False, reason="no-workspace")
+        refusal = _pin_refusal(root, pin, root)
+        if refusal:
+            return VcsResult(ok=False, reason=refusal)
+        run = _run(
+            root,
+            _git(
+                config,
+                "branch",
+                "-D",
+                f"{branch_prefix}{task_id}",
+                workspace=root,
+            ),
+            config,
+        )
+        if run.reason or run.code != 0:
+            return _failed(run)
+        return VcsResult(ok=True)
+    except Exception as exc:  # totality (DD-6)
+        return VcsResult(ok=False, stderr=_clip(str(exc)), reason="git-failed")
+
+
 def _parse_worktree_list_porcelain(output: str) -> list[dict[str, object]]:
     """`git worktree list --porcelain` into one dict per entry (`path`,
     `branch` when the worktree is on one, `detached`/`bare` flags). Entries
@@ -1949,6 +2020,57 @@ def working_tree_state(
         if refusal:
             return VcsResult(ok=False, reason=refusal)
         run = _status(ws, config)
+        if run.reason or run.code != 0:
+            return _failed(run)
+        entries, capped = _porcelain(run.out, with_code=True)
+        return VcsResult(
+            ok=True,
+            changed_entries=entries,
+            truncated=("changed_entries",) if capped else (),
+        )
+    except Exception as exc:  # totality (DD-6)
+        return VcsResult(ok=False, stderr=_clip(str(exc)), reason="git-failed")
+
+
+def repo_status(repo_root: str | Path, config: LoopConfig, pin: str = "") -> VcsResult:
+    """`git status`, porcelain, of the **operator's own repository** — never a
+    task workspace. Slice 9 P4, residual 2.
+
+    Deliberately not `working_tree_state(repo_root, config, pin=pin)`: that
+    function's guard has exactly two shapes, and `repo_root` fits neither.
+    Scratch mode's `_guard` requires the resolved workspace to sit inside
+    `config.workspace_root`, which `repo_root` is not (it is the operator's
+    own repository, entirely outside any workspace root); worktree mode's
+    `_guard_worktree` requires `<ws>/.git` to be a *file* (a worktree gitfile),
+    and `repo_root/.git` is an ordinary directory. Both refuse with
+    `"not-a-workspace-repo"` — measured, not assumed, which is why this is a
+    third, narrower entry point rather than a third branch bolted onto
+    `_guard`: `_guard`'s two shapes are containment checks defending an
+    agent-writable directory, and `repo_root` is neither of those things — it
+    is the one path in this whole module that is operator config, read
+    directly, never a workspace an agent's tools resolve into.
+
+    Still pinned, because it still spawns git under `<repo_root>/.git/config`
+    (the same config `_init_worktree`'s baseline defends) — a `git status`
+    run does not trigger a smudge/clean filter, but running any command
+    under a config nobody vetted is the exact axis this module's pin exists
+    to close, and there is no reason to make an exception for a read-only
+    one. Read-only otherwise, matching `working_tree_state`: it runs `status`
+    and nothing else. **Detects; prevents nothing** — see
+    `Loop._vcs_detect_out_of_branch_write`, its one caller."""
+    try:
+        if not config.vcs_enabled:
+            return VcsResult(ok=False, reason="disabled")
+        root = Path(repo_root)
+        try:
+            if not (root / ".git").is_dir():
+                return VcsResult(ok=False, reason="no-workspace")
+        except Exception:
+            return VcsResult(ok=False, reason="no-workspace")
+        refusal = _pin_refusal(root, pin, root)
+        if refusal:
+            return VcsResult(ok=False, reason=refusal)
+        run = _status(root, config)
         if run.reason or run.code != 0:
             return _failed(run)
         entries, capped = _porcelain(run.out, with_code=True)

@@ -957,17 +957,32 @@ def test_no_status_write_is_downstream_of_a_vcs_result():
     # legitimately changes the count changes this number in the same commit.
     names = vcs_call_names(tree)
     # Slice 9 P2 adds `working_tree_state` twice (H3: the validator-write
-    # detection takes the tree either side of the validator call). It is the
-    # same call-log-discard shape as the other four, and the count is changed
-    # here in the same commit that changes it in `loop.py`, which is what this
+    # detection takes the tree either side of the validator call). Slice 9 P4
+    # adds six more, all the same call-log-discard shape: `repo_status`
+    # (residual 2's out-of-branch-write snapshot, taken of `repo_root` either
+    # side of the test command — a *new* name, not a third
+    # `working_tree_state`: `repo_root` fits neither of `_guard`'s two shapes,
+    # so it gets its own narrower entry point, see `vcs.repo_status`'s
+    # docstring); a second `init_repo` (human_redo's worktree-mode fresh start
+    # recreates the checkout); `remove_worktree` and `remove_task_branch`
+    # (also human_redo's worktree-mode fresh start); and
+    # `base_ref`/`discarded_ref_prefix` (`_vcs_rollback_to_base` now selects
+    # the per-task ref names worktree mode requires instead of reading the
+    # scratch-mode module constants directly). The count is changed here in
+    # the same commit that changes it in `loop.py`, which is what this
     # control exists to force.
-    assert len(names) == 6, f"expected 6 vcs.* call expressions, found {names}"
+    assert len(names) == 12, f"expected 12 vcs.* call expressions, found {names}"
     assert set(names) == {
         "init_repo",
         "commit",
         "mark_approved",
         "rollback",
         "working_tree_state",
+        "remove_worktree",
+        "remove_task_branch",
+        "base_ref",
+        "discarded_ref_prefix",
+        "repo_status",
     }
 
     # Control 2 - walker liveness, the inverted predicate.

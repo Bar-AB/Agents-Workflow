@@ -100,6 +100,45 @@ _BASE_ENV_ALLOWLIST: tuple[str, ...] = (
     "PROGRAMFILES(X86)",
 )
 
+# Slice 9 P4, test 31. `_child_env` copies `_BASE_ENV_ALLOWLIST |
+# LoopConfig.sandbox_env_allowlist` with **no denylist** — an operator who
+# writes `"ANTHROPIC_API_KEY"` into the config knob hands it to arbitrary
+# generated code, silently. Tolerable while the sandbox barely ran (an empty
+# scratch workspace made most rounds report `status='na'`); not once worktree
+# mode runs the operator's real suite every round and a real suite has a real
+# reason to widen this knob (`DATABASE_URL`, a service token).
+#
+# A heuristic, documented as one: these are *name shapes*, not a registry of
+# real secrets, so it can both miss (`SOME_CUSTOM_CRED`) and over-match (an
+# app's own `FEATURE_TOKEN` flag that carries no secret). That is why the
+# response is a warning naming the variable, never a refusal — an operator may
+# have a genuine reason to pass a provider key into a test suite, and this
+# project's rule (CLAUDE.md: "a refusal it cannot justify becomes a knob
+# someone disables") is that silence is the only unacceptable outcome here,
+# not permissiveness.
+_CREDENTIAL_NAME_PATTERNS: tuple[str, ...] = (
+    "*_API_KEY",
+    "*_TOKEN",
+    "*_SECRET",
+    "*_PASSWORD",
+    "AWS_*",
+)
+
+
+def credential_like_names(allowlist: list[str]) -> list[str]:
+    """Which entries in `allowlist` look credential-shaped, by
+    `_CREDENTIAL_NAME_PATTERNS`. Pure and total: never raises, and an
+    unmatched entry is simply absent from the result — this never refuses
+    anything, it only names what a caller may want to warn about."""
+    import fnmatch
+
+    matched = []
+    for name in allowlist:
+        upper = str(name).upper()
+        if any(fnmatch.fnmatchcase(upper, p) for p in _CREDENTIAL_NAME_PATTERNS):
+            matched.append(name)
+    return matched
+
 
 # Coverage totals, as the two tools that report one actually print them.
 #

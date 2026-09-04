@@ -824,6 +824,27 @@ def _dispatch(args, store: Store, loop: Loop) -> int:
                         print(f"  blocked by: {', '.join(str(d) for d in unmet)}")
                 if t.plan_id and not store.is_plan_approved(t.plan_id):
                     print(f"  blocked by: plan {t.plan_id} (awaiting sign-off)")
+                # Slice 9 residual 4: a worktree survives DONE and lives
+                # outside the repository it works on (`worktree_root`), so an
+                # operator debugging a task can no longer just look beside
+                # their project directory — this is the other half of that
+                # trade, `agentloop workspace prune` being the first. Printed
+                # rather than probed for existence: the path is deterministic
+                # from config + task id whether or not anything has created it
+                # yet, and a task that never ran still has a workspace it
+                # *would* use.
+                repo_root = (
+                    os.path.abspath(loop.config.repo_root)
+                    if loop.config.workspace_mode == "worktree"
+                    else None
+                )
+                ws = workspace_for(
+                    loop.config.workspace_root,
+                    t.id,
+                    config=loop.config,
+                    repo_root=repo_root,
+                )
+                print(f"  workspace: {ws}")
             if t.escalation_reason:
                 print(f"  escalation: {t.escalation_reason}")
             print("  metrics:", json.dumps(store.task_metrics(t.id), indent=4))

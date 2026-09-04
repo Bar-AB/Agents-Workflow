@@ -629,7 +629,14 @@ command runs is the real exposure. Defenses are layered:
 - **Environment**: the child gets a **scrubbed, allowlisted env** — the parent
   environment (which holds `ANTHROPIC_API_KEY` and every other secret) is never
   passed wholesale, so generated code can't read credentials from it. Extra
-  vars a project genuinely needs go in `sandbox_env_allowlist`.
+  vars a project genuinely needs go in `sandbox_env_allowlist`. There is **no
+  denylist** — an entry that looks credential-shaped (`*_API_KEY`, `*_TOKEN`,
+  `*_SECRET`, `*_PASSWORD`, `AWS_*`; a name-pattern heuristic, not a secret
+  registry) is **warned about, never refused** (a `config_warning` event
+  naming the variable), because an operator may genuinely need a provider key
+  in a real test suite. Silence is what is not acceptable here — under slice
+  9's worktree mode your real suite runs every round, which is exactly when
+  you have a live reason to widen this knob.
 - **Resource bounds are real bounds** (slice 8). Output is read into a bounded
   ring buffer as it arrives rather than captured whole and truncated
   afterwards — a child was measured writing 331 MB in 4 s into the
@@ -864,6 +871,143 @@ tier's residual risk above:
   An operator counting refs after a dozen rejections should know why there are a
   dozen.
 
+## Existing-repository workspaces (Slice 9)
+
+Everything above describes **scratch mode** (the default): a throwaway
+directory the worker fills from nothing. That is unusable for the majority
+case at work — an existing repository, an existing test suite, a ticket-sized
+change — because the workspace starts empty and there is no code to modify.
+`workspace_mode: "worktree"` fixes this: each task gets a real `git worktree`
+checkout of your repository, on its own branch, sharing the object store (no
+clone, no copying files by hand).
+
+```jsonc
+{
+  "workspace_mode": "worktree",
+  "repo_root": "/path/to/your/repo",
+  "worktree_root": "~/.agentloop/ws"   // deliberately OUTSIDE repo_root
+}
+```
+
+`workspace_mode: "scratch"` (unset, or explicit) is a **proven** behavioral
+no-op in the same register as `vcs_enabled=false`: an enabled-vs-disabled
+differential over the whole observable state of a run, not an inspection —
+filling in every worktree knob and leaving `workspace_mode` at its default
+produces the identical run a config with none of those knobs set does.
+
+**What changes under worktree mode:**
+
+- The worker (and the validator, reviewing its output) run with their actual
+  working directory (`cwd`) set to the checkout — not just told about it in
+  the prompt. This is also a scratch-mode bug fix (slice 9 P1): before this,
+  the SDK's `cwd` was never set at all, so a worker "writing under the
+  workspace" per its instructions was actually writing into the orchestrator's
+  own directory.
+- The tests gate runs your **real** suite against the real checkout, not an
+  empty directory reporting `status='na'`.
+- An approved task leaves `agentloop/task-<id>` mergeable: `git diff
+  <base>...<branch>` contains only the worker's change. **Merging is never
+  automatic** — approval marks a ref, a human runs `git merge
+  agentloop/task-<id>`.
+- A worktree **survives DONE**. The loop never removes one on success — it is
+  what you `cd` into to review and merge. Removal happens only on `redo`
+  (remove + recreate, a genuinely fresh checkout) or the explicit
+  `agentloop workspace prune` below.
+- `redo`'s second (and every later) run of the same task no longer collides on
+  the branch `init_repo` created the first time: the stale
+  `agentloop/task-<id>` branch is deleted first, **only once the rollback that
+  precedes it has confirmed it recorded the discarded ref** (or had nothing
+  to discard) — deleting a branch *name* does not make its commits
+  unreachable only when that ref genuinely got written. A rollback that
+  fails outright — including a real git-level failure, such as another ref
+  already occupying the discarded ref's own path — leaves the worktree and
+  its branch untouched instead, and a later `redo` retries; deleting the
+  branch anyway is exactly the round-4 critical this project's hardening
+  pass closed.
+- `agentloop status <id>` prints the task's workspace path — worktrees live
+  outside your repository (see residual 4 below), so it is no longer
+  somewhere you would find by just looking beside your project.
+
+**Commands:**
+
+```bash
+agentloop workspace prune [--repo-root PATH]     # remove terminal tasks' worktrees;
+                                                  # also clears stale git admin entries
+agentloop workspace rebless [--repo-root PATH]   # sign off a changed .git/config
+                                                  # baseline after a legitimate edit
+```
+
+`prune` runs `git worktree remove` + `git worktree prune` (never a bare
+`rmtree`, which leaves a stale admin entry `git worktree list` keeps reporting)
+for every task in a terminal state (`done`/`failed`/`aborted`). It never
+touches a branch — `agentloop/task-<id>` lives in your ref store and outlives
+its worktree, so a pruned task stays mergeable.
+
+**Knobs** (`loopconfig.json`), added to the table above:
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `workspace_mode` | `"scratch"` | `"scratch"` (default, proven no-op) or `"worktree"`. |
+| `repo_root` | `"."` | The repository a worktree-mode task checks out. Unread in scratch mode. |
+| `worktree_root` | `"~/.agentloop/ws"` | Where worktree-mode workspaces are created. **Must be outside `repo_root`** — refused at config load otherwise (see residual 2). |
+| `vcs_base_ref` | `"HEAD"` | What each task's worktree branches from. `HEAD`, not `main`: a ticket usually branches from where you are standing. |
+| `vcs_branch_prefix` | `"agentloop/task-"` | Branch naming is derived (`f"{prefix}{task_id}"`), never stored — no schema migration for a value already reconstructible. |
+
+**Residuals — stated, not solved**, in the same register as the sandbox and
+slice-6 residuals above:
+
+1. **A worker can write your real `.git/config`.** `git config --local` run
+   from inside a worktree writes the *main* repository's config (measured) —
+   `filter.<name>.clean`/`core.fsmonitor` name programs git executes on an
+   ordinary `add`/`commit`, so this is the same execution axis slice 6's
+   config pin defends, just reached from a worktree instead of a scratch
+   repo. The pin *detects* the change before the next side-effecting call and
+   refuses (`config-changed`) — `agentloop workspace rebless` is the
+   human-only recovery when the edit was legitimate — but detection is not
+   prevention: the write already landed once. In scratch mode the blast
+   radius was a throwaway repo; here it is yours.
+2. **The executor sandbox's documented `..`/absolute-path escape gets a far
+   worse target.** In scratch mode a write that escapes the workspace lands in
+   a throwaway directory; under worktree mode the workspace is a real checkout
+   of your repository, so the same escape can land in your **main working
+   tree** — outside review, outside `vcs.rollback`, outside the audit log.
+   Two cheap, partial mitigations, and no others: `worktree_root` outside
+   `repo_root` (refused at config load otherwise) makes an *accidental*
+   relative-traversal escape (a test writing a fixture a few directories up)
+   land in an agentloop-owned directory instead of your repository — but an
+   **absolute** path still reaches it outright, and relative traversal with
+   enough `..` to climb past `worktree_root` does too. This is *reduced*, not
+   *closed*. Separately, a `git status` snapshot of the main repository is
+   taken before and after each test run; a difference is logged
+   (`worktree_out_of_branch_write`) as a **detection**, never a claim of
+   prevention. A real isolation tier (`sandbox_isolation='strict'` wired to a
+   container backend) is its own future slice.
+3. **Ignored files are not recoverable after a worktree rollback.** Slice 6's
+   round commit uses `git add -A -f` (force-adding ignored files) specifically
+   so the rollback's `clean -ffdqx` never destroys something un-recoverable.
+   Worktree mode drops the `-f`: force-adding your `.gitignore`d `node_modules`
+   or `.venv` into a task branch every round is worse than the alternative. So
+   a worker-generated, gitignored build artifact really is gone after a
+   rollback in worktree mode — the `vcs_rollback` event payload names this
+   per-rollback (`ignored_unrecoverable`), the way `unrecoverable_nested_repos`
+   already does.
+4. **Workspaces are no longer visible beside the repo they belong to.**
+   Deliberately outside `repo_root` (see residual 2) — the cost is that
+   `agentloop status <id>` (see above) is now how you find a task's checkout,
+   and a stale `worktree_root` can accumulate abandoned checkouts from repos
+   that have since moved or been deleted. `agentloop workspace prune` is the
+   cleanup; nothing runs it automatically.
+5. **Merge conflicts are your problem.** Two tasks touching the same file
+   produce two branches that conflict on merge; nothing in the loop detects or
+   resolves this. The planner's task graph expresses ordering, not file-level
+   disjointness.
+
+**What does not change:** no decision rule reads a workspace mode, a branch
+name or a worktree result — every `vcs.*` call in `loop.py` is *call, log,
+discard*, exactly as slice 6, and an AST guard
+(`test_no_status_write_is_downstream_of_a_vcs_result`) enforces it rather than
+merely documenting it.
+
 ## Provider seam
 
 The loop only knows the `ModelRunner` protocol. `ClaudeSDKRunner` is the
@@ -972,3 +1116,20 @@ problem. That's different from transient HTTP errors (408, 429, 5xx), which retr
       whole batch; a claim failure in a parallel worker was swallowed and
       reported as success; `resume` left the pause message on the row forever;
       and the 500k token cap escalated a *successful* first real task.
+- [x] **Existing-repository workspaces (slice 9)** — `workspace_mode:
+      "worktree"` gives each task a real `git worktree` checkout of your
+      repository on its own branch instead of an empty scratch directory, so
+      the loop can finally run against a real codebase and its real test
+      suite. Along the way: `ModelRunner.run()` gained a `cwd` parameter and
+      the worker/validator's actual working directory is now set to the
+      workspace — a scratch-mode bug fix independent of worktree mode, since
+      before this the SDK's `cwd` was never set and a worker "writing under
+      the workspace" per its prompt was writing into the orchestrator's own
+      directory. See "Existing-repository workspaces" above for the knobs,
+      the residuals (a worker can write your real `.git/config`; the
+      sandbox's `..`/absolute-path escape gets a far worse target, reduced by
+      `worktree_root` living outside `repo_root` and detected — not
+      prevented — by a `git status` differential; ignored files are not
+      recoverable after a worktree rollback) and what stays unchanged (no
+      decision rule reads a workspace mode, a branch name or a worktree
+      result — enforced by the same AST guard slice 6 introduced).

@@ -154,7 +154,12 @@ from .agents import (
     run_worker,
 )
 from .config import OPENAI_MODELS, LoopConfig
-from .executor import TestExecutor, clear_workspace, workspace_for
+from .executor import (
+    TestExecutor,
+    clear_workspace,
+    credential_like_names,
+    workspace_for,
+)
 from .memory import MemoryService
 from .models import Task, TaskStatus, TestResult, VerdictKind
 from .registry import Registry
@@ -367,6 +372,35 @@ class Loop:
                         "message": (
                             "These keys were ignored; the shipped default is in "
                             "force for anything you meant to set."
+                        ),
+                    },
+                )
+            except Exception:
+                pass
+
+        # Slice 9 P4, test 31. Same channel, same reasoning: a
+        # `sandbox_env_allowlist` entry that looks credential-shaped
+        # (`*_API_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`, `AWS_*`) is a
+        # config the operator wrote, not agent output, so it is warned rather
+        # than refused — but it must not be *silent*, since `_child_env` has
+        # no denylist and this knob is the one thing that re-admits what the
+        # scrub removes. A `warnings.warn` alone reaches neither `agentloop
+        # events`, the REST API nor the SSE feed.
+        credential_like = credential_like_names(config.sandbox_env_allowlist)
+        if credential_like:
+            try:
+                self.store.log_event(
+                    None,
+                    "config_warning",
+                    {
+                        "sandbox_env_allowlist_credential_like": credential_like,
+                        "message": (
+                            "These sandbox_env_allowlist entries look "
+                            "credential-shaped (a name-pattern heuristic, not a "
+                            "secret registry) and will be handed to arbitrary "
+                            "generated test code. This is not refused — an "
+                            "operator may need a provider key in a real test "
+                            "suite — but it is not silent either."
                         ),
                     },
                 )
@@ -659,6 +693,16 @@ class Loop:
                     plan_task,
                     self.memory,
                     config=self.config,
+                    # Slice 9 P4: the operator's repository, read-only (the
+                    # planner declares `file_read`, not `file_io`, so
+                    # surveying a codebase it may not modify is what the role
+                    # is for) — `None` in scratch mode, where a plan row has
+                    # no task workspace to point it at.
+                    cwd=(
+                        str(repo_root)
+                        if (repo_root := self._worktree_repo_root()) is not None
+                        else None
+                    ),
                 ),
             )
         except _ConfigError as exc:
@@ -849,15 +893,66 @@ class Loop:
             },
         )
 
-    def _vcs_mark_approved(self, task: Task, ws) -> None:
+    def _worktree_repo_root(self) -> Path | None:
+        """`None` in scratch mode; the absolute `repo_root` in worktree mode.
+
+        Slice 9 P4. The single place `run_task` and its helpers ask "which
+        mode is this run in" — every `vcs.*` call site below reads this once
+        and threads the same answer through, rather than each re-deriving it,
+        so scratch mode staying a *proven* no-op does not depend on getting
+        the same derivation right in six different places. `os.path.abspath`,
+        lexically, matching `vcs._git`'s own `-C` handling and
+        `Store._repo_key` — not `Path.resolve()`, which would follow a
+        junction and quietly answer a question about a different repository
+        than the one `config.repo_root` names."""
+        if self.config.workspace_mode != "worktree":
+            return None
+        return Path(os.path.abspath(self.config.repo_root))
+
+    def _worktree_pin(self, task_id: int, repo_root: Path | None) -> str:
+        """The pin to verify a `vcs.*` call against: the repository-level
+        baseline in worktree mode (`Store.vcs_repo_pin`, P2's remediation —
+        every task of one repository shares one `.git/config`, so a per-task
+        mint would let an ordinary later task re-bless a config an earlier one
+        poisoned), the per-task pin in scratch mode (`Store.vcs_pin`,
+        unchanged since slice 8)."""
+        if repo_root is not None:
+            return self.store.vcs_repo_pin(str(repo_root))
+        return self.store.vcs_pin(task_id)
+
+    def _record_vcs_pin(self, task_id: int, repo_root: Path | None, pin: str) -> None:
+        """Where a pin `init_repo` just minted is recorded — the repo-level
+        baseline table in worktree mode, the per-task table in scratch mode.
+        Mirrors `_worktree_pin`'s choice of table, and is only ever called
+        with a non-empty `pin` (see the callers: `VcsResult.pin` is non-empty
+        only on the branch that actually minted one)."""
+        if repo_root is not None:
+            self.store.set_vcs_repo_pin(str(repo_root), pin)
+        else:
+            self.store.set_vcs_pin(task_id, pin)
+
+    def _vcs_mark_approved(self, task: Task, ws, repo_root: Path | None = None) -> None:
         """Point `refs/agentloop/approved` at the workspace tip (C3 and C4).
 
         Additive: it moves a ref and removes nothing. The result is logged and
         discarded. Every caller gates the call on `set_status` reporting that
         its DONE write *landed* — the row is lease-predicated, so a write that
         did not land would otherwise leave the approved ref asserting a
-        transition the row never took."""
-        result = vcs.mark_approved(ws, self.config, pin=self.store.vcs_pin(task.id))
+        transition the row never took.
+
+        Slice 9 P4: `repo_root` is `None` in scratch mode (unchanged) and the
+        operator's checkout root in worktree mode, where `mark_approved`
+        itself picks the per-task ref (`vcs.approved_ref(task_id)`) over the
+        shared constant — this call site only has to supply which mode it is
+        in and the matching pin."""
+        result = vcs.mark_approved(
+            ws,
+            self.config,
+            pin=self._worktree_pin(task.id, repo_root),
+            repo_root=repo_root,
+            task_id=task.id,
+            branch_prefix=self.config.vcs_branch_prefix,
+        )
         if result.ok:
             self.store.log_event(
                 task.id, "vcs_commit", {"sha": result.sha, "ref": "approved"}
@@ -865,9 +960,15 @@ class Loop:
         elif result.reason != "disabled":
             self._vcs_degraded(task.id, "mark_approved", result)
 
-    def _vcs_detect_validator_writes(self, task_id: int, ws, pin: str, before) -> None:
+    def _vcs_detect_validator_writes(
+        self, task_id: int, ws, pin: str, before, repo_root: Path | None = None
+    ) -> None:
         """Record what the validator changed in the workspace after the round
         was snapshotted (H3). **Detection, not prevention.**
+
+        Slice 9 P4: `repo_root` threads the caller's mode through to
+        `working_tree_state`, unchanged behaviour in scratch mode
+        (`repo_root=None`).
 
         The shipped validator declares `file_io` (Read + Write + Edit) and
         slice 9 P1 pointed that write surface at the task workspace, while
@@ -907,7 +1008,14 @@ class Loop:
         detection that silently stops looking is worse than none."""
         if before is None or not before.ok:
             return
-        after = vcs.working_tree_state(ws, self.config, pin=pin)
+        after = vcs.working_tree_state(
+            ws,
+            self.config,
+            pin=pin,
+            repo_root=repo_root,
+            task_id=task_id,
+            branch_prefix=self.config.vcs_branch_prefix,
+        )
         if not after.ok:
             # A failed detection is still a fact about the detection, and it
             # used to return in silence - so a reader of the audit log could
@@ -957,17 +1065,18 @@ class Loop:
             },
         )
 
-    def _vcs_rollback_to_base(self, task_id: int) -> vcs.VcsResult:
-        """Return a task's workspace to `refs/agentloop/base` (C5 and C6).
+    def _vcs_rollback_to_base(
+        self, task_id: int, repo_root: Path | None = None
+    ) -> vcs.VcsResult:
+        """Return a task's workspace to its base ref (C5 and C6).
 
         The one destructive call expression in this module - and it destroys
-        nothing recoverable: `vcs.rollback` writes
-        `refs/agentloop/discarded/<sha>` at the tip *before* anything moves
-        (DD-12), so the discarded round stays reachable from `git log --all`,
-        which is what makes "reject recovers the work" true rather than
-        aspirational.
+        nothing recoverable: `vcs.rollback` writes a discarded ref at the tip
+        *before* anything moves (DD-12), so the discarded round stays
+        reachable from `git log --all`, which is what makes "reject recovers
+        the work" true rather than aspirational.
 
-        Always to `base`, never to the approved ref (ADR-2/DD-2): the approved
+        Always to base, never to the approved ref (ADR-2/DD-2): the approved
         ref is a bookmark a human placed, and rolling onto it would let a
         reject of a later round silently resurrect an earlier approved one.
 
@@ -976,19 +1085,35 @@ class Loop:
         one - the guard then refuses with `not-a-workspace-repo`, and the
         workspace keeps whatever it held, which is today's behaviour exactly.
 
+        Slice 9 P4: `repo_root` selects the per-task ref names (`base_ref`,
+        `discarded_ref_prefix`) worktree mode requires (P1's probe: worktrees
+        share one ref namespace, so a fixed name would let task 2's rollback
+        target task 1's base) — `None` reproduces the scratch-mode constants
+        byte for byte.
+
         The result is logged and returned; C6 reads it to choose a *filesystem
         shape* only. No status, threshold, revision count or budget rule reads
         it (DD-8).
         """
+        ref = vcs.base_ref(task_id if repo_root is not None else None)
+        prefix = vcs.discarded_ref_prefix(task_id if repo_root is not None else None)
         result = vcs.rollback(
-            workspace_for(self.config.workspace_root, task_id),
-            vcs.BASE_REF,
+            workspace_for(
+                self.config.workspace_root,
+                task_id,
+                config=self.config,
+                repo_root=repo_root,
+            ),
+            ref,
             self.config,
             # The pin recorded when this workspace's repo was created. Read
             # from the store because that is the one place a worker cannot
             # write: a rollback runs `reset --hard` and `clean -ffdqx`, so a
             # config it did not vet is a command the worker chose.
-            pin=self.store.vcs_pin(task_id),
+            pin=self._worktree_pin(task_id, repo_root),
+            repo_root=repo_root,
+            task_id=task_id,
+            branch_prefix=self.config.vcs_branch_prefix,
         )
         if result.ok:
             payload = {"ref": "base"}
@@ -997,7 +1122,7 @@ class Loop:
                 # target and nothing was discarded: these two keys name the
                 # recovery surface, and a null would assert one exists.
                 payload["discarded_sha"] = result.sha
-                payload["discarded_ref"] = f"{vcs.DISCARDED_REF_PREFIX}/{result.sha}"
+                payload["discarded_ref"] = f"{prefix}/{result.sha}"
             payload["files_removed"] = result.files_removed
             if result.nested_repos:
                 # The ref above holds everything the rollback deleted *except*
@@ -1025,11 +1150,106 @@ class Loop:
             extra: dict = {"history_preserved": preserved}
             if preserved:
                 extra["discarded_sha"] = result.sha
-                extra["discarded_ref"] = f"{vcs.DISCARDED_REF_PREFIX}/{result.sha}"
+                extra["discarded_ref"] = f"{prefix}/{result.sha}"
             if result.nested_repos:
                 extra["unrecoverable_nested_repos"] = list(result.nested_repos)
             self._vcs_degraded(task_id, "rollback", result, extra)
         return result
+
+    def _vcs_snapshot_repo_root(
+        self, repo_root: Path | None, pin: str
+    ) -> vcs.VcsResult | None:
+        """The main repository's own `git status`, or `None` when there is
+        nothing to snapshot (scratch mode, or vcs unavailable). Slice 9 P4,
+        residual 2.
+
+        `vcs.repo_status`, not `vcs.working_tree_state`: `repo_root` fits
+        neither of `_guard`'s two shapes (it is not inside `workspace_root`,
+        the way a scratch workspace must be, and its `.git` is a directory,
+        not a worktree gitfile) — `repo_status` is the narrower entry point
+        for reading the operator's own repository directly, pinned against
+        the same repository-level baseline every worktree-mode call in this
+        class already reads (`Store.vcs_repo_pin`)."""
+        if repo_root is None:
+            return None
+        result = vcs.repo_status(repo_root, self.config, pin=pin)
+        return result if result.ok else None
+
+    def _vcs_detect_out_of_branch_write(
+        self,
+        task_id: int,
+        repo_root: Path | None,
+        pin: str,
+        before: vcs.VcsResult | None,
+    ) -> None:
+        """Residual 2 (slice 9 plan): the executor sandbox's documented
+        `..`/absolute-path escape gets a far worse target under worktree mode
+        — the operator's real checkout instead of a throwaway directory — and
+        `worktree_root` living outside `repo_root` only *reduces* the
+        likelihood (relative traversal now has to climb out of an
+        agentloop-owned directory first), it does not close the escape: an
+        absolute path still reaches the repository outright (test 28).
+
+        **Detection, not prevention** — the same posture as
+        `_vcs_detect_validator_writes` (H3), reusing its shape rather than
+        inventing a second one: a `git status` snapshot of `repo_root` taken
+        before and after the test command runs, diffed, and logged as a
+        degradation when they differ. Nothing here stops or undoes a write;
+        the event text says so explicitly, because a detection that reads
+        like a barrier is worse than an absent one — an operator who believes
+        the escape is closed stops looking for it.
+
+        `before=None` covers both "scratch mode" and "the snapshot itself
+        failed" (`_vcs_snapshot_repo_root` folds `not result.ok` into `None`)
+        — there is nothing to diff against in either case, and this must not
+        manufacture a false positive by comparing against an empty baseline."""
+        if before is None:
+            return
+        after = self._vcs_snapshot_repo_root(repo_root, pin)
+        if after is None:
+            self.store.log_event(
+                task_id,
+                "worktree_write_detection_failed",
+                {
+                    "note": (
+                        "The main repository could not be re-read after the "
+                        "test command ran, so whether it wrote outside the "
+                        "task's branch is unknown. This is not a claim that "
+                        "it did not."
+                    ),
+                },
+            )
+            return
+        appeared = [
+            entry
+            for entry in after.changed_entries
+            if entry not in before.changed_entries
+        ]
+        blind = tuple(
+            f"{when}.{field}"
+            for when, snapshot in (("before", before), ("after", after))
+            for field in snapshot.truncated
+        )
+        if not appeared and not blind:
+            return
+        self.store.log_event(
+            task_id,
+            "worktree_out_of_branch_write",
+            {
+                "entries": appeared,
+                "truncated": list(blind),
+                "prevented": False,
+                "note": (
+                    "The test command changed the main repository — outside "
+                    "this task's worktree — while it ran. This is a "
+                    "detection only: nothing stopped or undid the write. "
+                    "worktree_root is configured outside repo_root, which "
+                    "reduces the likelihood of an accidental relative-path "
+                    "escape but does not close an absolute-path one; see "
+                    "residual 2 in the slice 9 design."
+                ),
+            },
+        )
 
     def run_task(self, task: Task) -> Task:
         # Both roles resolved up front, exactly as `plan()` resolves `planner`,
@@ -1081,6 +1301,10 @@ class Loop:
         vcs_ready: bool | None = None
         vcs_pin = ""
         round_n = 0
+        # Slice 9 P4: computed once per `run_task` invocation, exactly like
+        # `vcs_ready`/`round_n` above — a restart simply re-derives it, which
+        # is idempotent (it is a pure function of `self.config`).
+        repo_root = self._worktree_repo_root()
         while True:
             # Human control is read fresh from the store at each iteration
             # boundary, so a pause/abort set from another process (CLI or
@@ -1123,13 +1347,41 @@ class Loop:
 
                 # Worker self-checks in its own output (spec §4.2–4.3).
                 self.store.set_status(task, TaskStatus.IN_PROGRESS)
-                ws = workspace_for(self.config.workspace_root, task.id, create=True)
+                # `create=False`: in worktree mode the explicit `init_repo`
+                # call below is what creates the checkout (`git worktree add`
+                # creates its own directory and refuses one that already
+                # exists); passing `create=True` here as well would have
+                # `workspace_for`'s own delegation (`executor.py`) attempt the
+                # same worktree add every round. In scratch mode `repo_root`
+                # is `None` and `workspace_for` ignores `create` for anything
+                # but the `mkdir` scratch mode still needs, so this is
+                # unconditionally `True` there — byte-for-byte the pre-slice-9
+                # call.
+                ws = workspace_for(
+                    self.config.workspace_root,
+                    task.id,
+                    create=(repo_root is None),
+                    config=self.config,
+                    repo_root=repo_root,
+                )
                 if vcs_ready is None:
                     # C1: one repo per task workspace (DD-1), created once per
                     # `run_task` invocation. `.git` is invisible to
                     # `_has_any_file`, so this cannot flip the tests gate.
-                    vcs_pin = self.store.vcs_pin(task.id)
-                    init = vcs.init_repo(ws, self.config, pin=vcs_pin)
+                    #
+                    # Slice 9 P4: the pin is the repository-level baseline in
+                    # worktree mode (`Store.vcs_repo_pin`) and the per-task pin
+                    # in scratch mode (`Store.vcs_pin`) — see `_worktree_pin`.
+                    vcs_pin = self._worktree_pin(task.id, repo_root)
+                    init = vcs.init_repo(
+                        ws,
+                        self.config,
+                        pin=vcs_pin,
+                        repo_root=repo_root,
+                        task_id=task.id,
+                        start_ref=self.config.vcs_base_ref,
+                        branch_prefix=self.config.vcs_branch_prefix,
+                    )
                     if init.pin:
                         # Non-empty *only* when this call created the repo, so
                         # this records a config git wrote a moment ago and can
@@ -1138,7 +1390,7 @@ class Loop:
                         # either way, and a pin nobody recorded is a workspace
                         # nothing can ever act on again.
                         vcs_pin = init.pin
-                        self.store.set_vcs_pin(task.id, vcs_pin)
+                        self._record_vcs_pin(task.id, repo_root, vcs_pin)
                     vcs_ready = bool(init.ok or init.reason == "already")
                     if not init.ok and init.reason not in ("already", "disabled"):
                         self._vcs_degraded(task.id, "init", init)
@@ -1206,7 +1458,13 @@ class Loop:
                     # explicitly preserved and so must be in the commit.
                     round_n += 1
                     committed = vcs.commit(
-                        ws, f"round {round_n}", self.config, pin=vcs_pin
+                        ws,
+                        f"round {round_n}",
+                        self.config,
+                        pin=vcs_pin,
+                        repo_root=repo_root,
+                        task_id=task.id,
+                        branch_prefix=self.config.vcs_branch_prefix,
                     )
                     if committed.ok:
                         self.store.log_event(
@@ -1312,10 +1570,22 @@ class Loop:
 
                 # Tests are part of validation, executed for real (spec §5).
                 self.store.set_status(task, TaskStatus.TESTING)
+                # Residual 2 (slice 9 plan): the main repository's own state,
+                # snapshotted either side of the test command — detection
+                # only, see `_vcs_detect_out_of_branch_write`. `None` in
+                # scratch mode, where there is no `repo_root` to watch.
+                repo_before = (
+                    self._vcs_snapshot_repo_root(repo_root, vcs_pin)
+                    if vcs_ready
+                    else None
+                )
                 test_result = self._with_retry(
                     task, "executor", lambda: self.executor.run(ws)
                 )
                 self.store.add_test_run(task.id, None, test_result)
+                self._vcs_detect_out_of_branch_write(
+                    task.id, repo_root, vcs_pin, repo_before
+                )
 
                 # Validation runs in a separate context (spec §5).
                 self.store.set_status(task, TaskStatus.VALIDATING)
@@ -1331,7 +1601,14 @@ class Loop:
                 # attributed to the validator would be noise, and noise is how
                 # a real detection gets ignored.
                 tree_before = (
-                    vcs.working_tree_state(ws, self.config, pin=vcs_pin)
+                    vcs.working_tree_state(
+                        ws,
+                        self.config,
+                        pin=vcs_pin,
+                        repo_root=repo_root,
+                        task_id=task.id,
+                        branch_prefix=self.config.vcs_branch_prefix,
+                    )
                     if vcs_ready
                     else None
                 )
@@ -1375,7 +1652,9 @@ class Loop:
                 )
                 return self._require(task.id)
             self.store.add_verdict(task.id, attempt_id, verdict)
-            self._vcs_detect_validator_writes(task.id, ws, vcs_pin, tree_before)
+            self._vcs_detect_validator_writes(
+                task.id, ws, vcs_pin, tree_before, repo_root
+            )
 
             # Executed truth beats the validator's account of it. Record the
             # mismatch: a validator that rubber-stamps failing tests is a
@@ -1439,7 +1718,7 @@ class Loop:
                         # approved
                         # — that task is NEEDS_HUMAN, and its ref is written by
                         # `human_approve` instead (C4).
-                        self._vcs_mark_approved(task, ws)
+                        self._vcs_mark_approved(task, ws, repo_root)
                 return self._require(task.id)
 
             if task.revision_count >= cfg.max_revisions:
@@ -1740,8 +2019,16 @@ class Loop:
         # `create=False` (the default) is load-bearing: approving a task whose
         # workspace never existed must not conjure one — the guard then refuses.
         if landed:
+            repo_root = self._worktree_repo_root()
             self._vcs_mark_approved(
-                fresh, workspace_for(self.config.workspace_root, task_id)
+                fresh,
+                workspace_for(
+                    self.config.workspace_root,
+                    task_id,
+                    config=self.config,
+                    repo_root=repo_root,
+                ),
+                repo_root,
             )
         return fresh
 
@@ -1772,7 +2059,7 @@ class Loop:
         # logs `degraded` on the event and a `vcs_unavailable` row - so what
         # survived on disk is visible rather than hidden behind an ok result.
         if landed:
-            self._vcs_rollback_to_base(task_id)
+            self._vcs_rollback_to_base(task_id, self._worktree_repo_root())
         return self._require(task_id)
 
     def approve_tool_request(self, request_id: int, note: str = "") -> Task:
@@ -1950,8 +2237,94 @@ class Loop:
         # `vcs.is_repo` is deliberately not called first: `rollback` re-runs
         # the identical guard internally and says `not-a-workspace-repo`, so a
         # pre-check would be a second, racier copy of it.
-        result = self._vcs_rollback_to_base(task_id)
-        if not (result.ok and result.reason != "residue"):
+        repo_root = self._worktree_repo_root()
+        result = self._vcs_rollback_to_base(task_id, repo_root)
+        if repo_root is not None:
+            # Slice 9 P4, "Settled in interview" point 2: worktree mode's
+            # fresh start is *remove and recreate*
+            # (`vcs.remove_worktree` then `vcs.init_repo`), not reset-in-place
+            # — safe **only when the rollback above actually wrote the
+            # discarded ref** (or had nothing to discard). `vcs.rollback`
+            # writes `refs/agentloop/task-<id>/discarded/<sha>` at whatever
+            # the branch's prior tip was *before* anything moves, so the
+            # history this redo is about to remove the *branch name* from
+            # stays reachable from that ref (`git log --all`) — but only if
+            # that write is the one that actually happened. Round 4's
+            # remediation: this used to run unconditionally, so a rollback
+            # that failed *before* recording anything (a real git-level
+            # failure, e.g. the discarded ref's own path already occupied by
+            # an ordinary ref — no monkeypatch needed) still fell through to
+            # delete the branch, permanently orphaning the round's commits
+            # once an ordinary `git gc` ran. Gated on the same discriminator
+            # the scratch-mode branch below already uses correctly
+            # (`result.ok and result.reason != "residue"`): `ok=True` with a
+            # non-residue reason is the one shape that guarantees the
+            # discarded ref (or "nothing to discard") is real.
+            #
+            # This is what closes P2's documented gap: `init_repo`'s worktree
+            # branch always creates with `-b`, never `-B` (a branch that
+            # exists means a previous incarnation of this task, and
+            # force-resetting it would discard commits no human asked to
+            # discard) — so a *second* redo of the same task hit that refusal
+            # outright, because the branch `init_repo` made the first time was
+            # still there. The decision (see `vcs.remove_task_branch`'s
+            # docstring): delete the stale branch. `human_redo`'s whole
+            # contract is a fresh start with no carried-over context, and the
+            # discarded ref above is what makes deleting the *name* safe —
+            # the commits it pointed at do not become unreachable, only
+            # unnamed by a branch nothing may act on again after this call.
+            if result.ok and result.reason != "residue":
+                ws = workspace_for(
+                    self.config.workspace_root,
+                    task_id,
+                    config=self.config,
+                    repo_root=repo_root,
+                )
+                pin = self._worktree_pin(task_id, repo_root)
+                removed = vcs.remove_worktree(
+                    ws,
+                    self.config,
+                    pin,
+                    repo_root=repo_root,
+                    task_id=task_id,
+                    branch_prefix=self.config.vcs_branch_prefix,
+                )
+                if removed.ok or removed.reason == "no-workspace":
+                    # `no-workspace`: nothing to remove, e.g. a task redone
+                    # before its first round ever created a worktree —
+                    # proceed straight to (re)creating it.
+                    vcs.remove_task_branch(
+                        repo_root,
+                        self.config,
+                        pin,
+                        task_id=task_id,
+                        branch_prefix=self.config.vcs_branch_prefix,
+                    )
+                    recreated = vcs.init_repo(
+                        ws,
+                        self.config,
+                        pin,
+                        repo_root=repo_root,
+                        task_id=task_id,
+                        start_ref=self.config.vcs_base_ref,
+                        branch_prefix=self.config.vcs_branch_prefix,
+                    )
+                    if not recreated.ok and recreated.reason not in (
+                        "already",
+                        "disabled",
+                    ):
+                        self._vcs_degraded(task_id, "init", recreated)
+                elif removed.reason != "disabled":
+                    self._vcs_degraded(task_id, "remove_worktree", removed)
+            # else: the rollback did not cleanly succeed — it either failed
+            # outright or left residue behind — so the discarded ref this
+            # branch's safety depends on may not be the one that was written.
+            # `_vcs_rollback_to_base` has already audited the gap
+            # (`vcs_unavailable` on failure, a degraded `vcs_rollback` on
+            # residue). Leave the worktree and its branch exactly as they
+            # are — do not delete a branch whose commits might be reachable
+            # nowhere else — and let a later run retry.
+        elif not (result.ok and result.reason != "residue"):
             # ...except when the rollback failed *after* recording the
             # discarded tip (`sha` set on a failed result). `vcs.rollback`
             # aborts rather than lose that history, while `clear_workspace`
