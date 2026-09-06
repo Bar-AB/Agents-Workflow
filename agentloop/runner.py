@@ -65,6 +65,14 @@ try:  # optional extra: `pip install agentloop[claude]`
 except ImportError:  # core stays stdlib-only; MockRunner works without it
     anyio = None
     ResultMessage = None
+    # Rebound like its two siblings, and for a reason that is about the *tests*
+    # rather than the core: this name was the one the `except` forgot, so
+    # `from agentloop.runner import ClaudeAgentOptions` raised on the documented
+    # `pip install -e ".[dev]"` install, where `[claude]` is explicitly optional.
+    # An ImportError at module scope is a *collection* error, so it deleted
+    # every test in the importing module — including the ones that pin the
+    # working directory the loop hands the seam, which need no SDK at all.
+    ClaudeAgentOptions = None
 
 
 def _is_result_message(message) -> bool:
@@ -400,11 +408,36 @@ class ModelRunner(Protocol):
         prompt: str,
         model: str,
         tools: list[str] | None = None,
+        cwd: str | None = None,
     ) -> RunResult:
         """Execute one agent invocation and return output + token usage.
 
         `tools` is the agent's allowlist from the registry (spec §3): the
         shared baseline plus its role-specific tools.
+
+        `cwd` is the directory the agent's tools resolve relative paths
+        against — the task workspace for a worker or a validator, `None` for a
+        role with nowhere honest to point (the summarizer takes no tools at
+        all). It is a **call argument and not constructor state**, and that is
+        not a style preference: `Loop._runner_for` resolves one backend
+        instance per pinned name and hands that same object to every role and
+        every thread, so at `max_parallel_workers > 1` two tasks share it. A
+        `self.cwd` set before each call would be a data race whose losing task
+        writes into the other's workspace — silently, since neither the audit
+        log nor the verdict would show it.
+
+        Before this argument existed the worker prompt *asked* the agent to
+        write under the workspace (`agents.run_worker`'s `## Workspace` block)
+        while the SDK ran it in the orchestrator's own directory: the
+        operator's repository. An instruction is not a boundary, and the
+        validator — which also holds `file_io` — had the same bug more quietly,
+        reading the orchestrator's tree while nominally reviewing the worker's
+        output.
+
+        A backend with no filesystem may ignore it (see `OpenAICompatRunner`),
+        which is a weaker obligation than `tools` carries below: ignoring
+        `tools` grants a capability nobody approved, whereas ignoring `cwd`
+        where there is no execution loop withholds nothing.
 
         **An implementation must honor `tools`, and this seam cannot check that
         it did.** Since slice 5 the list is not merely a registry preference but
@@ -488,13 +521,18 @@ class MockRunner:
         prompt: str,
         model: str,
         tools: list[str] | None = None,
+        cwd: str | None = None,
     ) -> RunResult:
+        # `cwd` is *recorded* rather than acted on: this backend runs no tools,
+        # and a test asserting which directory a role was given must not need
+        # the SDK installed to do it.
         self.calls.append(
             {
                 "system": system_prompt,
                 "prompt": prompt,
                 "model": model,
                 "tools": list(tools or []),
+                "cwd": cwd,
             }
         )
         if self.outputs:
@@ -580,22 +618,43 @@ class ClaudeSDKRunner:
         prompt: str,
         model: str,
         tools: list[str] | None = None,
+        cwd: str | None = None,
     ) -> RunResult:
         if anyio is None:
             raise RuntimeError(
                 "ClaudeSDKRunner requires `pip install agentloop[claude]`"
             )
-        return anyio.run(self._run_async, system_prompt, prompt, model, tools)
+        return anyio.run(self._run_async, system_prompt, prompt, model, tools, cwd)
 
-    def build_options(self, system_prompt: str, model: str, tools: list[str] | None):
-        """Construct SDK options. Split out so the tool allowlist is testable
-        without credentials or a live call."""
+    def build_options(
+        self,
+        system_prompt: str,
+        model: str,
+        tools: list[str] | None,
+        cwd: str | None = None,
+    ):
+        """Construct SDK options. Split out so the tool allowlist — and now
+        the working directory — are testable without credentials or a live call.
+
+        `cwd` is the one field here that decides *where* the agent's Write and
+        Edit land. It was never passed, so the SDK defaulted to the
+        orchestrator's own directory while the prompt asked for the workspace;
+        `None` still means that default, and is correct only for a role with no
+        workspace to name."""
+        if ClaudeAgentOptions is None:
+            # Same message `run()` gives, one layer down: without the extra this
+            # is the first line that would fail, and it would fail as
+            # `TypeError: 'NoneType' object is not callable`.
+            raise RuntimeError(
+                "ClaudeSDKRunner requires `pip install agentloop[claude]`"
+            )
         allowed = resolve_tools(tools)
         return ClaudeAgentOptions(
             system_prompt=system_prompt,
             model=model,
             max_turns=25,
             allowed_tools=allowed,
+            cwd=cwd,
         )
 
     async def _run_async(
@@ -604,8 +663,9 @@ class ClaudeSDKRunner:
         prompt: str,
         model: str,
         tools: list[str] | None = None,
+        cwd: str | None = None,
     ) -> RunResult:
-        options = self.build_options(system_prompt, model, tools)
+        options = self.build_options(system_prompt, model, tools, cwd)
         chunks: list[str] = []
         tool_calls: list[dict] = []
         tokens_in = tokens_out = cache_creation = cache_read = 0
@@ -873,7 +933,20 @@ class OpenAICompatRunner:
         prompt: str,
         model: str,
         tools: list[str] | None = None,
+        cwd: str | None = None,
     ) -> RunResult:
+        # `cwd` is accepted and ignored, and — unlike `tools` a few lines down
+        # — **silently**. The two look alike and are not. Dropping `tools` leaves
+        # a model that may emit calls nobody executes and then reason as though
+        # they had run, so that gap is worth a warning at the moment it opens.
+        # A chat-completions call has no filesystem at all: there is no tool to
+        # resolve a path against, so a working directory is *meaningless* here
+        # rather than dangerous, and ignoring it withholds nothing from anyone.
+        # A warning would then fire on every attempt of every task pinned to
+        # this backend and report nothing an operator can act on, which is how
+        # a real warning gets tuned out. The parameter exists only because the
+        # seam is one protocol.
+        #
         # Checked before the request, so a missing key is a configuration error
         # with a name in it rather than a provider 401. A `RunnerConfigError`
         # and not a bare RuntimeError because `run()` is called *inside*

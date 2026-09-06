@@ -642,3 +642,50 @@ def test_eval_with_no_flags_still_runs_the_verdict_harness(capsys, tmp_path):
         assert [r["kind"] for r in s.eval_runs()] == ["verdict"]
     finally:
         s.close()
+
+
+# -- slice 9 P4: `agentloop status` prints the task's workspace path ---------
+
+
+def test_status_prints_the_scratch_mode_workspace_path(capsys):
+    main(["add", "A task", "--goal", "do it", "--criteria", "works"])
+    capsys.readouterr()
+
+    rc = main(["status", "1"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "workspace:" in out
+    assert "task-1" in out
+
+
+def test_status_prints_the_worktree_mode_workspace_path(tmp_path, capsys):
+    import json
+    import subprocess
+
+    repo_root = tmp_path / "operator_repo"
+    repo_root.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=str(repo_root), check=True)
+
+    cfg_path = tmp_path / "loopconfig.json"
+    cfg_path.write_text(
+        json.dumps(
+            {
+                "db_path": str(tmp_path / "agentloop.db"),
+                "workspace_mode": "worktree",
+                "repo_root": str(repo_root),
+                "worktree_root": str(tmp_path / "wt_root"),
+            }
+        ),
+        encoding="utf-8",
+    )
+    main(["--config", str(cfg_path), "add", "A task", "--goal", "g", "--criteria", "c"])
+    capsys.readouterr()
+
+    rc = main(["--config", str(cfg_path), "status", "1"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "workspace:" in out
+    assert "wt_root" in out
+    assert "task-1" in out

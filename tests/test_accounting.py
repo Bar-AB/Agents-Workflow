@@ -80,7 +80,7 @@ class CacheHeavyRunner:
         self.cache_creation = cache_creation
         self.calls = []
 
-    def run(self, system_prompt, prompt, model, tools=None):
+    def run(self, system_prompt, prompt, model, tools=None, cwd=None):
         self.calls.append({"prompt": prompt})
         out = self.outputs.pop(0) if self.outputs else "(out)"
         return RunResult(

@@ -573,7 +573,7 @@ class GraphRunner:
         self.active = 0
         self.max_active = 0
 
-    def run(self, system_prompt, prompt, model, tools=None):
+    def run(self, system_prompt, prompt, model, tools=None, cwd=None):
         with self._lock:
             self.prompts.append(prompt)
             self.active += 1

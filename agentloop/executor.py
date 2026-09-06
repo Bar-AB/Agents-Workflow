@@ -36,6 +36,7 @@ layered accordingly:
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shlex
@@ -49,8 +50,12 @@ import time
 import warnings
 from collections import deque
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .models import TestResult
+
+if TYPE_CHECKING:
+    from .config import LoopConfig
 
 # Keep stored output small — the tail is for humans debugging a failure, and
 # the whole thing is also fed into a validator prompt where tokens cost money.
@@ -94,6 +99,45 @@ _BASE_ENV_ALLOWLIST: tuple[str, ...] = (
     "PROGRAMFILES",
     "PROGRAMFILES(X86)",
 )
+
+# Slice 9 P4, test 31. `_child_env` copies `_BASE_ENV_ALLOWLIST |
+# LoopConfig.sandbox_env_allowlist` with **no denylist** — an operator who
+# writes `"ANTHROPIC_API_KEY"` into the config knob hands it to arbitrary
+# generated code, silently. Tolerable while the sandbox barely ran (an empty
+# scratch workspace made most rounds report `status='na'`); not once worktree
+# mode runs the operator's real suite every round and a real suite has a real
+# reason to widen this knob (`DATABASE_URL`, a service token).
+#
+# A heuristic, documented as one: these are *name shapes*, not a registry of
+# real secrets, so it can both miss (`SOME_CUSTOM_CRED`) and over-match (an
+# app's own `FEATURE_TOKEN` flag that carries no secret). That is why the
+# response is a warning naming the variable, never a refusal — an operator may
+# have a genuine reason to pass a provider key into a test suite, and this
+# project's rule (CLAUDE.md: "a refusal it cannot justify becomes a knob
+# someone disables") is that silence is the only unacceptable outcome here,
+# not permissiveness.
+_CREDENTIAL_NAME_PATTERNS: tuple[str, ...] = (
+    "*_API_KEY",
+    "*_TOKEN",
+    "*_SECRET",
+    "*_PASSWORD",
+    "AWS_*",
+)
+
+
+def credential_like_names(allowlist: list[str]) -> list[str]:
+    """Which entries in `allowlist` look credential-shaped, by
+    `_CREDENTIAL_NAME_PATTERNS`. Pure and total: never raises, and an
+    unmatched entry is simply absent from the result — this never refuses
+    anything, it only names what a caller may want to warn about."""
+    import fnmatch
+
+    matched = []
+    for name in allowlist:
+        upper = str(name).upper()
+        if any(fnmatch.fnmatchcase(upper, p) for p in _CREDENTIAL_NAME_PATTERNS):
+            matched.append(name)
+    return matched
 
 
 # Coverage totals, as the two tools that report one actually print them.
@@ -575,10 +619,130 @@ class TestExecutor:
         return env
 
 
-def workspace_for(root: str | Path, task_id: int, create: bool = False) -> Path:
-    """Per-task workspace. Isolated so a redo can wipe it for a true fresh
-    start rather than rerunning over dirty state."""
-    ws = Path(root) / f"task-{task_id}"
+def _worktree_dir_name(repo_root: str | Path) -> str:
+    """`<repo-name>-<short-hash>` — the directory one repository's worktrees
+    share under `worktree_root`.
+
+    Hashed over the **resolved** `repo_root` (P3 introduced the hash;
+    remediation-5 fixed what it resolved over), not the basename alone, so two
+    checkouts of the same repository at different paths — or two unrelated
+    repositories that happen to share a basename — cannot collide in one
+    shared root and silently mix one repository's task branches with
+    another's.
+
+    `realpath` before `normcase`, **not** lexical `abspath` — this is exactly
+    `Store._repo_key`'s distinction (see its docstring) and resolves the same
+    way for the same reason: this computation has no subprocess to spawn, it
+    is a pure key derivation over a string feeding a directory-name decision,
+    which is `config._is_within`'s category, not `vcs._git`'s `-C` argument
+    (which stays lexical on purpose because *that* value becomes a
+    subprocess's cwd, and a junction substituting the directory git actually
+    runs in is the escape `vcs._guard`'s identity checks exist to close). A
+    pure key has nothing for a junction to substitute, so staying lexical here
+    bought nothing and cost the property this key exists to hold:
+    `worktree_root_for` is where every task's worktree for one repository is
+    supposed to live, and `agentloop workspace prune` recomputes this same
+    path from whatever spelling of `repo_root` the current invocation was
+    given. Measured with a real Windows junction: a lexical hash produced a
+    different `<name>-<hash>` for the target directory and a junction alias of
+    it, so a workspace created under one spelling was never found — and so
+    never reclaimed — by `prune` invoked with the other, silently, with no
+    error, no event and no warning. `os.path.normcase` after resolving so
+    Windows' case-insensitive paths and a `/` vs `\\` spelling still hash
+    identically; POSIX is unaffected (`normcase` is identity there). An
+    unresolvable path (a dangling reference, a mixed-drive path) falls back to
+    plain `abspath` rather than raising — a key must always be computable, and
+    failing to resolve a spelling is not evidence the two spellings differ.
+
+    The name prefix is taken from the **resolved** path too, not the given
+    spelling — a junction or symlink alias can carry an arbitrary basename of
+    its own (e.g. a symlink named `alias-of-it` pointing at a directory named
+    `target-directory`), and deriving the name from the unresolved spelling
+    would leave two aliases sharing an identical hash but disagreeing on the
+    human-readable prefix, so the two still could not produce the one grouping
+    key this function exists to guarantee."""
+    try:
+        resolved = os.path.realpath(str(repo_root))
+    except Exception:
+        resolved = os.path.abspath(str(repo_root))
+    abs_root = os.path.normcase(resolved)
+    name = Path(resolved).name or "repo"
+    digest = hashlib.sha256(abs_root.encode("utf-8")).hexdigest()[:8]
+    return f"{name}-{digest}"
+
+
+def worktree_root_for(config: "LoopConfig", repo_root: str | Path) -> Path:
+    """`<config.worktree_root>/<repo-name>-<hash>`, absolute. The parent
+    `workspace_for` places `task-<id>` under in worktree mode."""
+    base = Path(os.path.abspath(os.path.expanduser(config.worktree_root)))
+    return base / _worktree_dir_name(repo_root)
+
+
+def workspace_for(
+    root: str | Path,
+    task_id: int,
+    create: bool = False,
+    *,
+    config: "LoopConfig | None" = None,
+    repo_root: str | Path | None = None,
+    pin: str = "",
+) -> Path:
+    """Per-task workspace, always **absolute**. Isolated so a redo can wipe it
+    for a true fresh start rather than rerunning over dirty state.
+
+    Absolutised here, at the one place a workspace path is produced, because
+    since slice 9's P1 that path is read from *two different directories*: the
+    orchestrator's, when the loop resolves it, and the workspace itself, when
+    the agent reads the `## Workspace` instruction naming it after `cwd` has
+    put it there. `workspace_root` ships relative (`.agentloop/ws`), so the
+    same string denoted two directories — the agent created
+    `<ws>/.agentloop/ws/task-N`, pytest's `norecursedirs` skipped the dotted
+    directory, nothing was collected, and the tests gate blocked approval every
+    round until the revisions ran out, escalating with a reason about tests
+    rather than about a path.
+
+    `os.path.abspath`, **lexically, and deliberately not `Path.resolve()`** —
+    the same choice `vcs._git` documents for its `-C` value: resolve follows a
+    junction at the workspace and would quietly take over the one decision
+    `vcs._guard` exists to make.
+
+    **Worktree mode (P3)**: when `config.workspace_mode == 'worktree'` and
+    `repo_root` is given, `root` is ignored for the directory computation — the
+    workspace lives at `worktree_root_for(config, repo_root) / f"task-{id}"`
+    instead of `<root>/task-{id}`, and `create=True` delegates to
+    `vcs.init_repo` (a real checkout on its own branch) rather than `mkdir`.
+    `pin` is the caller's recorded repository-level baseline (see
+    `Store.vcs_repo_pin`); `""` is the "no baseline recorded yet" case that lets
+    `init_repo` mint one — the first task on a repository does this.
+
+    `config` defaulting to `None` is what keeps every one of the loop's six
+    existing call sites unchanged and scratch-mode behaviour a **proven**
+    no-op: an unset `config` never reads `workspace_mode`, so wiring `config`/
+    `repo_root`/`pin` through those call sites is left for P4 to do, not
+    something this function forces on them. Total like every `vcs` entry
+    point: a failed `init_repo` is not raised here, it is returned by `vcs` and
+    the path is handed back regardless — the caller's own retry/escalation
+    path (unchanged by this slice) is what acts on it."""
+    if (
+        config is not None
+        and config.workspace_mode == "worktree"
+        and repo_root is not None
+    ):
+        ws = worktree_root_for(config, repo_root) / f"task-{task_id}"
+        if create:
+            from . import vcs
+
+            vcs.init_repo(
+                ws,
+                config,
+                pin,
+                repo_root=repo_root,
+                task_id=task_id,
+                start_ref=config.vcs_base_ref,
+                branch_prefix=config.vcs_branch_prefix,
+            )
+        return ws
+    ws = Path(os.path.abspath(Path(root) / f"task-{task_id}"))
     if create:
         ws.mkdir(parents=True, exist_ok=True)
     return ws
@@ -609,7 +773,14 @@ _RMTREE_KW = (
 )
 
 
-def clear_workspace(root: str | Path, task_id: int) -> bool:
+def clear_workspace(
+    root: str | Path,
+    task_id: int,
+    *,
+    config: "LoopConfig | None" = None,
+    repo_root: str | Path | None = None,
+    pin: str = "",
+) -> bool:
     """Wipe a task workspace (used by human_redo — no carried-over state) and
     report whether it is gone.
 
@@ -623,7 +794,42 @@ def clear_workspace(root: str | Path, task_id: int) -> bool:
     redo that quietly kept the previous round is invisible. The report is the
     observed state of the filesystem afterwards, not a guess from which branch
     ran — a workspace that never existed is `True`, because "not there" is the
-    outcome that was asked for."""
+    outcome that was asked for.
+
+    **Worktree mode (P3)**: an `rmtree` alone is wrong here — it leaves the
+    admin entry under `<repo_root>/.git/worktrees/<name>` registered, so
+    `git worktree list` keeps reporting a workspace that is gone and a later
+    `worktree add` at the same path is refused as already registered (see
+    `vcs.remove_worktree`'s docstring). So when `config.workspace_mode ==
+    'worktree'` and `repo_root` is given, this routes to `vcs.remove_worktree`
+    instead — never `rmtree` — and reports `True` only when the workspace is
+    confirmed gone afterwards (either `remove_worktree` succeeded, or the
+    directory was already absent, matching the scratch branch's own "not
+    there" reading of `True`). `config=None` (the default) is unchanged from
+    before this slice."""
+    if (
+        config is not None
+        and config.workspace_mode == "worktree"
+        and repo_root is not None
+    ):
+        ws = workspace_for(root, task_id, config=config, repo_root=repo_root)
+        if not ws.exists():
+            return True
+        from . import vcs
+
+        result = vcs.remove_worktree(
+            ws,
+            config,
+            pin,
+            repo_root=repo_root,
+            task_id=task_id,
+            branch_prefix=config.vcs_branch_prefix,
+        )
+        try:
+            return bool(result.ok) or not ws.exists()
+        except Exception:
+            return False
+
     ws = workspace_for(root, task_id)
     if not ws.is_dir():
         return True

@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -287,6 +288,26 @@ CREATE TABLE IF NOT EXISTS test_runs (
 -- an attempt.
 CREATE TABLE IF NOT EXISTS vcs_pins (
     task_id     INTEGER PRIMARY KEY,
+    fingerprint TEXT NOT NULL,
+    created_at  REAL NOT NULL
+);
+
+-- The same fingerprint, keyed by **repository** rather than by task (slice 9).
+-- `vcs_pins` above is the right shape for scratch mode, where a workspace owns
+-- its own `.git/config` and the two are 1:1. A git worktree does not: every
+-- task of one repository shares `<repo_root>/.git/config`, which is
+-- pre-existing and agent-writable, so the pin there is a fact about the
+-- repository and a per-task row let task 1 poison the config and task 2 mint a
+-- fresh pin over the poison. One row per repository, `repo_key` *is* the
+-- primary key, and it is `realpath`-then-`normcase` (see `Store._repo_key`)
+-- so two spellings of one checkout -- including a junction, a symlink, a
+-- mapped drive or a case difference, not merely a trailing slash -- cannot
+-- become two baselines a lookup would have to choose between.
+--
+-- A live fact with one current value, not history, exactly like `vcs_pins`; and
+-- no foreign key, for the same reason.
+CREATE TABLE IF NOT EXISTS vcs_repo_pins (
+    repo_key    TEXT PRIMARY KEY,
     fingerprint TEXT NOT NULL,
     created_at  REAL NOT NULL
 );
@@ -1753,6 +1774,115 @@ class Store:
             "SELECT fingerprint FROM vcs_pins WHERE task_id=?", (task_id,)
         ).fetchall()
         return rows[0]["fingerprint"] if rows else ""
+
+    @staticmethod
+    def _repo_key(repo_root: str) -> str:
+        """One repository, one key — `realpath` then `normcase`, **not**
+        `abspath`.
+
+        This computation has no subprocess to spawn: it is a pure key
+        derivation over a string, feeding a `SELECT`/`INSERT` and nothing
+        else. That is exactly `config._is_within`'s distinction, and it
+        resolves the *other* way from `vcs._git`'s `-C` argument (which stays
+        lexical on purpose, because *that* value becomes a subprocess's
+        working directory and a junction substituting the directory git
+        actually runs in is the escape `_guard_worktree`'s identity checks
+        exist to close). A pure key has nothing for a junction to substitute,
+        so leaving it lexical here bought nothing and cost the property this
+        key exists to hold: `vcs.config_pin` fingerprints
+        `<repo_root>/.git/config` through an actual filesystem read
+        (`stat`/`read_bytes`), which the OS transparently resolves through a
+        symlink, a junction, a mapped drive or a case difference — so two
+        *textually different* spellings of one physical repository produce
+        the identical fingerprint but, under a lexical `_repo_key`, two
+        different store keys. The alias then reads as a repository the store
+        has never pinned, and `_init_worktree` treats an absent baseline as
+        "mint a fresh one" — precisely the pin-laundering escape P2's C3 was
+        built to close, reopened through the store key's identity rather than
+        the task id. `realpath` (matching `config._is_within`'s pairing, not
+        `vcs._git`'s) makes the two spellings collapse to one key, exactly as
+        they already collapse to one fingerprint; `normcase` after it is the
+        same Windows case/separator normalisation `_is_within` applies for
+        the same reason. An unresolvable path (a dangling reference, a
+        mixed-drive path) falls back to plain `abspath` rather than raising —
+        a key must always be computable, and failing to resolve a spelling
+        is not evidence the two spellings differ."""
+        try:
+            return os.path.normcase(os.path.realpath(str(repo_root)))
+        except Exception:
+            return os.path.normcase(os.path.abspath(str(repo_root)))
+
+    def set_vcs_repo_pin(self, repo_root: str, fingerprint: str) -> None:
+        """Record the config-pin **baseline** for a repository worked on in
+        worktree mode.
+
+        Separate from `set_vcs_pin` because the key is different, not because
+        the value is: in worktree mode every task of one repository runs git
+        under one `<repo_root>/.git/config`, so a per-task row made the pin
+        re-mintable by the simple act of starting the next task -- measured as
+        arbitrary command execution outside every workspace. Only the first
+        task on a repository establishes the baseline; every later `init_repo`
+        is verified against it and refuses on `config-changed`.
+
+        Replaces rather than appends, like its per-task sibling: two baselines
+        would be a gate with a second answer in it. **Re-blessing a
+        legitimately changed baseline needs a human-facing surface and there is
+        deliberately none yet** -- it is a P3/P4 item, and an agent must never
+        be the thing that writes this row."""
+        self._conn.write(
+            "INSERT INTO vcs_repo_pins (repo_key, fingerprint, created_at) "
+            "VALUES (?, ?, ?) ON CONFLICT(repo_key) DO UPDATE SET "
+            "fingerprint=excluded.fingerprint, created_at=excluded.created_at",
+            (self._repo_key(repo_root), fingerprint, time.time()),
+        )
+
+    def vcs_repo_pin(self, repo_root: str) -> str:
+        """The recorded baseline, or `""` when there is none. `""` is what
+        makes the *first* task on a repository the one that blesses the
+        operator's pre-existing config -- and the residual that follows from
+        it is stated in `vcs._init_worktree` rather than hidden here."""
+        rows = self._conn.execute(
+            "SELECT fingerprint FROM vcs_repo_pins WHERE repo_key=?",
+            (self._repo_key(repo_root),),
+        ).fetchall()
+        return rows[0]["fingerprint"] if rows else ""
+
+    def rebless_vcs_repo_pin(
+        self, repo_root: str, fingerprint: str, note: str = ""
+    ) -> str:
+        """The human-only re-bless surface `_init_worktree`'s docstring names
+        as deliberately absent from P2: once a repository has a recorded
+        baseline, a legitimate operator edit to `<repo_root>/.git/config`
+        makes every later `init_repo` refuse forever with `config-changed`,
+        because nothing else re-blesses it. This is that surface, and it is
+        never automatic — `agentloop workspace rebless` is the only caller,
+        an explicit human action, never something `vcs.py` or `loop.py` may
+        invoke on their own (that would launder exactly the edit the pin
+        exists to catch, the same reasoning `init_repo` uses for "mint only on
+        the branch that creates the repository").
+
+        Unlike `set_vcs_repo_pin` (the machine path `init_repo` mints
+        through, silent because a mint is not a degradation), a re-bless is a
+        human decision about a repository's trust boundary and is audited
+        like one: `vcs_repo_pin_reblessed` carries the old and new
+        **fingerprints** (never the `.git/config` bytes — a hash is not a
+        secret and the config may name one) and the operator's note.
+        `task_id=None`: this is a fact about a repository, not about any one
+        task. Returns the fingerprint that is now in force."""
+        old = self.vcs_repo_pin(repo_root)
+        with self.transaction():
+            self.set_vcs_repo_pin(repo_root, fingerprint)
+            self.log_event(
+                None,
+                "vcs_repo_pin_reblessed",
+                {
+                    "repo_key": self._repo_key(repo_root),
+                    "old_fingerprint": old,
+                    "new_fingerprint": fingerprint,
+                    "note": note,
+                },
+            )
+        return fingerprint
 
     # -- agent tool requests (roadmap slice 5) --------------------------------
 

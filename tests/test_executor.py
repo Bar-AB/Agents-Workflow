@@ -604,3 +604,160 @@ def test_the_sandbox_can_resolve_the_running_interpreters_tools(tmp_path):
     env = TestExecutor(command="pytest -q")._child_env()
     scripts = str(Path(sys.executable).resolve().parent)
     assert scripts in env["PATH"].split(os.pathsep)
+
+
+# -- slice 9 P3: worktree-mode workspace creation/teardown --------------------
+
+
+def _make_operator_repo(path: Path) -> Path:
+    """The smallest real git repository `workspace_for` can check out —
+    reusing `test_worktree_vcs`'s helper so this exercises the same real `git`
+    subprocess path, not a mock."""
+    from tests.test_worktree_vcs import make_repo
+
+    return make_repo(path)
+
+
+def test_workspace_for_create_true_in_worktree_mode_makes_a_worktree_not_a_bare_directory(
+    tmp_path,
+):
+    """Test 25. Routes through `vcs.init_repo`: the created directory is a real
+    checkout on its own branch (a `.git` *file*, not `mkdir`'s empty
+    directory), and the repo's tracked file is present."""
+    repo_root = _make_operator_repo(tmp_path / "operator_repo")
+    config = LoopConfig(
+        workspace_mode="worktree",
+        repo_root=str(repo_root),
+        worktree_root=str(tmp_path / "wt_root"),
+        vcs_enabled=True,
+    )
+
+    ws = workspace_for(
+        config.workspace_root, 1, create=True, config=config, repo_root=repo_root
+    )
+
+    assert ws.is_dir()
+    assert (ws / ".git").is_file(), "a worktree's .git is a file, not a directory"
+    assert (ws / "README.md").read_text(encoding="utf-8") == "the operators work\n"
+    # And it landed under worktree_root, not workspace_root — a plain `mkdir`
+    # would have used `root` (config.workspace_root) instead.
+    assert str(ws).startswith(str(Path(tmp_path / "wt_root").resolve().parent) or "")
+    assert "wt_root" in str(ws)
+
+
+def test_has_any_file_returns_true_in_a_worktree(tmp_path):
+    """Test 26. The `.git` *file* a worktree uses is excluded by the same path-
+    component rule as the directory scratch mode uses — the tests gate is back
+    on rather than reporting `na` against a real checkout."""
+    from agentloop.executor import _has_any_file
+
+    repo_root = _make_operator_repo(tmp_path / "operator_repo2")
+    config = LoopConfig(
+        workspace_mode="worktree",
+        repo_root=str(repo_root),
+        worktree_root=str(tmp_path / "wt_root2"),
+        vcs_enabled=True,
+    )
+    ws = workspace_for(
+        config.workspace_root, 7, create=True, config=config, repo_root=repo_root
+    )
+
+    assert _has_any_file(ws) is True
+
+
+def test_workspace_for_worktree_mode_collision_avoidance_hashes_the_absolute_repo_root(
+    tmp_path,
+):
+    """Two repositories sharing a basename land in different directories under
+    one shared `worktree_root` — the hash is over the absolute `repo_root`,
+    not the basename alone."""
+    from agentloop.executor import worktree_root_for
+
+    repo_a = _make_operator_repo(tmp_path / "a" / "repo")
+    repo_b = _make_operator_repo(tmp_path / "b" / "repo")
+    config = LoopConfig(
+        workspace_mode="worktree",
+        repo_root=str(repo_a),
+        worktree_root=str(tmp_path / "wt_root3"),
+        vcs_enabled=True,
+    )
+
+    assert worktree_root_for(config, repo_a) != worktree_root_for(config, repo_b)
+
+
+def test_clear_workspace_in_worktree_mode_routes_through_remove_worktree(tmp_path):
+    """`clear_workspace` must not `rmtree` a worktree — that would leave a stale
+    admin entry under `<repo_root>/.git/worktrees/<name>`."""
+    repo_root = _make_operator_repo(tmp_path / "operator_repo3")
+    config = LoopConfig(
+        workspace_mode="worktree",
+        repo_root=str(repo_root),
+        worktree_root=str(tmp_path / "wt_root4"),
+        vcs_enabled=True,
+    )
+    ws = workspace_for(
+        config.workspace_root, 3, create=True, config=config, repo_root=repo_root
+    )
+    assert ws.is_dir()
+    admin = repo_root / ".git" / "worktrees" / "task-3"
+    assert admin.is_dir()
+
+    # The recorded baseline `remove_worktree` needs to be verified against —
+    # in production this is what `Store.vcs_repo_pin` replays; here it is
+    # recomputed the same way `init_repo`'s mint did.
+    pin = vcs.config_pin(repo_root, repo_root)
+    ok = clear_workspace(
+        config.workspace_root, 3, config=config, repo_root=repo_root, pin=pin
+    )
+
+    assert ok is True
+    assert not ws.exists()
+    assert not admin.exists(), "rmtree alone would have left this stale entry"
+
+
+def _link_dir(link: Path, target: Path) -> bool:
+    """A directory link at `link` pointing at `target`, or False if this
+    platform/user cannot make one without privileges. Same helper shape as
+    `test_vcs_repo_pin_store.py`'s `_link_dir` — the alias must be a real
+    filesystem redirection the OS resolves, not merely a textually different
+    spelling `os.path.abspath` already collapses."""
+    import subprocess
+
+    try:
+        if os.name == "nt":
+            proc = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+                capture_output=True,
+                text=True,
+                shell=False,
+            )
+            return proc.returncode == 0 and link.exists()
+        os.symlink(target, link, target_is_directory=True)
+        return True
+    except Exception:
+        return False
+
+
+def test_worktree_dir_name_shares_key_for_a_real_filesystem_alias(tmp_path):
+    """`_worktree_dir_name` must key on the resolved repository location, not
+    the textual spelling of `repo_root` — the same class of bug as
+    `Store._repo_key`'s pre-fix defect. A junction/symlink is a genuine OS-level
+    alias of one physical repository; `_worktree_dir_name` must produce the
+    identical `<name>-<hash>` grouping key for both spellings, or
+    `worktree_root_for` sends the two spellings' worktrees to two different
+    directories and `agentloop workspace prune`, recomputing the path from
+    whatever spelling it is invoked with, silently fails to find (and so never
+    reclaims) a workspace created under the other spelling.
+
+    Watched failing against the pre-fix (lexical `abspath`-only) computation:
+    the alias produced a different hash (and, since the two directories have
+    different basenames here, a different name) from the canonical path."""
+    from agentloop.executor import _worktree_dir_name
+
+    canonical = tmp_path / "target-directory"
+    canonical.mkdir()
+    alias = tmp_path / "alias-of-it"
+    if not _link_dir(alias, canonical):
+        pytest.skip("this platform/user cannot create a directory junction/symlink")
+
+    assert _worktree_dir_name(str(canonical)) == _worktree_dir_name(str(alias))

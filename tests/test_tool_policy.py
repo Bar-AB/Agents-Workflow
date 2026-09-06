@@ -2474,8 +2474,8 @@ class _CallbackRunner(MockRunner):
         self._at_call = at_call
         self._callback = callback
 
-    def run(self, system_prompt, prompt, model, tools=None):
-        result = super().run(system_prompt, prompt, model, tools)
+    def run(self, system_prompt, prompt, model, tools=None, cwd=None):
+        result = super().run(system_prompt, prompt, model, tools, cwd)
         if len(self.calls) == self._at_call:
             self._callback()
         return result

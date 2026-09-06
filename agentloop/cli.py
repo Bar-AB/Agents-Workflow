@@ -13,6 +13,9 @@ agentloop serve [--host H] [--port P]   # live dashboard (spec §8)
 agentloop memory list|approve|reject|add
 agentloop tools list|approve|reject   # the agent-requested tool queue
 agentloop charter show|set|clear|history   # project-wide rules for every agent
+agentloop workspace prune [--repo-root PATH]     # remove terminal tasks' worktrees
+agentloop workspace rebless [--repo-root PATH]   # human sign-off on a changed
+                                                  # .git/config baseline (worktree mode)
 agentloop init-registry          # write default agents.json for editing
 """
 
@@ -26,6 +29,7 @@ import time
 from pathlib import Path
 
 from .config import LoopConfig
+from .executor import workspace_for
 from .loop import Loop
 from .models import Task, TaskStatus, ToolRequestStatus
 from .registry import DEFAULT_AGENTS, Registry
@@ -346,6 +350,138 @@ def _charter_cmd(store: Store, args) -> int:
     return 0
 
 
+_TERMINAL_STATUSES = (TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.ABORTED)
+
+
+def _workspace_cmd(store: Store, config: LoopConfig, args) -> int:
+    """`agentloop workspace prune|rebless` — the two operator-facing surfaces
+    slice 9's P2 review named as no longer optional.
+
+    `prune` removes the worktrees of tasks that reached a terminal state
+    (`done`/`failed`/`aborted`) and then runs a bare `git worktree prune` as a
+    catch-all, because `vcs.remove_worktree` correctly *refuses* a workspace
+    whose directory is already gone rather than repairing the stale admin
+    entry it leaves (see `vcs.prune_worktrees`'s docstring) — this command is
+    the only thing that clears that case.
+
+    `rebless` is the human-only surface `vcs._init_worktree`'s docstring names
+    as deliberately absent from P2: once a repository has a recorded config
+    baseline, a legitimate operator edit to `.git/config` (a new hook, a
+    filter) makes every later task on that repository refuse forever with
+    `config-changed`, because nothing else re-blesses it. This re-mints the
+    baseline from the config as it stands *now* and records it through
+    `Store.rebless_vcs_repo_pin` — an explicit, audited, never-automatic
+    action; no agent and no `vcs.py`/`loop.py` call path may reach it.
+
+    **`repo_root` resolution (P3 remediation cycle 3, HIGH 1).** `Store.
+    _repo_key`/`vcs.config_pin` resolve a relative `repo_root` (the config
+    default, `"."`) against *this process's* cwd — correct for the loop,
+    which runs as one long-lived process at a fixed cwd, but `agentloop
+    workspace rebless` is a separate, short-lived, human-invoked process
+    that may run from anywhere. Measured: with `repo_root: "."` and no
+    `--repo-root`, invoking `rebless` from inside a *different*, unrelated
+    git repository silently reblessed *that* repository — a real,
+    successful write, `rc=0`, a "success" message — while the intended
+    repository's actual `config-changed`-blocking pin was never touched. No
+    lexical resolution can recover "the right repository" from an
+    ambiguous relative default (both directories are equally valid
+    repositories from git's point of view), so this refuses the ambiguity
+    outright rather than guessing: a relative `repo_root` is only accepted
+    when the operator names the repository explicitly with `--repo-root`.
+    An absolute `repo_root` (via `--repo-root` or an absolute value in
+    `loopconfig.json`) is `os.path.abspath`'d once here and is then
+    cwd-independent for the rest of the call — the same lexical convention
+    `vcs._git`'s `-C` argument uses, and deliberately not `Path.resolve()`
+    (`config._is_within`'s realpath is for pure containment comparisons,
+    not for deciding what a git subprocess sees)."""
+    from . import vcs
+
+    repo_root_arg = args.repo_root or config.repo_root
+    if args.workspace_cmd == "prune":
+        if config.workspace_mode != "worktree":
+            # `repo_root` is unread in scratch mode (the proven-no-op
+            # contract), so it must not be able to break this fast path —
+            # checked *before* the relative-path refusal below.
+            print("workspace_mode is 'scratch' — nothing to prune.")
+            return 0
+
+    if not os.path.isabs(repo_root_arg):
+        print(
+            f"error: repo_root ({repo_root_arg!r}) is a relative path. "
+            f"'agentloop workspace {args.workspace_cmd}' is a human-only, "
+            f"security-relevant action and must not guess which repository "
+            f"a relative path means from an unknown cwd — pass an absolute "
+            f"--repo-root, or set an absolute repo_root in loopconfig.json.",
+            file=sys.stderr,
+        )
+        return 1
+    repo_root = os.path.abspath(repo_root_arg)
+    if args.workspace_cmd == "prune":
+        pin = store.vcs_repo_pin(repo_root)
+        removed, skipped = 0, 0
+        for t in store.list_tasks():
+            if t.kind != "task" or t.status not in _TERMINAL_STATUSES:
+                continue
+            ws = workspace_for(
+                config.workspace_root, t.id, config=config, repo_root=repo_root
+            )
+            if not ws.exists():
+                continue
+            result = vcs.remove_worktree(
+                ws,
+                config,
+                pin,
+                repo_root=repo_root,
+                task_id=t.id,
+                branch_prefix=config.vcs_branch_prefix,
+            )
+            if result.ok:
+                removed += 1
+                print(f"  task {t.id}: removed ({ws})")
+            else:
+                skipped += 1
+                print(f"  task {t.id}: not removed ({result.reason}) — {ws}")
+        # The catch-all: clears any *agentloop* admin entry `git worktree
+        # list` still reports for a directory that is already gone by some
+        # other means (a manual rm, a redo's rollback fallback) — the case
+        # `remove_worktree` refuses rather than repairs. Scoped to
+        # `vcs_branch_prefix` (HIGH 2, P3 remediation cycle 3): a bare
+        # `git worktree prune` is repo-wide and would clear the operator's
+        # own unrelated worktree registrations too.
+        pruned = vcs.prune_worktrees(
+            repo_root, config, branch_prefix=config.vcs_branch_prefix
+        )
+        if pruned.ok:
+            print(f"Pruned stale worktree registrations under {repo_root}.")
+        elif pruned.reason not in ("disabled", ""):
+            print(f"git worktree prune: {pruned.reason}")
+        print(f"{removed} worktree(s) removed, {skipped} skipped.")
+        return 0
+
+    if args.workspace_cmd == "rebless":
+        fingerprint = vcs.config_pin(repo_root, repo_root)
+        if not fingerprint:
+            print(
+                f"error: cannot read {repo_root}/.git/config — nothing to bless.",
+                file=sys.stderr,
+            )
+            return 1
+        old = store.vcs_repo_pin(repo_root)
+        store.rebless_vcs_repo_pin(repo_root, fingerprint, args.note)
+        if old:
+            print(
+                f"Repository baseline reblessed for {repo_root}: "
+                f"{old[:12]} -> {fingerprint[:12]}"
+            )
+        else:
+            print(
+                f"Repository baseline recorded for {repo_root}: "
+                f"{fingerprint[:12]} (was unpinned)."
+            )
+        return 0
+    return 0
+
+
 def _eval_cmd(store: Store, args) -> int:
     """Run an evaluation harness: per-verdict calibration, or whole-loop batch.
 
@@ -548,6 +684,23 @@ def main(argv: list[str] | None = None) -> int:
     cclear.add_argument("--note", default="")
     chsub.add_parser("history", help="Every version, oldest first")
 
+    ws = sub.add_parser("workspace", help="Worktree-mode workspace maintenance")
+    wssub = ws.add_subparsers(dest="workspace_cmd", required=True)
+    wsprune = wssub.add_parser(
+        "prune", help="Remove terminal tasks' worktrees; clear stale registrations"
+    )
+    wsprune.add_argument(
+        "--repo-root", default=None, help="Defaults to config.repo_root"
+    )
+    wsrebless = wssub.add_parser(
+        "rebless",
+        help="Human sign-off on a legitimately changed .git/config baseline",
+    )
+    wsrebless.add_argument(
+        "--repo-root", default=None, help="Defaults to config.repo_root"
+    )
+    wsrebless.add_argument("--note", default="", help="Why, for the audit trail")
+
     ev = sub.add_parser("eval", help="Evaluation harness (calibration / batch)")
     ev.add_argument("--runner", default="mock", choices=["claude", "openai", "mock"])
     ev.add_argument(
@@ -671,6 +824,27 @@ def _dispatch(args, store: Store, loop: Loop) -> int:
                         print(f"  blocked by: {', '.join(str(d) for d in unmet)}")
                 if t.plan_id and not store.is_plan_approved(t.plan_id):
                     print(f"  blocked by: plan {t.plan_id} (awaiting sign-off)")
+                # Slice 9 residual 4: a worktree survives DONE and lives
+                # outside the repository it works on (`worktree_root`), so an
+                # operator debugging a task can no longer just look beside
+                # their project directory — this is the other half of that
+                # trade, `agentloop workspace prune` being the first. Printed
+                # rather than probed for existence: the path is deterministic
+                # from config + task id whether or not anything has created it
+                # yet, and a task that never ran still has a workspace it
+                # *would* use.
+                repo_root = (
+                    os.path.abspath(loop.config.repo_root)
+                    if loop.config.workspace_mode == "worktree"
+                    else None
+                )
+                ws = workspace_for(
+                    loop.config.workspace_root,
+                    t.id,
+                    config=loop.config,
+                    repo_root=repo_root,
+                )
+                print(f"  workspace: {ws}")
             if t.escalation_reason:
                 print(f"  escalation: {t.escalation_reason}")
             print("  metrics:", json.dumps(store.task_metrics(t.id), indent=4))
@@ -723,6 +897,9 @@ def _dispatch(args, store: Store, loop: Loop) -> int:
 
     elif args.cmd == "charter":
         return _charter_cmd(store, args)
+
+    elif args.cmd == "workspace":
+        return _workspace_cmd(store, loop.config, args)
     return 0
 
 

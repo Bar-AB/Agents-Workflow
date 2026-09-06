@@ -179,6 +179,35 @@ def test_openai_runner_warns_when_it_drops_a_tool_allowlist(monkeypatch):
         r2.run("s", "p", "gpt-5-mini", [])
 
 
+def test_openai_runner_takes_a_cwd_positionally_and_drops_it_silently(
+    monkeypatch, tmp_path
+):
+    """The seam is one protocol, so this backend must *accept* `cwd` even
+    though it has no filesystem to resolve a path against. Ten lines of comment
+    in `runner.py` justify the silent drop and nothing pinned it: removing the
+    parameter left the whole suite green and surfaced only as a `TypeError`
+    inside `_with_retry` on a live pinned validator — three paid retries and an
+    `infra_error`, the exact shape already measured on the test doubles.
+
+    Passed **positionally**, because that is how `agents._invoke` calls the
+    seam: a keyword-only assertion would still pass for a runner that renamed
+    the parameter.
+    """
+    r, sent = _stubbed(
+        monkeypatch, _response(usage={"prompt_tokens": 7, "completion_tokens": 2})
+    )
+    with warnings.catch_warnings():
+        # Silent, unlike the `tools` drop one test above: a working directory is
+        # *meaningless* to a chat-completions call rather than dangerous, so a
+        # warning would fire on every attempt of every pinned role and report
+        # nothing an operator can act on.
+        warnings.simplefilter("error")
+        result = r.run("s", "p", "gpt-5-mini", None, str(tmp_path))
+    assert result.output.startswith("VERDICT: approve")
+    # Dropped means dropped: it must not reach the wire either.
+    assert str(tmp_path) not in json.dumps(sent["payload"])
+
+
 def test_openai_runner_needs_its_key_and_never_leaks_it(monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     with pytest.raises(RuntimeError) as exc:
