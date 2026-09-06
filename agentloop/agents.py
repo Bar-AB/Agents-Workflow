@@ -1027,15 +1027,15 @@ def run_planner(
 ) -> RunResult:
     """Decompose a goal into a task graph (roadmap slice 3).
 
-    `cwd` is a seam left open for slice 9, and it is `None` from every caller
-    today. A plan row has no task workspace — there is no `task-<id>`
-    directory for a goal that has not been decomposed yet - so in scratch mode
-    there is nothing honest to point the planner at, and pointing it at the
-    orchestrator's directory is the bug the rest of this change removes. In
-    worktree mode P4 will pass `repo_root` here (loop integration; P3 only
-    wires `config`/`executor`/the worker prompt), which is the *operator's*
-    repo read-only: the planner declares `file_read`, not `file_io`, so
-    surveying a codebase it may not modify is exactly what the role is for.
+    `cwd` is `None` from a scratch-mode caller and the operator's `repo_root`
+    from a worktree-mode one — slice 9 P4: `Loop.plan` passes
+    `str(self._worktree_repo_root())` when it is not `None`. A plan row has no
+    task workspace — there is no `task-<id>` directory for a goal that has not
+    been decomposed yet - so in scratch mode there is nothing honest to point
+    the planner at, and pointing it at the orchestrator's directory was the
+    bug slice 9 P1 removed. In worktree mode this is the *operator's* repo,
+    read-only: the planner declares `file_read`, not `file_io`, so surveying a
+    codebase it may not modify is exactly what the role is for.
 
     Recorded as its own attempt (kind='planner') against the plan row, so the
     decomposition is auditable and its cost is attributed like any other agent

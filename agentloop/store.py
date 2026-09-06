@@ -299,8 +299,10 @@ CREATE TABLE IF NOT EXISTS vcs_pins (
 -- pre-existing and agent-writable, so the pin there is a fact about the
 -- repository and a per-task row let task 1 poison the config and task 2 mint a
 -- fresh pin over the poison. One row per repository, `repo_key` *is* the
--- primary key, and it is the normalised absolute path so two spellings of one
--- checkout cannot become two baselines a lookup would have to choose between.
+-- primary key, and it is `realpath`-then-`normcase` (see `Store._repo_key`)
+-- so two spellings of one checkout -- including a junction, a symlink, a
+-- mapped drive or a case difference, not merely a trailing slash -- cannot
+-- become two baselines a lookup would have to choose between.
 --
 -- A live fact with one current value, not history, exactly like `vcs_pins`; and
 -- no foreign key, for the same reason.
@@ -1775,11 +1777,40 @@ class Store:
 
     @staticmethod
     def _repo_key(repo_root: str) -> str:
-        """One repository, one key. `abspath` (never `realpath`) matches
-        `vcs._git`'s deliberate lexical normalisation: resolving would follow a
-        junction at the repo root and quietly answer a question about a
-        different directory than the one the operator configured."""
-        return os.path.normcase(os.path.abspath(str(repo_root)))
+        """One repository, one key — `realpath` then `normcase`, **not**
+        `abspath`.
+
+        This computation has no subprocess to spawn: it is a pure key
+        derivation over a string, feeding a `SELECT`/`INSERT` and nothing
+        else. That is exactly `config._is_within`'s distinction, and it
+        resolves the *other* way from `vcs._git`'s `-C` argument (which stays
+        lexical on purpose, because *that* value becomes a subprocess's
+        working directory and a junction substituting the directory git
+        actually runs in is the escape `_guard_worktree`'s identity checks
+        exist to close). A pure key has nothing for a junction to substitute,
+        so leaving it lexical here bought nothing and cost the property this
+        key exists to hold: `vcs.config_pin` fingerprints
+        `<repo_root>/.git/config` through an actual filesystem read
+        (`stat`/`read_bytes`), which the OS transparently resolves through a
+        symlink, a junction, a mapped drive or a case difference — so two
+        *textually different* spellings of one physical repository produce
+        the identical fingerprint but, under a lexical `_repo_key`, two
+        different store keys. The alias then reads as a repository the store
+        has never pinned, and `_init_worktree` treats an absent baseline as
+        "mint a fresh one" — precisely the pin-laundering escape P2's C3 was
+        built to close, reopened through the store key's identity rather than
+        the task id. `realpath` (matching `config._is_within`'s pairing, not
+        `vcs._git`'s) makes the two spellings collapse to one key, exactly as
+        they already collapse to one fingerprint; `normcase` after it is the
+        same Windows case/separator normalisation `_is_within` applies for
+        the same reason. An unresolvable path (a dangling reference, a
+        mixed-drive path) falls back to plain `abspath` rather than raising —
+        a key must always be computable, and failing to resolve a spelling
+        is not evidence the two spellings differ."""
+        try:
+            return os.path.normcase(os.path.realpath(str(repo_root)))
+        except Exception:
+            return os.path.normcase(os.path.abspath(str(repo_root)))
 
     def set_vcs_repo_pin(self, repo_root: str, fingerprint: str) -> None:
         """Record the config-pin **baseline** for a repository worked on in

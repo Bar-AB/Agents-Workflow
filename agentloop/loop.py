@@ -682,7 +682,24 @@ class Loop:
             self.store.set_status(plan_task, TaskStatus.NEEDS_HUMAN, reason=str(exc))
             return plan_task
 
+        # Slice 9 P4: the operator's repository, read-only (the planner
+        # declares `file_read`, not `file_io`, so surveying a codebase it may
+        # not modify is what the role is for) — `None` in scratch mode, where
+        # a plan row has no task workspace to point it at.
+        repo_root = self._worktree_repo_root()
         try:
+            # HIGH-3 (slice 9 remediation): every worker/validator call site is
+            # preceded by `_require_workspace`, which refuses with a clean
+            # config error rather than letting the SDK's `CLIConnectionError`
+            # for a missing cwd fall into `_with_retry`'s transient branch —
+            # three paid retries and an `infra_error` blaming the network for
+            # a permanent condition (a `repo_root` typo, an unexpanded `~`, a
+            # deleted checkout). `run_planner`'s `cwd` had no equivalent guard.
+            # Scoped to worktree mode: scratch mode passes `cwd=None`, which
+            # `_require_workspace` would refuse as "does not exist" for a
+            # reason that has nothing to do with a missing repository.
+            if repo_root is not None:
+                self._require_workspace("planner", repo_root)
             result = self._with_retry(
                 plan_task,
                 "planner",
@@ -693,16 +710,7 @@ class Loop:
                     plan_task,
                     self.memory,
                     config=self.config,
-                    # Slice 9 P4: the operator's repository, read-only (the
-                    # planner declares `file_read`, not `file_io`, so
-                    # surveying a codebase it may not modify is what the role
-                    # is for) — `None` in scratch mode, where a plan row has
-                    # no task workspace to point it at.
-                    cwd=(
-                        str(repo_root)
-                        if (repo_root := self._worktree_repo_root()) is not None
-                        else None
-                    ),
+                    cwd=(str(repo_root) if repo_root is not None else None),
                 ),
             )
         except _ConfigError as exc:
@@ -1005,8 +1013,30 @@ class Loop:
         records when either snapshot was **truncated** by the reporting cap, or
         when the `after` snapshot could not be taken at all: over a real
         checkout more than the cap's worth of changed paths is ordinary, and a
-        detection that silently stops looking is worse than none."""
-        if before is None or not before.ok:
+        detection that silently stops looking is worse than none.
+
+        That "worse than none" reasoning has to apply symmetrically. `before`
+        arrives already folded to `None` for the case with nothing to watch
+        (scratch mode, or vcs not ready) — silence there is correct, there was
+        never a snapshot to fail. But `before is not None and not before.ok`
+        means a snapshot was *attempted* and the read itself failed, which is
+        exactly the after-side failure this function already logs a few lines
+        down — dropping it here instead was the asymmetry HIGH-1 named."""
+        if before is None:
+            return
+        if not before.ok:
+            self.store.log_event(
+                task_id,
+                "validator_write_detection_failed",
+                {
+                    "reason": before.reason,
+                    "note": (
+                        "The workspace could not be read before the "
+                        "validator ran, so whether it wrote anything is "
+                        "unknown. This is not a claim that it did not."
+                    ),
+                },
+            )
             return
         after = vcs.working_tree_state(
             ws,
@@ -1169,11 +1199,18 @@ class Loop:
         not a worktree gitfile) — `repo_status` is the narrower entry point
         for reading the operator's own repository directly, pinned against
         the same repository-level baseline every worktree-mode call in this
-        class already reads (`Store.vcs_repo_pin`)."""
+        class already reads (`Store.vcs_repo_pin`).
+
+        `None` means only "nothing to snapshot" (`repo_root is None`) — an
+        attempted-and-failed read is returned as-is, `ok=False` and all, not
+        folded away. HIGH-1's remediation: this used to fold `not result.ok`
+        into `None` too, which made a genuine read failure indistinguishable
+        from scratch mode at every caller, and `_vcs_detect_out_of_branch_
+        write`'s before-side silently treated a failed snapshot as "nothing to
+        watch" instead of "a gap in what was watched"."""
         if repo_root is None:
             return None
-        result = vcs.repo_status(repo_root, self.config, pin=pin)
-        return result if result.ok else None
+        return vcs.repo_status(repo_root, self.config, pin=pin)
 
     def _vcs_detect_out_of_branch_write(
         self,
@@ -1199,18 +1236,41 @@ class Loop:
         like a barrier is worse than an absent one — an operator who believes
         the escape is closed stops looking for it.
 
-        `before=None` covers both "scratch mode" and "the snapshot itself
-        failed" (`_vcs_snapshot_repo_root` folds `not result.ok` into `None`)
-        — there is nothing to diff against in either case, and this must not
-        manufacture a false positive by comparing against an empty baseline."""
+        `before=None` covers only "nothing to snapshot" (scratch mode, or vcs
+        not ready) — there is nothing to diff against, and this must not
+        manufacture a false positive by comparing against an empty baseline.
+        `before is not None and not before.ok` is the other case, HIGH-1's
+        remediation target: a snapshot was attempted and the read itself
+        failed. That used to be folded into the same `None` as "nothing to
+        snapshot" (`_vcs_snapshot_repo_root` no longer does that), which made
+        the before-side silently drop a detection gap the after-side already
+        logged explicitly a few lines down — the exact asymmetry this
+        function's own "detection that silently stops looking is worse than
+        none" is about."""
         if before is None:
             return
-        after = self._vcs_snapshot_repo_root(repo_root, pin)
-        if after is None:
+        if not before.ok:
             self.store.log_event(
                 task_id,
                 "worktree_write_detection_failed",
                 {
+                    "reason": before.reason,
+                    "note": (
+                        "The main repository could not be read before the "
+                        "test command ran, so whether it wrote outside the "
+                        "task's branch is unknown. This is not a claim that "
+                        "it did not."
+                    ),
+                },
+            )
+            return
+        after = self._vcs_snapshot_repo_root(repo_root, pin)
+        if after is None or not after.ok:
+            self.store.log_event(
+                task_id,
+                "worktree_write_detection_failed",
+                {
+                    "reason": after.reason if after is not None else "",
                     "note": (
                         "The main repository could not be re-read after the "
                         "test command ran, so whether it wrote outside the "

@@ -623,18 +623,50 @@ def _worktree_dir_name(repo_root: str | Path) -> str:
     """`<repo-name>-<short-hash>` — the directory one repository's worktrees
     share under `worktree_root`.
 
-    Hashed over the **absolute** `repo_root` (P3), not the basename alone, so
-    two checkouts of the same repository at different paths — or two unrelated
+    Hashed over the **resolved** `repo_root` (P3 introduced the hash;
+    remediation-5 fixed what it resolved over), not the basename alone, so two
+    checkouts of the same repository at different paths — or two unrelated
     repositories that happen to share a basename — cannot collide in one
     shared root and silently mix one repository's task branches with
-    another's. `os.path.normcase` before hashing so Windows' case-insensitive
-    paths and a `/` vs `\\` spelling hash identically; POSIX is unaffected
-    (`normcase` is identity there). `abspath`, lexically — the path-shaping
-    convention `workspace_for` already documents, not a security comparison —
-    the hash only needs to be *stable*, not to resolve every junction the way
-    `vcs._guard`'s identity checks must."""
-    abs_root = os.path.normcase(os.path.abspath(str(repo_root)))
-    name = Path(str(repo_root)).name or "repo"
+    another's.
+
+    `realpath` before `normcase`, **not** lexical `abspath` — this is exactly
+    `Store._repo_key`'s distinction (see its docstring) and resolves the same
+    way for the same reason: this computation has no subprocess to spawn, it
+    is a pure key derivation over a string feeding a directory-name decision,
+    which is `config._is_within`'s category, not `vcs._git`'s `-C` argument
+    (which stays lexical on purpose because *that* value becomes a
+    subprocess's cwd, and a junction substituting the directory git actually
+    runs in is the escape `vcs._guard`'s identity checks exist to close). A
+    pure key has nothing for a junction to substitute, so staying lexical here
+    bought nothing and cost the property this key exists to hold:
+    `worktree_root_for` is where every task's worktree for one repository is
+    supposed to live, and `agentloop workspace prune` recomputes this same
+    path from whatever spelling of `repo_root` the current invocation was
+    given. Measured with a real Windows junction: a lexical hash produced a
+    different `<name>-<hash>` for the target directory and a junction alias of
+    it, so a workspace created under one spelling was never found — and so
+    never reclaimed — by `prune` invoked with the other, silently, with no
+    error, no event and no warning. `os.path.normcase` after resolving so
+    Windows' case-insensitive paths and a `/` vs `\\` spelling still hash
+    identically; POSIX is unaffected (`normcase` is identity there). An
+    unresolvable path (a dangling reference, a mixed-drive path) falls back to
+    plain `abspath` rather than raising — a key must always be computable, and
+    failing to resolve a spelling is not evidence the two spellings differ.
+
+    The name prefix is taken from the **resolved** path too, not the given
+    spelling — a junction or symlink alias can carry an arbitrary basename of
+    its own (e.g. a symlink named `alias-of-it` pointing at a directory named
+    `target-directory`), and deriving the name from the unresolved spelling
+    would leave two aliases sharing an identical hash but disagreeing on the
+    human-readable prefix, so the two still could not produce the one grouping
+    key this function exists to guarantee."""
+    try:
+        resolved = os.path.realpath(str(repo_root))
+    except Exception:
+        resolved = os.path.abspath(str(repo_root))
+    abs_root = os.path.normcase(resolved)
+    name = Path(resolved).name or "repo"
     digest = hashlib.sha256(abs_root.encode("utf-8")).hexdigest()[:8]
     return f"{name}-{digest}"
 

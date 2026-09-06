@@ -515,9 +515,19 @@ def _guard_worktree(
 
     What does *not* change is the discipline. Four conditions, all fail-closed,
     any error refuses, and the two that matter are anchored by **identity**
-    against a location the agent cannot write: `repo_root` is operator config,
-    where scratch mode's anchor (`<ws>`) sits inside the agent-writable
-    workspace. Concretely:
+    against `repo_root`, the operator's own checkout — unlike scratch mode's
+    anchor (`<ws>`), which sits *inside* the agent-writable workspace. **M-1
+    (slice 9 remediation): this is not "a location the agent cannot write" —
+    it is a location the agent cannot *substitute* for another one.**
+    `<repo_root>/.git/config` is pre-existing and ordinary, and a worker
+    running `git config --local` from inside its worktree writes it, the same
+    documented residual `config_pin` exists to catch (see its own docstring,
+    and the CRITICAL fix reproducing exactly that path-laundering). This guard
+    closes every *unprivileged filesystem* escape — a junction, a symlink, a
+    rewritten `.git/commondir`, a sibling worktree's admin directory pointed at
+    this one — correctly; it was never meant to, and does not, make
+    `repo_root` invulnerable to a command the worker itself is allowed to run
+    inside it. Concretely:
 
     - `<ws>/.git` is a regular file. A directory here is the scratch shape and
       must take the scratch branch.

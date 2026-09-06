@@ -307,6 +307,25 @@ class LoopConfig:
         """
         for f in fields(self):
             setattr(self, f.name, _coerced(f.name, f.type, getattr(self, f.name)))
+        # HIGH-4 (slice 9 remediation): expanded exactly once, here, so every
+        # downstream consumer of `repo_root` sees the same value `_is_within`
+        # validates below. Before this fix `_is_within` expanded `~` on its
+        # own *copy* for the containment check only, while `loop.py`'s
+        # `_worktree_repo_root` read the raw, unexpanded field with a bare
+        # `os.path.abspath` -- so a config-valid `repo_root: "~/myproj"`
+        # passed validation against the expanded path and then ran against
+        # the literal, never-existing `~/myproj` relative to the process's
+        # own cwd. `executor.worktree_root_for` already expands
+        # `worktree_root` at its own use site; `repo_root` gets the same
+        # treatment, but centralised rather than duplicated at each call
+        # site, since a value expanded twice is idempotent but a value
+        # expanded at only *some* of its call sites is exactly this bug.
+        # Unconditional (not scoped to worktree mode) because it is a no-op
+        # for the `"."` default and for any scratch-mode value that never
+        # contains `~` -- scoping it would only reintroduce a second
+        # normalisation path to keep in sync with the unconditional one
+        # `_is_within` already applies.
+        self.repo_root = os.path.expanduser(str(self.repo_root))
         # An unknown mode raises rather than degrading to 'scratch' (the
         # `memory_retrieval_backend` precedent): which mode ran is part of how
         # the run behaved, and silently substituting one is exactly the kind

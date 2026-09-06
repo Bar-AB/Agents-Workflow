@@ -9,7 +9,35 @@ is the whole reason it is not kept under `.git/` - so it goes in the store.
 
 from __future__ import annotations
 
+import os
+import subprocess
+
+import pytest
+
+from agentloop import vcs
 from agentloop.store import Store
+
+
+def _link_dir(link, target) -> bool:
+    """A directory link at `link` pointing at `target`, or False if this
+    platform will not make one without privileges. Mirrors `test_vcs.py`'s
+    `_link_dir` helper (a junction on Windows via `mklink /J`, a symlink
+    elsewhere) — the alias has to be a real filesystem redirection the OS
+    resolves, not merely a textually different spelling `os.path.abspath`
+    already collapses."""
+    try:
+        if os.name == "nt":
+            proc = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+                capture_output=True,
+                text=True,
+                shell=False,
+            )
+            return proc.returncode == 0 and link.exists()
+        os.symlink(target, link, target_is_directory=True)
+        return True
+    except Exception:
+        return False
 
 
 def test_a_repo_baseline_is_absent_until_recorded():
@@ -86,3 +114,65 @@ def test_rebless_never_records_config_bytes_only_fingerprints():
     store.rebless_vcs_repo_pin("/a/repo", "abc123", note="")
     events = [e for e in store.events() if e["kind"] == "vcs_repo_pin_reblessed"]
     assert secret_looking not in str(events[0]["payload"])
+
+
+# -- CRITICAL remediation: a real alias must not reopen C3's pin-laundering
+# escape --------------------------------------------------------------------
+
+
+def test_a_real_filesystem_alias_of_one_repository_shares_its_baseline(tmp_path):
+    """`_repo_key` must key on the resolved location, not the spelling.
+
+    A junction/symlink is a *real* alias the OS resolves transparently — unlike
+    a trailing slash or a `./` component, which `os.path.abspath` already
+    collapses with no actual normalisation. `vcs.config_pin` reads through
+    `Path(...).stat()`/`read_bytes()`, so it returns the identical fingerprint
+    for both spellings of one physical `.git/config`. If `Store._repo_key`
+    is purely lexical, the alias reads as a repository the store has never
+    seen — an absent baseline, which `vcs._init_worktree` treats as "mint a
+    fresh one" rather than "refuse" (exactly the escape P2's C3 closed,
+    reopened through the store key's identity instead of the task id).
+
+    Watched failing against the pre-fix (`os.path.abspath`-only) `_repo_key`:
+    the alias's baseline read `""` instead of the canonical spelling's
+    recorded pin."""
+    canonical = tmp_path / "canonical-repo"
+    canonical.mkdir()
+    alias = tmp_path / "alias-repo"
+    if not _link_dir(alias, canonical):
+        pytest.skip("this platform/user cannot create a directory junction/symlink")
+
+    subprocess.run(["git", "init", "-q"], cwd=str(canonical), check=True, shell=False)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "init",
+        ],
+        cwd=str(canonical),
+        check=True,
+        shell=False,
+    )
+
+    # Confirm the alias is a genuine filesystem redirection to the same
+    # physical repository before asserting anything about the store: the
+    # config-pin fingerprint, computed by reading actual bytes through the
+    # OS, must already agree across both spellings.
+    canonical_fingerprint = vcs.config_pin(canonical)
+    alias_fingerprint = vcs.config_pin(alias)
+    assert canonical_fingerprint != ""
+    assert canonical_fingerprint == alias_fingerprint
+
+    store = Store(":memory:")
+    store.set_vcs_repo_pin(str(canonical), canonical_fingerprint)
+
+    # The real bug: the alias must resolve to the SAME baseline, not read as
+    # an unpinned, never-before-seen repository.
+    assert store.vcs_repo_pin(str(alias)) == canonical_fingerprint

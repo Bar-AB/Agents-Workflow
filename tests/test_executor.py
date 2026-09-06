@@ -713,3 +713,51 @@ def test_clear_workspace_in_worktree_mode_routes_through_remove_worktree(tmp_pat
     assert ok is True
     assert not ws.exists()
     assert not admin.exists(), "rmtree alone would have left this stale entry"
+
+
+def _link_dir(link: Path, target: Path) -> bool:
+    """A directory link at `link` pointing at `target`, or False if this
+    platform/user cannot make one without privileges. Same helper shape as
+    `test_vcs_repo_pin_store.py`'s `_link_dir` — the alias must be a real
+    filesystem redirection the OS resolves, not merely a textually different
+    spelling `os.path.abspath` already collapses."""
+    import subprocess
+
+    try:
+        if os.name == "nt":
+            proc = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+                capture_output=True,
+                text=True,
+                shell=False,
+            )
+            return proc.returncode == 0 and link.exists()
+        os.symlink(target, link, target_is_directory=True)
+        return True
+    except Exception:
+        return False
+
+
+def test_worktree_dir_name_shares_key_for_a_real_filesystem_alias(tmp_path):
+    """`_worktree_dir_name` must key on the resolved repository location, not
+    the textual spelling of `repo_root` — the same class of bug as
+    `Store._repo_key`'s pre-fix defect. A junction/symlink is a genuine OS-level
+    alias of one physical repository; `_worktree_dir_name` must produce the
+    identical `<name>-<hash>` grouping key for both spellings, or
+    `worktree_root_for` sends the two spellings' worktrees to two different
+    directories and `agentloop workspace prune`, recomputing the path from
+    whatever spelling it is invoked with, silently fails to find (and so never
+    reclaims) a workspace created under the other spelling.
+
+    Watched failing against the pre-fix (lexical `abspath`-only) computation:
+    the alias produced a different hash (and, since the two directories have
+    different basenames here, a different name) from the canonical path."""
+    from agentloop.executor import _worktree_dir_name
+
+    canonical = tmp_path / "target-directory"
+    canonical.mkdir()
+    alias = tmp_path / "alias-of-it"
+    if not _link_dir(alias, canonical):
+        pytest.skip("this platform/user cannot create a directory junction/symlink")
+
+    assert _worktree_dir_name(str(canonical)) == _worktree_dir_name(str(alias))

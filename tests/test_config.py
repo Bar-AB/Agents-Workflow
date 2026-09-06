@@ -122,3 +122,51 @@ def test_scratch_mode_is_a_proven_no_op_over_the_whole_observable_dataclass():
     assert cfg.worktree_root == "~/.agentloop/ws"
     assert cfg.vcs_base_ref == "HEAD"
     assert cfg.vcs_branch_prefix == "agentloop/task-"
+
+
+# -- HIGH-4 (slice 9 remediation): `~` in repo_root, expanded once ------------
+
+
+def test_repo_root_containing_a_tilde_is_expanded_at_config_load(monkeypatch, tmp_path):
+    """Before this fix, `_is_within` expanded `~` on its own copy for the
+    containment check only, while `loop._worktree_repo_root` read the raw
+    field with a bare `os.path.abspath` — so a config-valid
+    `repo_root: "~/myproj"` passed validation against the *expanded* path and
+    then ran, every task, against the literal, never-existing `~/myproj`
+    relative to the process's own cwd. Expanded once, at load, so every
+    consumer of `config.repo_root` — `_is_within` here and
+    `loop._worktree_repo_root` downstream — sees the identical value."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    cfg = LoopConfig(
+        workspace_mode="worktree",
+        repo_root="~/myproj",
+        worktree_root=str(tmp_path / "wt"),
+    )
+    assert cfg.repo_root == os.path.expanduser("~/myproj")
+    assert "~" not in cfg.repo_root
+
+
+def test_a_tilde_repo_root_still_works_with_the_containment_check(
+    monkeypatch, tmp_path
+):
+    """Confirms the fix doesn't break the existing refusal: the check would
+    now be comparing an already-expanded value against itself, and expanding
+    twice must be idempotent, not a false negative or a false positive."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    repo = tmp_path / "myproj"
+    repo.mkdir()
+    with pytest.raises(ValueError):
+        LoopConfig(
+            workspace_mode="worktree",
+            repo_root="~/myproj",
+            worktree_root="~/myproj/ws",  # inside repo_root — must still refuse
+        )
+
+
+def test_the_default_dot_repo_root_is_unaffected_by_expansion():
+    """Scratch mode's proven-no-op contract: `expanduser(".")` is `"."`
+    unchanged, so this fix must not perturb the default."""
+    cfg = LoopConfig()
+    assert cfg.repo_root == "."
