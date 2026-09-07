@@ -7,6 +7,7 @@ import type {
   EventRow,
   MemoryFact,
   LoopConfigView,
+  RepoConfigUpdate,
   RunMetrics,
   Task,
   TaskDetail,
@@ -47,6 +48,12 @@ export const api = {
       (r) => r.events,
     ),
   config: () => get<LoopConfigView>('/api/config'),
+
+  // Takes effect only on the next `agentloop serve`/`run` process — never the
+  // one that served this request, so the panel must say so rather than imply
+  // it already applied.
+  setRepoConfig: (repo_root: string, workspace_mode: string) =>
+    post<RepoConfigUpdate>('/api/config/repo', { repo_root, workspace_mode }),
 
   // `taskId` narrows to one task's rows, which is what `TaskDetail` shows inline
   // when a task is parked awaiting a decision. Server-side filtering rather than
