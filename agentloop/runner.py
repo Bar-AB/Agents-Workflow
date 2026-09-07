@@ -652,7 +652,13 @@ class ClaudeSDKRunner:
         return ClaudeAgentOptions(
             system_prompt=system_prompt,
             model=model,
-            max_turns=25,
+            # 25 was measured too low for a real worker round against a real
+            # workspace (write file(s), run tests, fix, re-run): the SDK cuts
+            # the turn off mid-task with `error_max_turns`, and the *next*
+            # attempt's resumed session then reports a confusing secondary
+            # "success" error on top of it. 80 is headroom, not a promise —
+            # a genuinely stuck agent still hits it and escalates safely.
+            max_turns=80,
             allowed_tools=allowed,
             cwd=cwd,
         )

@@ -337,4 +337,20 @@ export interface LoopConfigView {
   // allowlist is side-effecting and needs a human.
   tool_readonly_allowlist: string[]
   gate_declared_tools: boolean
+  // slice 9: which repository (if any) task workspaces are checked out from,
+  // and whether they are throwaway scratch directories or real `git worktree`
+  // checkouts of it. Changing either takes effect only on the next
+  // `agentloop serve` / `agentloop run` process — this is a read of the
+  // config the running process already loaded, not a live knob.
+  repo_root: string
+  workspace_mode: string
+}
+
+// Mirrors the POST /api/config/repo request body and its 200 response (same
+// shape echoed back). A 400 is a validation failure (relative path, or a path
+// that is not an existing directory) and carries a plain-text error message
+// rather than this shape.
+export interface RepoConfigUpdate {
+  repo_root: string
+  workspace_mode: string
 }

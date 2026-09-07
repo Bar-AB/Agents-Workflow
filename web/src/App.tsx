@@ -4,13 +4,14 @@ import { CharterPanel } from './components/CharterPanel'
 import { EventFeed } from './components/EventFeed'
 import { MemoryPanel } from './components/MemoryPanel'
 import { NewTaskForm } from './components/NewTaskForm'
+import { RepoConfigPanel } from './components/RepoConfigPanel'
 import { StatBar } from './components/StatBar'
 import { ToolRequestPanel } from './components/ToolRequestPanel'
 import { TaskBoard } from './components/TaskBoard'
 import { TaskDetail } from './components/TaskDetail'
 import { useLiveLoop } from './useLiveLoop'
 
-type Tab = 'detail' | 'new' | 'memory' | 'tools' | 'charter'
+type Tab = 'detail' | 'new' | 'memory' | 'tools' | 'charter' | 'repo'
 
 export default function App() {
   const {
@@ -110,6 +111,12 @@ export default function App() {
             >
               Charter
             </button>
+            <button
+              className={`tab ${tab === 'repo' ? 'on' : ''}`}
+              onClick={() => setTab('repo')}
+            >
+              Repo
+            </button>
           </div>
 
           {tab === 'new' && <NewTaskForm onCreated={() => void refresh()} />}
@@ -123,6 +130,7 @@ export default function App() {
             />
           )}
           {tab === 'charter' && <CharterPanel />}
+          {tab === 'repo' && <RepoConfigPanel />}
 
           <AgentPanel agents={agents} tasks={tasks} />
           <EventFeed events={events} />
