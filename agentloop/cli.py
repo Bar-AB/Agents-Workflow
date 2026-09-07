@@ -876,7 +876,8 @@ def _dispatch(args, store: Store, loop: Loop) -> int:
             print(f"{ev['ts']:.0f} {ev['kind']:20s} {json.dumps(ev['payload'])[:120]}")
 
     elif args.cmd == "serve":
-        config = LoopConfig.load(args.config or "loopconfig.json")
+        config_path = args.config or "loopconfig.json"
+        config = LoopConfig.load(config_path)
         serve_forever(
             store,
             loop,
@@ -884,6 +885,7 @@ def _dispatch(args, store: Store, loop: Loop) -> int:
             config,
             args.host,
             args.port,
+            config_path=config_path,
         )
 
     elif args.cmd == "eval":

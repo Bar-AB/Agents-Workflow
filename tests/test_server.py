@@ -1123,3 +1123,219 @@ def test_a_legitimate_request_writes_no_refusal_event(live):
     host = base.split("//", 1)[1]
     raw_request(base, "GET", "/api/tasks", {"Host": host})
     assert not [e for e in store.events() if e["kind"] == "dashboard_refused"]
+
+
+# -- repo_root / workspace_mode (slice 9 dashboard wiring) -------------------
+
+
+@pytest.fixture()
+def live_cfg(tmp_path):
+    """Like `live`, but with a real loopconfig.json on disk for
+    `POST /api/config/repo` to edit, seeded with an unrelated key so a test
+    can prove the write leaves it alone."""
+    store = Store(tmp_path / "srv.db")
+    config = LoopConfig(
+        db_path=store.db_path,
+        workspace_root=str(tmp_path / "ws"),
+        allow_test_exec=False,
+        vcs_enabled=False,
+        stream_poll_seconds=0.05,
+    )
+    config_path = tmp_path / "loopconfig.json"
+    config_path.write_text(
+        json.dumps({"max_revisions": 7}, indent=2), encoding="utf-8"
+    )
+    loop = Loop(store, MockRunner(), Registry.load(), config)
+    server = serve(
+        store,
+        loop,
+        Registry.load(),
+        config,
+        host="127.0.0.1",
+        port=0,
+        config_path=str(config_path),
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        yield base, store, loop, config, config_path
+    finally:
+        server._shutdown_flag.set()
+        server.shutdown()
+        server.server_close()
+        store.close()
+
+
+def test_config_endpoint_exposes_repo_root_and_workspace_mode(live):
+    """GET /api/config now carries the two slice-9 knobs, matching the live
+    `LoopConfig` the loop/registry actually use."""
+    base, _, _, config = live
+    _, body = get(base, "/api/config")
+    assert body["repo_root"] == config.repo_root
+    assert body["workspace_mode"] == config.workspace_mode
+
+
+def test_post_config_repo_happy_path_merges_into_the_file(live_cfg, tmp_path):
+    base, _store, _loop, _config, config_path = live_cfg
+    repo = tmp_path / "existing-repo"
+    repo.mkdir()
+
+    status, body = post(
+        base,
+        "/api/config/repo",
+        {"repo_root": str(repo), "workspace_mode": "worktree"},
+    )
+    assert status == 200
+    assert body == {"repo_root": str(repo), "workspace_mode": "worktree"}
+
+    on_disk = json.loads(config_path.read_text(encoding="utf-8"))
+    assert on_disk["repo_root"] == str(repo)
+    assert on_disk["workspace_mode"] == "worktree"
+    # The pre-existing, unrelated key survives the merge untouched.
+    assert on_disk["max_revisions"] == 7
+
+
+def test_post_config_repo_rejects_a_relative_path(live_cfg):
+    base, _store, _loop, _config, config_path = live_cfg
+    before = config_path.read_text(encoding="utf-8")
+
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        post(
+            base,
+            "/api/config/repo",
+            {"repo_root": "relative/path", "workspace_mode": "worktree"},
+        )
+    assert exc.value.code == 400
+    # No file write happened: byte-for-byte unchanged.
+    assert config_path.read_text(encoding="utf-8") == before
+
+
+def test_post_config_repo_rejects_a_missing_directory(live_cfg, tmp_path):
+    base, _store, _loop, _config, config_path = live_cfg
+    before = config_path.read_text(encoding="utf-8")
+    missing = tmp_path / "does-not-exist"
+
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        post(
+            base,
+            "/api/config/repo",
+            {"repo_root": str(missing), "workspace_mode": "worktree"},
+        )
+    assert exc.value.code == 400
+    assert config_path.read_text(encoding="utf-8") == before
+
+    # Also refused when the absolute path exists but is a file, not a dir.
+    a_file = tmp_path / "a-file.txt"
+    a_file.write_text("not a directory", encoding="utf-8")
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        post(
+            base,
+            "/api/config/repo",
+            {"repo_root": str(a_file), "workspace_mode": "worktree"},
+        )
+    assert exc.value.code == 400
+    assert config_path.read_text(encoding="utf-8") == before
+
+
+def test_post_config_repo_rejects_a_bad_workspace_mode(live_cfg, tmp_path):
+    base, _store, _loop, _config, config_path = live_cfg
+    before = config_path.read_text(encoding="utf-8")
+    repo = tmp_path / "existing-repo"
+    repo.mkdir()
+
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        post(
+            base,
+            "/api/config/repo",
+            {"repo_root": str(repo), "workspace_mode": "bogus"},
+        )
+    assert exc.value.code == 400
+    assert config_path.read_text(encoding="utf-8") == before
+
+
+def test_post_config_repo_never_mutates_the_live_config(live_cfg, tmp_path):
+    """Only the file changes. The `LoopConfig` object the running loop and
+    registry hold is provably untouched — a restart is required to pick up
+    the edit."""
+    base, _store, _loop, config, _config_path = live_cfg
+    repo_root_before = config.repo_root
+    workspace_mode_before = config.workspace_mode
+    repo = tmp_path / "existing-repo"
+    repo.mkdir()
+
+    status, _body = post(
+        base,
+        "/api/config/repo",
+        {"repo_root": str(repo), "workspace_mode": "worktree"},
+    )
+    assert status == 200
+    assert config.repo_root == repo_root_before
+    assert config.workspace_mode == workspace_mode_before
+
+
+def test_post_config_repo_over_http_is_created_when_absent(tmp_path):
+    """No pre-existing loopconfig.json: the file is created holding only the
+    two new keys."""
+    store = Store(tmp_path / "srv2.db")
+    cfg = LoopConfig(
+        db_path=store.db_path,
+        workspace_root=str(tmp_path / "ws2"),
+        allow_test_exec=False,
+        vcs_enabled=False,
+        stream_poll_seconds=0.05,
+    )
+    config_path = tmp_path / "fresh-loopconfig.json"
+    assert not config_path.exists()
+    loop = Loop(store, MockRunner(), Registry.load(), cfg)
+    server = serve(
+        store,
+        loop,
+        Registry.load(),
+        cfg,
+        host="127.0.0.1",
+        port=0,
+        config_path=str(config_path),
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        repo = tmp_path / "existing-repo"
+        repo.mkdir()
+        status, body = post(
+            base,
+            "/api/config/repo",
+            {"repo_root": str(repo), "workspace_mode": "scratch"},
+        )
+        assert status == 200
+        assert body == {"repo_root": str(repo), "workspace_mode": "scratch"}
+        on_disk = json.loads(config_path.read_text(encoding="utf-8"))
+        assert on_disk == {"repo_root": str(repo), "workspace_mode": "scratch"}
+    finally:
+        server._shutdown_flag.set()
+        server.shutdown()
+        server.server_close()
+        store.close()
+
+
+def test_post_config_repo_is_refused_cross_origin(live_cfg):
+    """Reuses the existing `_same_origin` check inherited from `do_POST`'s
+    top — no second guard, no bypass."""
+    base, _store, _loop, _config, config_path = live_cfg
+    before = config_path.read_text(encoding="utf-8")
+    host = base.split("//", 1)[1]
+
+    code, _ = raw_request(
+        base,
+        "POST",
+        "/api/config/repo",
+        {
+            "Host": host,
+            "Origin": "http://evil.example",
+            "Content-Type": "text/plain",
+        },
+        json.dumps({"repo_root": "/tmp", "workspace_mode": "worktree"}),
+    )
+    assert code == 403
+    assert config_path.read_text(encoding="utf-8") == before

@@ -19,6 +19,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import mimetypes
+import os
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -65,12 +66,24 @@ class DashboardServer(ThreadingHTTPServer):
     allow_reuse_address = True
 
     def __init__(
-        self, addr, store: Store, loop: Loop, registry: Registry, config: LoopConfig
+        self,
+        addr,
+        store: Store,
+        loop: Loop,
+        registry: Registry,
+        config: LoopConfig,
+        config_path: str | None = None,
     ):
         self.store = store
         self.loop = loop
         self.registry = registry
         self.config = config
+        # The loopconfig.json path the running `agentloop serve` process was
+        # started with (`args.config or "loopconfig.json"` in `cli.py`), kept
+        # only so `POST /api/config/repo` can find the *file* to edit. Never
+        # read to build `self.config` — that already happened in `cli.py`
+        # before this object existed.
+        self.config_path = config_path or "loopconfig.json"
         # The name the operator asked to be reachable at, kept verbatim for the
         # `Host` check. `server_address` holds the *resolved* bind address, which
         # for a hostname bind is an IP and so cannot answer "was this the name
@@ -336,6 +349,13 @@ class _Handler(BaseHTTPRequestHandler):
                         # request is gated rather than just that it is.
                         "tool_readonly_allowlist": list(cfg.tool_readonly_allowlist),
                         "gate_declared_tools": cfg.gate_declared_tools,
+                        # Slice 9: which repository (if any) worktree-mode
+                        # workspaces are checked out from. Read from the live
+                        # `LoopConfig`, so this reflects what the running loop
+                        # actually uses, not what a POST to `/api/config/repo`
+                        # has since written to disk (that needs a restart).
+                        "repo_root": cfg.repo_root,
+                        "workspace_mode": cfg.workspace_mode,
                     }
                 )
             elif path == "/api/stream":
@@ -394,6 +414,12 @@ class _Handler(BaseHTTPRequestHandler):
             # /api/charter — the human write surface; agents have none.
             elif parts == ["api", "charter"]:
                 self._set_charter(body)
+            # /api/config/repo — writes the on-disk loopconfig.json only; the
+            # live `self.server.config` the running loop/registry hold is
+            # never touched, so this needs a restart to take effect (see
+            # `_set_config_repo`).
+            elif parts == ["api", "config", "repo"]:
+                self._set_config_repo(body)
             # /api/memory/{id}/{approve|reject|pin|unpin}
             elif (
                 len(parts) == 4
@@ -622,6 +648,54 @@ class _Handler(BaseHTTPRequestHandler):
         self.store.charter_set(text, str(body.get("note") or ""))
         self._send_json(self._charter_json())
 
+    def _set_config_repo(self, body: dict) -> None:
+        """POST /api/config/repo — persist `repo_root`/`workspace_mode` to the
+        loopconfig.json file `agentloop serve` was started with.
+
+        Every check below runs, in order, before anything is written, and a
+        failure at any of them writes nothing — the same "validate whole,
+        write once" shape `agents.parse_plan` uses for the same reason: a
+        half-written config is worse than no write at all.
+
+        Deliberately does **not** touch `self.server.config` — that is the
+        live `LoopConfig` the running loop and registry actually use, and
+        mutating it here would apply an unreviewed edit to a task mid-run.
+        Only the file changes; picking it up needs a restart, exactly like
+        any other loopconfig.json edit.
+        """
+        repo_root = body.get("repo_root")
+        if not isinstance(repo_root, str) or not repo_root.strip():
+            raise ValueError("repo_root is required")
+        workspace_mode = body.get("workspace_mode")
+        if workspace_mode not in ("scratch", "worktree"):
+            raise ValueError(
+                f"workspace_mode must be 'scratch' or 'worktree', not "
+                f"{workspace_mode!r}"
+            )
+        if not os.path.isabs(repo_root):
+            raise ValueError(f"repo_root must be an absolute path: {repo_root!r}")
+        if not os.path.isdir(repo_root):
+            raise ValueError(
+                f"repo_root does not exist or is not a directory: {repo_root!r}"
+            )
+
+        path = self.server.config_path
+        # Same read convention as `LoopConfig.load`: utf-8-sig, so a
+        # BOM-writing editor doesn't turn a config edit into a stack trace.
+        if os.path.exists(path):
+            raw = Path(path).read_text(encoding="utf-8-sig")
+            data = json.loads(raw) if raw.strip() else {}
+        else:
+            data = {}
+        # Only these two keys change; every other existing key survives
+        # untouched, so this can never silently revert an operator's other
+        # settings back to defaults.
+        data["repo_root"] = repo_root
+        data["workspace_mode"] = workspace_mode
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        self._send_json({"repo_root": repo_root, "workspace_mode": workspace_mode})
+
     def _task_detail(self, path: str) -> None:
         try:
             task_id = int(path.rsplit("/", 1)[-1])
@@ -766,6 +840,7 @@ def serve(
     config: LoopConfig,
     host: str | None = None,
     port: int | None = None,
+    config_path: str | None = None,
 ) -> DashboardServer:
     """Start the dashboard server. Returns it so callers (and tests) can
     shut it down."""
@@ -773,7 +848,7 @@ def serve(
         host or config.server_host,
         port if port is not None else config.server_port,
     )
-    return DashboardServer(addr, store, loop, registry, config)
+    return DashboardServer(addr, store, loop, registry, config, config_path)
 
 
 def serve_forever(
@@ -783,8 +858,9 @@ def serve_forever(
     config: LoopConfig,
     host: str | None = None,
     port: int | None = None,
+    config_path: str | None = None,
 ) -> None:
-    server = serve(store, loop, registry, config, host, port)
+    server = serve(store, loop, registry, config, host, port, config_path)
     h, p = server.server_address[0], server.server_address[1]
     print(f"agentloop dashboard on http://{h}:{p}")
     if not _WEB_DIST.is_dir():
