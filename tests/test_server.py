@@ -1142,9 +1142,7 @@ def live_cfg(tmp_path):
         stream_poll_seconds=0.05,
     )
     config_path = tmp_path / "loopconfig.json"
-    config_path.write_text(
-        json.dumps({"max_revisions": 7}, indent=2), encoding="utf-8"
-    )
+    config_path.write_text(json.dumps({"max_revisions": 7}, indent=2), encoding="utf-8")
     loop = Loop(store, MockRunner(), Registry.load(), config)
     server = serve(
         store,
