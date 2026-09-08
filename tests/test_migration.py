@@ -158,3 +158,236 @@ def test_resolve_project_none_on_a_brand_new_db_returns_the_default(tmp_path):
         assert proj["name"] == "Default"
     finally:
         store.close()
+
+
+# A `memory` table shaped like it was just before `memory_hits` existed
+# (tier/key/value/hit_count/approved/pinned/created_at/last_used_at, no
+# `project_id`, `UNIQUE(tier, key)`) and NO `memory_hits` table at all — the
+# exact trigger for `_reconcile_memory_hits()`. A real `project`/`loop` key
+# collision on 'style' so `_reconcile_memory_hits` -> `_merge_into_loop` ->
+# `memory_write` actually fires on the legacy path, not just an inert call.
+PRE_MEMORY_HITS_MEMORY_SCHEMA = """
+CREATE TABLE memory (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tier TEXT NOT NULL,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    hit_count INTEGER NOT NULL DEFAULT 0,
+    approved INTEGER NOT NULL DEFAULT 0,
+    pinned INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL,
+    last_used_at REAL,
+    UNIQUE(tier, key)
+);
+INSERT INTO memory (tier, key, value, approved, created_at) VALUES
+  ('project', 'style', 'use tabs', 1, 0),
+  ('loop', 'style', 'use spaces', 0, 0);
+"""
+
+
+def build_pre_memory_hits_db(path):
+    raw = sqlite3.connect(path)
+    raw.executescript(SLICE5_SCHEMA)
+    raw.executescript(PRE_MEMORY_HITS_MEMORY_SCHEMA)
+    raw.commit()
+    raw.close()
+    return path
+
+
+def test_legacy_pre_memory_hits_db_migrates_without_project_id_error(tmp_path):
+    """Plan-vs-code gap #6: `_reconcile_memory_hits()` -> `_merge_into_loop()`
+    -> `memory_write()`, and `memory_write` is project_id-aware. On a
+    pre-memory_hits db, `memory.project_id` must exist BEFORE that legacy
+    branch runs, or this raises `sqlite3.OperationalError: no such column:
+    project_id`. Must open cleanly, and the merged row must carry the
+    correct project_id."""
+    db = build_pre_memory_hits_db(tmp_path / "pre_memory_hits.db")
+
+    raw = sqlite3.connect(db)
+    tables = {
+        r[0] for r in raw.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    raw.close()
+    assert "memory" in tables
+    assert "memory_hits" not in tables
+
+    migrated = Store(db)  # must not raise
+    try:
+        default_id = migrated.resolve_project(None)
+        rows = migrated.memory_list(project_id=default_id)
+        style_rows = [r for r in rows if r["key"] == "style"]
+        # Merged onto one loop row (migration origin: approved project value
+        # wins per _merge_into_loop's docstring).
+        assert len(style_rows) == 1
+        assert style_rows[0]["tier"] == "loop"
+        assert style_rows[0]["value"] == "use tabs"
+        assert style_rows[0]["project_id"] == default_id
+    finally:
+        migrated.close()
+
+
+def test_memory_rebuild_preserves_autoincrement(tmp_path):
+    """A deleted row's id must never be reissued to a later fact. Falsified
+    by temporarily reverting the rebuild DDL to `id INTEGER PRIMARY KEY` (no
+    AUTOINCREMENT) and confirming this goes red — see the ADR in the plan."""
+    db = build_pre_memory_hits_db(tmp_path / "autoincrement.db")
+    store = Store(db)
+    try:
+        default_id = store.resolve_project(None)
+        rows = store.memory_list(project_id=default_id)
+        max_id_before = max(r["id"] for r in rows)
+        # Delete whichever row currently holds the table's max id.
+        victim = next(r for r in rows if r["id"] == max_id_before)
+        store.memory_delete(victim["id"])
+        # A brand-new fact, no explicit id.
+        store.memory_write("project", "brand-new-fact", "hello", project_id=default_id)
+        new_row = store.memory_list(project_id=default_id, tier="project")
+        new_id = next(r["id"] for r in new_row if r["key"] == "brand-new-fact")
+        assert new_id > max_id_before, (
+            f"deleted id {max_id_before} was reissued to a new fact (got {new_id})"
+        )
+    finally:
+        store.close()
+
+
+def test_memory_rebuild_preserves_true_historical_high_water_mark(tmp_path):
+    """A row deleted BEFORE the rebuild ever runs must still keep its id from
+    being reissued — the sneakier trigger than `test_memory_rebuild_preserves_
+    autoincrement` above, which only proves ordinary post-migration
+    AUTOINCREMENT works (its delete happens after `Store()` already migrated).
+
+    `DROP TABLE` on an AUTOINCREMENT table deletes its `sqlite_sequence` row —
+    the one place the table's *true* historical high-water mark lived — so a
+    naive id-preserving copy (`INSERT INTO memory_new (id, ...) SELECT id, ...
+    FROM memory`) only carries forward the max id among rows that *survive* to
+    migration time. If the row that held the table's true max id was deleted
+    beforehand (an entirely ordinary event — `_merge_into_loop`'s
+    collision-loser DELETE, or `memory_delete`), the rebuilt table's sequence
+    starts from `max(surviving ids)`, not the true historical max, and the
+    very first post-migration `memory_write` silently reissues the deleted
+    row's old id to an unrelated new fact.
+
+    Built by hand via raw sqlite3, entirely BEFORE `Store()` is ever
+    constructed — the exact shape of the failure-hunter's live reproduction.
+    Falsified by temporarily dropping the `old_seq`-carrying fix and
+    confirming this goes red.
+    """
+    db = tmp_path / "pre_migration_delete.db"
+    raw = sqlite3.connect(db)
+    raw.executescript(SLICE5_SCHEMA)
+    raw.executescript(
+        """
+        CREATE TABLE memory (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tier TEXT NOT NULL,
+            key TEXT NOT NULL,
+            value TEXT NOT NULL,
+            hit_count INTEGER NOT NULL DEFAULT 0,
+            approved INTEGER NOT NULL DEFAULT 0,
+            pinned INTEGER NOT NULL DEFAULT 0,
+            created_at REAL NOT NULL,
+            last_used_at REAL,
+            UNIQUE(tier, key)
+        );
+        INSERT INTO memory (tier, key, value, approved, created_at) VALUES
+          ('project', 'fact-1', 'v1', 1, 0),
+          ('project', 'fact-2', 'v2', 1, 0),
+          ('project', 'fact-3', 'v3', 1, 0);
+        """
+    )
+    # fact-3 holds the table's true max id (3). Delete it BEFORE Store() ever
+    # opens this database, so the true high-water mark only ever lived in
+    # sqlite_sequence, never in a surviving row.
+    deleted_id = raw.execute("SELECT id FROM memory WHERE key='fact-3'").fetchone()[0]
+    assert deleted_id == 3
+    raw.execute("DELETE FROM memory WHERE id=?", (deleted_id,))
+    raw.commit()
+    raw.close()
+
+    store = Store(db)
+    try:
+        default_id = store.resolve_project(None)
+        store.memory_write("project", "brand-new-fact", "hello", project_id=default_id)
+        new_row = store.memory_list(project_id=default_id, tier="project")
+        new_id = next(r["id"] for r in new_row if r["key"] == "brand-new-fact")
+        assert new_id > deleted_id, (
+            f"pre-migration-deleted id {deleted_id} was reissued to a new fact"
+            f" (got {new_id})"
+        )
+    finally:
+        store.close()
+
+
+def test_memory_hits_row_survives_the_rebuild_and_still_resolves(tmp_path):
+    """Exit Criteria (plan Phase 2, line 593): 'A `memory_hits` row written
+    before the rebuild still resolves to the correct fact after it.'
+
+    Realistic shape of nearly every real pre-slice-10 database: `memory_hits`
+    already exists (it predates this slice), so `_reconcile_memory_hits`'s
+    legacy branch does NOT run (`"memory_hits" not in existing` is False) --
+    but `_rebuild_memory_unique_constraint` still runs, because the old
+    `memory` table's `UNIQUE(tier, key)` has not yet been widened. That
+    rebuild does `DROP TABLE memory`, and `memory_hits.memory_id REFERENCES
+    memory(id) ON DELETE CASCADE` -- so if the `PRAGMA foreign_keys=OFF`
+    guarding that DROP were ever missing or misplaced, the DROP would cascade
+    and silently wipe every `memory_hits` row.
+
+    Falsified by temporarily moving the `PRAGMA foreign_keys=OFF` call to
+    AFTER `_rebuild_memory_unique_constraint` runs (the code's own comment
+    already warns the ordering is load-bearing) and confirming this test goes
+    red.
+    """
+    db = tmp_path / "pre_rebuild_with_hits.db"
+    raw = sqlite3.connect(db)
+    raw.executescript(SLICE5_SCHEMA)
+    raw.executescript(
+        """
+        CREATE TABLE memory (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tier TEXT NOT NULL,
+            key TEXT NOT NULL,
+            value TEXT NOT NULL,
+            hit_count INTEGER NOT NULL DEFAULT 0,
+            approved INTEGER NOT NULL DEFAULT 0,
+            pinned INTEGER NOT NULL DEFAULT 0,
+            created_at REAL NOT NULL,
+            last_used_at REAL,
+            UNIQUE(tier, key)
+        );
+        CREATE TABLE memory_hits (
+            memory_id INTEGER NOT NULL REFERENCES memory(id) ON DELETE CASCADE,
+            task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            ts REAL NOT NULL,
+            UNIQUE(memory_id, task_id)
+        );
+        INSERT INTO memory (tier, key, value, approved, hit_count, created_at)
+        VALUES ('project', 'reliable-fact', 'the value', 1, 1, 0);
+        INSERT INTO memory_hits (memory_id, task_id, ts) VALUES (1, 1, 0);
+        """
+    )
+    raw.commit()
+    raw.close()
+
+    # The fixture really predates the rebuild and already has memory_hits, or
+    # this test proves nothing.
+    check = sqlite3.connect(db)
+    tables = {
+        r[0] for r in check.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    sql_row = check.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='memory'"
+    ).fetchone()
+    check.close()
+    assert "memory_hits" in tables
+    assert "UNIQUE(project_id, tier, key)" not in sql_row[0]
+
+    store = Store(db)
+    try:
+        default_id = store.resolve_project(None)
+        rows = store.memory_list(project_id=default_id, tier="project")
+        fact = next(r for r in rows if r["key"] == "reliable-fact")
+        assert fact["value"] == "the value"
+        assert fact["id"] == 1
+        assert store.memory_hits(fact["id"]) == [1]
+    finally:
+        store.close()

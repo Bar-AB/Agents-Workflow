@@ -240,8 +240,11 @@ CREATE TABLE IF NOT EXISTS events (
 
 -- Two-tier memory (spec §7): tier = 'project' | 'loop'.
 -- Writes are human-auditable via the events log; `approved` gates reads.
+-- Scoped per project (slice 10): the same (tier, key) text is a different
+-- fact in a different project, so UNIQUE includes project_id.
 CREATE TABLE IF NOT EXISTS memory (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL REFERENCES projects(id),
     tier TEXT NOT NULL,
     key TEXT NOT NULL,
     value TEXT NOT NULL,
@@ -255,7 +258,7 @@ CREATE TABLE IF NOT EXISTS memory (
     -- When this fact was last read out. `hit_count` says how often, never how
     -- recently; a fact hot a year ago and cold since looks identical without it.
     last_used_at REAL,
-    UNIQUE(tier, key)
+    UNIQUE(project_id, tier, key)
 );
 
 -- Which tasks a memory fact was actually relevant to. `hit_count` is the
@@ -630,9 +633,12 @@ class Store:
                 self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
         # Ordering is load-bearing: strictly after the additions loop (needs
         # tasks.project_id to exist for the backfill UPDATE) and strictly
-        # before the legacy _reconcile_memory_hits() branch below (a future
-        # memory-scoping migration will need to slot in between these two).
-        self._ensure_default_project()
+        # before the legacy _reconcile_memory_hits() branch below. The legacy
+        # branch's _merge_into_loop() calls memory_write(), which this phase
+        # makes project_id-aware -- so on a pre-memory_hits db, memory's
+        # project_id column must exist before that branch runs, not after.
+        default_id = self._ensure_default_project()
+        self._rebuild_memory_unique_constraint(default_id)
         if "memory" in existing and "memory_hits" not in existing:
             self._reconcile_memory_hits()
 
@@ -701,6 +707,95 @@ class Store:
                 )
             return project_id
 
+    def _rebuild_memory_unique_constraint(self, default_project_id: int) -> None:
+        """One-time repair: `memory`'s `UNIQUE(tier, key)` -> `UNIQUE(project_id,
+        tier, key)`, id-preserving and AUTOINCREMENT-preserving.
+
+        Idempotent: detects whether it already ran by reading the table's own
+        `sqlite_master.sql` for BOTH the literal substring
+        `"UNIQUE(project_id, tier, key)"` AND `"AUTOINCREMENT"` -- requiring
+        both, not just the UNIQUE one, is what stops a hypothetical
+        partially-correct prior rebuild (right UNIQUE clause, missing
+        AUTOINCREMENT) from being mistaken for "already done" and skipped.
+        AUTOINCREMENT is load-bearing, not decoration: the live `memory`
+        table already has it because rows are genuinely deleted in normal
+        operation (`_merge_into_loop`'s collision-loser DELETE,
+        `memory_delete`), and without it SQLite can reissue a deleted row's
+        id to the next unspecified-id INSERT -- silently pointing a stale
+        `memory_hits.memory_id` or a past `retrieval` event's recorded id at
+        an unrelated, later-created fact.
+        """
+        sql_row = self._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='memory'"
+        ).fetchone()
+        existing_sql = sql_row["sql"] if sql_row else ""
+        if "UNIQUE(project_id, tier, key)" in existing_sql and (
+            "AUTOINCREMENT" in existing_sql
+        ):
+            return
+        # PRAGMA foreign_keys change is ignored mid-transaction, so it must
+        # happen outside self.transaction().
+        self._conn.execute("PRAGMA foreign_keys=OFF")
+        # Capture the OLD table's true historical high-water mark BEFORE
+        # `DROP TABLE memory` below deletes its `sqlite_sequence` row along
+        # with it. A naive id-preserving copy only carries forward
+        # `max(surviving ids)` -- if a row holding a higher id was deleted at
+        # any point before this migration runs (an ordinary event:
+        # `_merge_into_loop`'s collision-loser DELETE, or `memory_delete`),
+        # that higher id lived nowhere but `sqlite_sequence`, and skipping
+        # this capture reissues the deleted row's old id to the very next
+        # unspecified-id INSERT after migration.
+        old_seq_row = self._conn.execute(
+            "SELECT seq FROM sqlite_sequence WHERE name='memory'"
+        ).fetchone()
+        old_seq = int(old_seq_row["seq"]) if old_seq_row else 0
+        with self.transaction():
+            self._conn.execute(
+                "CREATE TABLE memory_new ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                " project_id INTEGER NOT NULL REFERENCES projects(id),"
+                " tier TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,"
+                " hit_count INTEGER NOT NULL DEFAULT 0,"
+                " approved INTEGER NOT NULL DEFAULT 0,"
+                " pinned INTEGER NOT NULL DEFAULT 0,"
+                " created_at REAL NOT NULL, last_used_at REAL,"
+                " UNIQUE(project_id, tier, key))"
+            )
+            self._conn.execute(
+                "INSERT INTO memory_new (id, project_id, tier, key, value,"
+                " hit_count, approved, pinned, created_at, last_used_at)"
+                " SELECT id, ?, tier, key, value, hit_count, approved, pinned,"
+                " created_at, last_used_at FROM memory",
+                (default_project_id,),
+            )
+            self._conn.execute("DROP TABLE memory")
+            self._conn.execute("ALTER TABLE memory_new RENAME TO memory")
+            # SQLite's RENAME updates the sqlite_sequence row's `name` column
+            # in place, so a row for 'memory' now exists reflecting
+            # `max(surviving explicit ids)` -- verified empirically, not
+            # assumed (see the falsification test). Raise it to the true
+            # historical mark captured above; check-then-insert-or-update
+            # rather than an ON CONFLICT, since sqlite_sequence carries no
+            # guaranteed-usable unique index for that purpose.
+            current_row = self._conn.execute(
+                "SELECT seq FROM sqlite_sequence WHERE name='memory'"
+            ).fetchone()
+            if current_row is None:
+                self._conn.execute(
+                    "INSERT INTO sqlite_sequence (name, seq) VALUES ('memory', ?)",
+                    (old_seq,),
+                )
+            elif int(current_row["seq"]) < old_seq:
+                self._conn.execute(
+                    "UPDATE sqlite_sequence SET seq=? WHERE name='memory'",
+                    (old_seq,),
+                )
+            row_count = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM memory"
+            ).fetchone()["n"]
+            self.log_event(None, "memory_project_unique_migrated", {"rows": row_count})
+        self._conn.execute("PRAGMA foreign_keys=ON")
+
     def _reconcile_memory_hits(self) -> None:
         """Repair what the pre-`memory_hits` build of agentloop left behind.
 
@@ -745,6 +840,7 @@ class Store:
             dupes = self._conn.execute(
                 "SELECT p.id AS project_id, l.id AS loop_id FROM memory p"
                 " JOIN memory l ON l.key = p.key AND l.tier='loop'"
+                " AND l.project_id = p.project_id"
                 " WHERE p.tier='project'"
             ).fetchall()
             for row in dupes:
@@ -1682,6 +1778,7 @@ class Store:
         value: str,
         approved: bool = False,
         pinned: bool = False,
+        project_id: int | None = None,
     ) -> None:
         # Approval is approval *of a value*, so a rewrite that changes the value
         # drops back to unapproved: otherwise an agent could rewrite an approved
@@ -1693,20 +1790,28 @@ class Store:
         # Pinning is sticky regardless: it is a statement about the *key* ("always
         # tell agents about this"), not about a particular value, and it never
         # grants a read on its own. Lowering either flag is via the setters.
+        project_id = self.resolve_project(project_id)
         with self.transaction():
             self._conn.execute(
-                "INSERT INTO memory (tier, key, value, approved, pinned,"
-                " created_at) VALUES (?,?,?,?,?,?)"
-                " ON CONFLICT(tier, key) DO UPDATE SET value=excluded.value,"
+                "INSERT INTO memory (project_id, tier, key, value, approved,"
+                " pinned, created_at) VALUES (?,?,?,?,?,?,?)"
+                " ON CONFLICT(project_id, tier, key) DO UPDATE SET"
+                " value=excluded.value,"
                 " approved=MAX(excluded.approved, CASE WHEN"
                 " memory.value = excluded.value THEN memory.approved ELSE 0 END),"
                 " pinned=MAX(memory.pinned, excluded.pinned)",
-                (tier, key, value, int(approved), int(pinned), time.time()),
+                (project_id, tier, key, value, int(approved), int(pinned), time.time()),
             )
             self.log_event(
                 None,
                 "memory_write",
-                {"tier": tier, "key": key, "approved": approved, "pinned": pinned},
+                {
+                    "tier": tier,
+                    "key": key,
+                    "approved": approved,
+                    "pinned": pinned,
+                    "project_id": project_id,
+                },
             )
 
     def memory_read(
@@ -1715,6 +1820,7 @@ class Store:
         key: str,
         approved_only: bool = True,
         task_id: int | None = None,
+        project_id: int | None = None,
     ) -> str | None:
         """Read one fact, recording the read against the task that caused it.
 
@@ -1729,11 +1835,13 @@ class Store:
         (`agentloop memory`, eval, a direct call) still records recency but no
         hit: promotion is a claim about tasks, and there isn't one.
         """
+        project_id = self.resolve_project(project_id)
         gate = " AND approved=1" if approved_only else ""
         with self.transaction():
             row = self._conn.execute(
-                f"SELECT id, value FROM memory WHERE tier=? AND key=?{gate}",
-                (tier, key),
+                f"SELECT id, value FROM memory WHERE tier=? AND key=?"
+                f" AND project_id=?{gate}",
+                (tier, key, project_id),
             ).fetchone()
             if row is None:
                 return None
@@ -1801,7 +1909,8 @@ class Store:
                 raise ValueError(f"Only project facts promote (got {row['tier']!r})")
             key = row["key"]
             collision = self._conn.execute(
-                "SELECT id FROM memory WHERE tier='loop' AND key=?", (key,)
+                "SELECT id FROM memory WHERE tier='loop' AND key=? AND project_id=?",
+                (key, row["project_id"]),
             ).fetchone()
             if collision is None:
                 self._conn.execute(
@@ -1900,6 +2009,10 @@ class Store:
                 value,
                 approved=survivor_approved,
                 pinned=bool(project["pinned"]),
+                # Explicit, never left to default-resolve: the merged pair's
+                # own project, not whatever project happens to be "active"
+                # when the merge runs.
+                project_id=project["project_id"],
             )
             self._conn.execute(
                 "INSERT OR IGNORE INTO memory_hits (memory_id, task_id, ts)"
@@ -1944,11 +2057,21 @@ class Store:
                 )
 
     def memory_list(
-        self, tier: str | None = None, approved_only: bool = False
+        self,
+        tier: str | None = None,
+        approved_only: bool = False,
+        project_id: int | None = None,
     ) -> list[dict]:
+        """`project_id=None` here means "every project" -- matching
+        `list_tasks`'s "None = unfiltered" convention, deliberately NOT
+        `resolve_project(None)` = the default. This is the one method where
+        the two meanings would otherwise collide."""
         q = "SELECT * FROM memory"
         params: list = []
         where = []
+        if project_id is not None:
+            where.append("project_id=?")
+            params.append(project_id)
         if tier:
             where.append("tier=?")
             params.append(tier)
