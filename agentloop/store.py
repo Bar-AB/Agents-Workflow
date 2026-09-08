@@ -112,6 +112,21 @@ def _bounded_text(value, limit: int = _MAX_COERCED_TEXT_CHARS) -> str:
 
 
 _SCHEMA = """
+-- A project is a named, repo_root-backed unit of work (slice 10). Every
+-- fresh install bootstraps exactly one, named 'Default', with is_default=1.
+-- Declared before `tasks` so the FK target exists when the script runs,
+-- matching this file's existing `charter`-before-`attempts` convention.
+CREATE TABLE IF NOT EXISTS projects (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    repo_root TEXT NOT NULL,
+    workspace_mode TEXT NOT NULL DEFAULT 'scratch',
+    is_default INTEGER NOT NULL DEFAULT 0,
+    archived INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS tasks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     title TEXT NOT NULL,
@@ -142,6 +157,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- planner generating tasks *is* task definition, which humans stay in the
     -- loop for, so children of an unapproved plan are not claimable.
     plan_approved INTEGER NOT NULL DEFAULT 0,
+    -- Which project this task belongs to (slice 10). NOT NULL for fresh
+    -- installs; a bare nullable column via `additions` on migrated dbs,
+    -- backfilled to the bootstrap Default project by `_ensure_default_project`.
+    project_id INTEGER NOT NULL REFERENCES projects(id),
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
@@ -584,6 +603,10 @@ class Store:
             # id this store just inserted.
             ("tasks", "plan_id", "INTEGER"),
             ("tasks", "plan_approved", "INTEGER NOT NULL DEFAULT 0"),
+            # Same FK trap as plan_id: fresh dbs get `REFERENCES projects(id)`
+            # from _SCHEMA, older dbs get the bare nullable column, backfilled
+            # by `_ensure_default_project()` below to the bootstrap project.
+            ("tasks", "project_id", "INTEGER"),
             ("memory", "pinned", "INTEGER NOT NULL DEFAULT 0"),
             ("memory", "last_used_at", "REAL"),
             # Same FK trap and same handling as `plan_id` above: fresh dbs get
@@ -605,8 +628,78 @@ class Store:
             }
             if column not in cols:
                 self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+        # Ordering is load-bearing: strictly after the additions loop (needs
+        # tasks.project_id to exist for the backfill UPDATE) and strictly
+        # before the legacy _reconcile_memory_hits() branch below (a future
+        # memory-scoping migration will need to slot in between these two).
+        self._ensure_default_project()
         if "memory" in existing and "memory_hits" not in existing:
             self._reconcile_memory_hits()
+
+    def _ensure_default_project(self) -> int:
+        """Bootstrap the one guaranteed 'Default' project and backfill every
+        task still missing a `project_id`.
+
+        Three cases, not two -- collapsing the last two into one is exactly
+        what caused this migration's own worst bug the first time it was
+        written: (1) a project is already `is_default=1` -- normal case,
+        just resolve its id; (2) `projects` is empty -- a fresh or
+        pre-projects-table database, race-safe bootstrap via
+        `INSERT OR IGNORE` + a follow-up SELECT (two `agentloop` processes
+        opening the same brand-new db at once must not crash on the
+        UNIQUE(name) constraint -- `cur.lastrowid` is not trusted here
+        precisely because IGNORE can silently skip the insert); (3) rows
+        exist but none is `is_default=1` (a corrupted invariant, e.g. a
+        prior bug in `set_default_project`) -- deterministic repair,
+        promoting the lowest-id row rather than attempting a second insert
+        named 'Default' that would collide with the UNIQUE constraint.
+        """
+        with self.transaction():
+            row = self._conn.execute(
+                "SELECT id FROM projects WHERE is_default=1 LIMIT 1"
+            ).fetchone()
+            if row is not None:
+                project_id = int(row["id"])
+            else:
+                any_row = self._conn.execute(
+                    "SELECT id FROM projects ORDER BY id LIMIT 1"
+                ).fetchone()
+                if any_row is None:
+                    now = time.time()
+                    self._conn.execute(
+                        "INSERT OR IGNORE INTO projects (name, repo_root,"
+                        " workspace_mode, is_default, archived, created_at,"
+                        " updated_at) VALUES ('Default', '.', 'scratch', 1,"
+                        " 0, ?, ?)",
+                        (now, now),
+                    )
+                    project_id = int(
+                        self._conn.execute(
+                            "SELECT id FROM projects WHERE is_default=1 LIMIT 1"
+                        ).fetchone()["id"]
+                    )
+                else:
+                    project_id = int(any_row["id"])
+                    self._conn.execute(
+                        "UPDATE projects SET is_default=1, updated_at=? WHERE id=?",
+                        (time.time(), project_id),
+                    )
+                    self.log_event(
+                        None,
+                        "project_default_repaired",
+                        {"project_id": project_id},
+                    )
+            cur = self._conn.execute(
+                "UPDATE tasks SET project_id=? WHERE project_id IS NULL",
+                (project_id,),
+            )
+            if cur.rowcount > 0:
+                self.log_event(
+                    None,
+                    "project_migration_backfill",
+                    {"project_id": project_id, "tasks_backfilled": cur.rowcount},
+                )
+            return project_id
 
     def _reconcile_memory_hits(self) -> None:
         """Repair what the pre-`memory_hits` build of agentloop left behind.
@@ -669,15 +762,197 @@ class Store:
         append-only. See `_LockedConnection.transaction`."""
         return self._conn.transaction()
 
+    # -- projects --------------------------------------------------------------
+
+    def resolve_project(self, project: int | str | None) -> int:
+        """`None` -> the default project's id (never raises, bootstrap
+        guarantees one exists); an `int` -> verified to exist, else
+        `KeyError`; a `str` -> looked up by name, else the same `KeyError`.
+        The message text is what `cli.main`'s existing
+        `except (KeyError, ValueError)` handler renders as
+        `error: unknown project '<name>'`."""
+        if project is None:
+            return self.default_project_id()
+        if isinstance(project, int):
+            row = self.get_project(project)
+            if row is None:
+                raise KeyError(f"unknown project {project!r}")
+            return project
+        row = self.get_project_by_name(project)
+        if row is None:
+            raise KeyError(f"unknown project {project!r}")
+        return int(row["id"])
+
+    def default_project_id(self) -> int:
+        row = self._conn.execute(
+            "SELECT id FROM projects WHERE is_default=1 LIMIT 1"
+        ).fetchone()
+        if row is not None:
+            return int(row["id"])
+        # Safety net; a no-op after __init__ under normal operation.
+        return self._ensure_default_project()
+
+    def create_project(
+        self,
+        name: str,
+        repo_root: str,
+        workspace_mode: str = "scratch",
+        is_default: bool = False,
+    ) -> int:
+        if self.get_project_by_name(name) is not None:
+            raise ValueError(f"a project named {name!r} already exists")
+        if workspace_mode not in ("scratch", "worktree"):
+            raise ValueError(f"invalid workspace_mode: {workspace_mode!r}")
+        if not os.path.isabs(repo_root):
+            raise ValueError(f"repo_root must be an absolute path: {repo_root!r}")
+        if not os.path.isdir(repo_root):
+            raise ValueError(
+                f"repo_root does not exist or is not a directory: {repo_root!r}"
+            )
+        now = time.time()
+        with self.transaction():
+            if is_default:
+                self._conn.execute("UPDATE projects SET is_default=0")
+            cur = self._conn.execute(
+                "INSERT INTO projects (name, repo_root, workspace_mode,"
+                " is_default, archived, created_at, updated_at)"
+                " VALUES (?,?,?,?,0,?,?)",
+                (name, repo_root, workspace_mode, int(is_default), now, now),
+            )
+            project_id = cur.lastrowid
+            self.log_event(
+                None,
+                "project_created",
+                {
+                    "project_id": project_id,
+                    "name": name,
+                    "repo_root": repo_root,
+                    "workspace_mode": workspace_mode,
+                },
+            )
+        return project_id
+
+    def get_project(self, project_id: int) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM projects WHERE id=?", (project_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_project_by_name(self, name: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM projects WHERE name=?", (name,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_projects(self, include_archived: bool = False) -> list[dict]:
+        if include_archived:
+            rows = self._conn.execute("SELECT * FROM projects ORDER BY id").fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM projects WHERE archived=0 ORDER BY id"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def rename_project(self, project_id: int, new_name: str) -> None:
+        existing = self.get_project_by_name(new_name)
+        if existing is not None and int(existing["id"]) != project_id:
+            raise ValueError(f"a project named {new_name!r} already exists")
+        with self.transaction():
+            cur = self._conn.execute(
+                "UPDATE projects SET name=?, updated_at=? WHERE id=?",
+                (new_name, time.time(), project_id),
+            )
+            if cur.rowcount == 0:
+                raise KeyError(f"unknown project {project_id!r}")
+            self.log_event(
+                None,
+                "project_renamed",
+                {"project_id": project_id, "name": new_name},
+            )
+
+    def repoint_project(
+        self, project_id: int, repo_root: str, workspace_mode: str
+    ) -> None:
+        if workspace_mode not in ("scratch", "worktree"):
+            raise ValueError(f"invalid workspace_mode: {workspace_mode!r}")
+        if not os.path.isabs(repo_root):
+            raise ValueError(f"repo_root must be an absolute path: {repo_root!r}")
+        if not os.path.isdir(repo_root):
+            raise ValueError(
+                f"repo_root does not exist or is not a directory: {repo_root!r}"
+            )
+        with self.transaction():
+            cur = self._conn.execute(
+                "UPDATE projects SET repo_root=?, workspace_mode=?, updated_at=?"
+                " WHERE id=?",
+                (repo_root, workspace_mode, time.time(), project_id),
+            )
+            if cur.rowcount == 0:
+                raise KeyError(f"unknown project {project_id!r}")
+            self.log_event(
+                None,
+                "project_repointed",
+                {
+                    "project_id": project_id,
+                    "repo_root": repo_root,
+                    "workspace_mode": workspace_mode,
+                },
+            )
+
+    def set_default_project(self, project_id: int) -> None:
+        """Exactly one project is ever `is_default`: clear every row, then set
+        the target, in one transaction. Validates the id exists *before*
+        touching anything -- the first UPDATE (clear all) is destructive on
+        its own even if the second one later fails to match, so both a
+        pre-check and a rowcount check guard the invariant."""
+        if self.get_project(project_id) is None:
+            raise KeyError(f"unknown project {project_id!r}")
+        with self.transaction():
+            self._conn.execute("UPDATE projects SET is_default=0")
+            cur = self._conn.execute(
+                "UPDATE projects SET is_default=1, updated_at=? WHERE id=?",
+                (time.time(), project_id),
+            )
+            if cur.rowcount == 0:
+                raise KeyError(f"unknown project {project_id!r}")
+            self.log_event(None, "project_default_changed", {"project_id": project_id})
+
+    def archive_project(self, project_id: int) -> None:
+        row = self.get_project(project_id)
+        if row is None:
+            raise KeyError(f"unknown project {project_id!r}")
+        if row["is_default"]:
+            raise ValueError("cannot archive the default project")
+        non_terminal = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM tasks WHERE project_id=?"
+            " AND status NOT IN ('done','failed','aborted')",
+            (project_id,),
+        ).fetchone()["n"]
+        if non_terminal:
+            raise ValueError(
+                f"project {project_id} has {non_terminal} non-terminal task(s)"
+            )
+        with self.transaction():
+            self._conn.execute(
+                "UPDATE projects SET archived=1, updated_at=? WHERE id=?",
+                (time.time(), project_id),
+            )
+            self.log_event(None, "project_archived", {"project_id": project_id})
+
     # -- tasks ---------------------------------------------------------------
 
     def add_task(self, task: Task) -> int:
         now = time.time()
+        # Resolves None -> the default project transparently, so every
+        # existing call site in the codebase that never sets project_id
+        # keeps working unchanged.
+        task.project_id = self.resolve_project(task.project_id)
         with self.transaction():
             cur = self._conn.execute(
                 "INSERT INTO tasks (title, goal, acceptance_criteria, status,"
                 " risk_level, worker_role, validator_role, kind, plan_id,"
-                " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                " project_id, created_at, updated_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     task.title,
                     task.goal,
@@ -688,6 +963,7 @@ class Store:
                     task.validator_role,
                     task.kind,
                     task.plan_id,
+                    task.project_id,
                     now,
                     now,
                 ),
@@ -703,6 +979,7 @@ class Store:
                     "risk_level": task.risk_level,
                     "kind": task.kind,
                     "plan_id": task.plan_id,
+                    "project_id": task.project_id,
                 },
             )
         return task.id
@@ -747,7 +1024,9 @@ class Store:
         ).fetchone()
         return self._row_to_task(row) if row else None
 
-    def claim_next_task(self, worker_id: str) -> Task | None:
+    def claim_next_task(
+        self, worker_id: str, project_id: int | None = None
+    ) -> Task | None:
         """Atomically hand the next actionable task to exactly one worker.
 
         Select and claim happen in a single transaction, so two workers racing
@@ -773,17 +1052,20 @@ class Store:
         `WHERE status='pending' AND claimed_by IS NULL` guard makes the loser's
         UPDATE match zero rows, and it retries on the next candidate instead.
         """
+        project_filter = " AND t.project_id=?" if project_id is not None else ""
         for _ in range(_CLAIM_ATTEMPTS):
             with self.transaction():
+                params = (worker_id,) if project_id is None else (worker_id, project_id)
                 row = self._conn.execute(
                     "SELECT * FROM tasks t WHERE ("
                     " t.status='pending'"
                     " OR (t.status IN ('in_progress','testing','validating',"
                     "'revising') AND t.claimed_by=?))"
                     + self._UNBLOCKED
+                    + project_filter
                     + self._ACTIONABLE_ORDER
                     + " LIMIT 1",
-                    (worker_id,),
+                    params,
                 ).fetchone()
                 if row is None:
                     return None
@@ -911,8 +1193,14 @@ class Store:
             if t.claimed_by not in active
         ]
 
-    def list_tasks(self) -> list[Task]:
-        rows = self._conn.execute("SELECT * FROM tasks ORDER BY id").fetchall()
+    def list_tasks(self, project_id: int | None = None) -> list[Task]:
+        """`project_id=None` is unfiltered — byte-for-byte today's query."""
+        if project_id is None:
+            rows = self._conn.execute("SELECT * FROM tasks ORDER BY id").fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM tasks WHERE project_id=? ORDER BY id", (project_id,)
+            ).fetchall()
         return [self._row_to_task(r) for r in rows]
 
     def update_task(self, task: Task) -> bool:
@@ -1018,6 +1306,7 @@ class Store:
             claimed_by=row["claimed_by"],
             kind=row["kind"],
             plan_id=row["plan_id"],
+            project_id=row["project_id"],
         )
 
     # -- task graph (spec: planner) -------------------------------------------
@@ -1033,6 +1322,16 @@ class Store:
         """
         if task_id == depends_on_id:
             raise ValueError(f"Task {task_id} cannot depend on itself (cycle)")
+        # A store invariant, not a hope about the planner (mirrors the cycle
+        # refusal above): a dependency across projects makes no sense once
+        # tasks are project-scoped. Graceful no-op, not a crash, when either
+        # referenced task doesn't exist yet -- an unrelated error surfaces
+        # from the FK/insert path instead.
+        t1, t2 = self.get_task(task_id), self.get_task(depends_on_id)
+        if t1 is not None and t2 is not None and t1.project_id != t2.project_id:
+            raise ValueError(
+                f"Dependency {task_id} -> {depends_on_id} would cross projects"
+            )
         with self.transaction():
             # The new edge closes a cycle iff `task_id` is already reachable
             # from `depends_on_id` by following existing edges.

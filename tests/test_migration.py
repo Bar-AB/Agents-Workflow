@@ -94,3 +94,67 @@ def test_a_slice5_database_gains_the_slice6_columns(tmp_path):
         assert migrated.test_runs(1)[1]["coverage_percent"] == 87.0
     finally:
         migrated.close()
+
+
+def test_a_pre_projects_database_bootstraps_a_default_and_backfills_tasks(tmp_path):
+    """An old db (no `projects` table, `tasks` with no `project_id` column at
+    all) must open, gain a Default project, and have every existing task's
+    `project_id` backfilled to it — no data loss, and `resolve_project(None)`
+    on the migrated store answers with that same Default project.
+
+    Reuses the slice-5 fixture (SLICE5_SCHEMA), which already predates both
+    the `projects` table and `tasks.project_id`, rather than adding a third
+    schema shape — the property under test ("a pre-projects database migrates
+    cleanly") does not care which older slice's schema it starts from.
+    """
+    db = build_slice5_db(tmp_path / "pre_projects.db")
+
+    # The fixture really is missing both, or the test proves nothing.
+    raw = sqlite3.connect(db)
+    tables = {
+        r[0] for r in raw.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    task_cols = {r[1] for r in raw.execute("PRAGMA table_info(tasks)")}
+    raw.close()
+    assert "projects" not in tables
+    assert "project_id" not in task_cols
+
+    migrated = Store(db)
+    try:
+        projects = migrated.list_projects()
+        assert len(projects) == 1
+        assert projects[0]["name"] == "Default"
+        assert projects[0]["is_default"] == 1
+
+        default_id = migrated.resolve_project(None)
+        assert default_id == projects[0]["id"]
+
+        # The pre-existing 'Legacy task' row (id=1 from SLICE5_SCHEMA) survived
+        # with no data loss and now carries the backfilled project_id.
+        task = migrated.get_task(1)
+        assert task is not None
+        assert task.title == "Legacy task"
+        assert task.project_id == default_id
+
+        backfill_events = [
+            e for e in migrated.events() if e["kind"] == "project_migration_backfill"
+        ]
+        assert len(backfill_events) == 1
+        assert backfill_events[0]["payload"]["project_id"] == default_id
+        assert backfill_events[0]["payload"]["tasks_backfilled"] == 1
+    finally:
+        migrated.close()
+
+
+def test_resolve_project_none_on_a_brand_new_db_returns_the_default(tmp_path):
+    """No pre-existing data at all: `resolve_project(None)` must still answer
+    with a valid id whose row is named 'Default' — the bootstrap runs on
+    every `Store.__init__`, not only when migrating an old database."""
+    store = Store(tmp_path / "brand_new.db")
+    try:
+        pid = store.resolve_project(None)
+        proj = store.get_project(pid)
+        assert proj is not None
+        assert proj["name"] == "Default"
+    finally:
+        store.close()
