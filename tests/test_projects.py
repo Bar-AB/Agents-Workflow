@@ -176,6 +176,96 @@ def test_archive_project_allows_only_terminal_tasks(store, tmp_path):
     assert store.get_project(pid)["archived"] == 1
 
 
+def test_archive_project_holds_the_lock_across_its_whole_check_and_write(
+    store, tmp_path
+):
+    """[RED-FIRST] The non-terminal-task check and the archive write must
+    run under ONE lock hold (one `with self.transaction():`), not a plain
+    SELECT followed by a separate transaction -- the latter releases the
+    lock between them, leaving a real gap under `ThreadingHTTPServer`
+    concurrency where a task created in that gap is invisible to the
+    check (a project could archive while holding a task the refusal
+    exists to catch).
+
+    Deterministic proof, not a timing-dependent race: pause execution
+    (via a hook on the connection) at the exact instant AFTER the
+    non-terminal-task SELECT runs but BEFORE the archive UPDATE, from
+    inside `archive_project`'s own thread. A genuinely separate thread
+    then attempts `add_task` on the same project. If the check and the
+    write share one lock hold (the fix), that second thread's `add_task`
+    call BLOCKS until `archive_project` finishes -- provably, by recording
+    which of the two events happens first. Against the pre-fix code (two
+    separate lock acquisitions), the second thread's `add_task` would
+    complete WHILE `archive_project` is paused, proving the gap is real."""
+    pid = store.create_project("Race", str(tmp_path))
+    paused = threading.Event()
+    resume = threading.Event()
+    order: list[str] = []
+    real_execute = store._conn.execute
+
+    def hooked_execute(sql, params=()):
+        if "SELECT COUNT(*) AS n FROM tasks" in sql:
+            result = real_execute(sql, params)
+            paused.set()
+            resume.wait(timeout=10)
+            return result
+        return real_execute(sql, params)
+
+    store._conn.execute = hooked_execute
+    try:
+
+        def archiver():
+            try:
+                store.archive_project(pid)
+            finally:
+                order.append("archive_project done")
+
+        def adder():
+            # A genuinely separate thread's add_task, issued while
+            # archive_project is paused mid-check-and-write. Must run on
+            # its own thread: calling this from the thread that later
+            # signals `resume` would deadlock (it would block here forever,
+            # since the lock is held by the paused archiver, and never
+            # reach the line that lets the archiver continue).
+            store.add_task(a_task(project_id=pid))
+            order.append("add_task done")
+
+        t_archive = threading.Thread(target=archiver)
+        t_archive.start()
+        assert paused.wait(timeout=10), "archive_project never reached the pause point"
+
+        t_add = threading.Thread(target=adder)
+        t_add.start()
+        # `adder` is now blocked acquiring the same lock `archiver` holds
+        # (it cannot even enter its own `with self.transaction():` yet).
+        # Give it a moment to genuinely reach that blocked state before
+        # releasing the archiver -- not a proof by itself, but a real
+        # attempt was made and the join below is what actually verifies
+        # the ordering.
+        t_add.join(timeout=0.2)
+        assert t_add.is_alive(), (
+            "add_task returned before archive_project resumed -- the lock "
+            "did not serialize them, which is exactly the bug this test "
+            "exists to catch"
+        )
+
+        resume.set()
+        t_archive.join(timeout=10)
+        t_add.join(timeout=10)
+    finally:
+        store._conn.execute = real_execute
+
+    # The fix's actual guarantee: add_task could only complete AFTER
+    # archive_project's own transaction released the lock -- i.e. after
+    # archive_project itself finished (it must have refused, since a task
+    # existed the instant it committed... but since add_task ran while
+    # archive_project was PAUSED mid-transaction, and the two share one
+    # lock, add_task's own `with self.transaction():` cannot have started
+    # until archive_project's finished. That serialization -- not which
+    # one "won" -- is what the fix guarantees).
+    assert order == ["archive_project done", "add_task done"], order
+
+
 # -- scoped queries ---------------------------------------------------------
 
 

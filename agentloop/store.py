@@ -1014,21 +1014,31 @@ class Store:
             self.log_event(None, "project_default_changed", {"project_id": project_id})
 
     def archive_project(self, project_id: int) -> None:
-        row = self.get_project(project_id)
-        if row is None:
-            raise KeyError(f"unknown project {project_id!r}")
-        if row["is_default"]:
-            raise ValueError("cannot archive the default project")
-        non_terminal = self._conn.execute(
-            "SELECT COUNT(*) AS n FROM tasks WHERE project_id=?"
-            " AND status NOT IN ('done','failed','aborted')",
-            (project_id,),
-        ).fetchone()["n"]
-        if non_terminal:
-            raise ValueError(
-                f"project {project_id} has {non_terminal} non-terminal task(s)"
-            )
+        """Refuses the default project or any project holding a non-terminal
+        task. The read-then-write here is inside ONE transaction, not two
+        separate lock acquisitions -- a plain SELECT followed by a later
+        `with self.transaction():` leaves a real gap under
+        `ThreadingHTTPServer` concurrency (the server's own `/api/tasks` and
+        `/api/projects/{id}/archive` routes can race): a task created in
+        that gap would be invisible to the check, letting a project archive
+        while holding a task the refusal exists to catch. Verified: this
+        was reachable with the validation split out, reproduced by
+        injecting a task-create between the SELECT and the write."""
         with self.transaction():
+            row = self.get_project(project_id)
+            if row is None:
+                raise KeyError(f"unknown project {project_id!r}")
+            if row["is_default"]:
+                raise ValueError("cannot archive the default project")
+            non_terminal = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM tasks WHERE project_id=?"
+                " AND status NOT IN ('done','failed','aborted')",
+                (project_id,),
+            ).fetchone()["n"]
+            if non_terminal:
+                raise ValueError(
+                    f"project {project_id} has {non_terminal} non-terminal task(s)"
+                )
             self._conn.execute(
                 "UPDATE projects SET archived=1, updated_at=? WHERE id=?",
                 (time.time(), project_id),
@@ -2946,12 +2956,32 @@ class Store:
 
     # -- change feed for the Phase-2 dashboard --------------------------------
 
-    def events_since(self, event_id: int, limit: int = 500) -> list[dict]:
+    def events_since(
+        self, event_id: int, limit: int = 500, project_id: int | None = None
+    ) -> list[dict]:
         """Audit-log rows after `event_id`. The append-only log doubles as the
-        dashboard's change feed: monotonic ids make SSE resumable by cursor."""
-        rows = self._conn.execute(
-            "SELECT * FROM events WHERE id > ? ORDER BY id LIMIT ?", (event_id, limit)
-        ).fetchall()
+        dashboard's change feed: monotonic ids make SSE resumable by cursor.
+
+        `project_id=None` is unfiltered — byte-for-byte today's exact query.
+        An int scopes task-owned events by their task's `project_id` via a
+        LEFT JOIN, never an INNER JOIN: task-less global events (`memory_*`,
+        `charter_*`, `config_warning`, `project_*`) always pass through
+        regardless of the filter, matching `Store.events`'s own project_id
+        filter (same shape, same reasoning). The `LIMIT` applies to the
+        already-filtered result set, so `server._stream`'s `cursor =
+        row["id"]` loop needs no change."""
+        if project_id is None:
+            rows = self._conn.execute(
+                "SELECT * FROM events WHERE id > ? ORDER BY id LIMIT ?",
+                (event_id, limit),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT e.* FROM events e LEFT JOIN tasks t ON t.id = e.task_id"
+                " WHERE e.id > ? AND (e.task_id IS NULL OR t.project_id = ?)"
+                " ORDER BY e.id LIMIT ?",
+                (event_id, project_id, limit),
+            ).fetchall()
         return [dict(r) | {"payload": json.loads(r["payload"])} for r in rows]
 
     def latest_event_id(self) -> int:
@@ -2960,55 +2990,108 @@ class Store:
         ).fetchone()
         return int(row["m"])
 
-    def run_metrics(self) -> dict:
-        """Run-level rollup across all tasks (spec §6)."""
-        totals = self._conn.execute(
-            "SELECT COALESCE(SUM(tokens_in),0) AS tin,"
-            " COALESCE(SUM(tokens_out),0) AS tout,"
-            " COALESCE(SUM(cache_creation_tokens),0) AS cwrite,"
-            " COALESCE(SUM(cache_read_tokens),0) AS cread,"
-            " COALESCE(SUM(cost_usd),0.0) AS cost,"
-            " COUNT(*) AS attempts,"
-            " COALESCE(SUM(finished_at-started_at),0) AS wall"
-            " FROM attempts WHERE finished_at IS NOT NULL"
-        ).fetchone()
-        by_status = {
-            r["status"]: r["n"]
-            for r in self._conn.execute(
-                "SELECT status, COUNT(*) AS n FROM tasks GROUP BY status"
-            ).fetchall()
-        }
-        by_model = [
-            dict(r)
-            for r in self._conn.execute(
-                "SELECT model, COUNT(*) AS attempts,"
-                " COALESCE(SUM(tokens_in),0) AS tokens_in,"
-                " COALESCE(SUM(tokens_out),0) AS tokens_out,"
-                " COALESCE(SUM(cost_usd),0.0) AS cost_usd"
-                # Same population as the headline totals above, which filter on
-                # `finished_at IS NOT NULL`. An attempt row exists from
-                # `start_attempt` and is completed only by `finish_attempt`, so
-                # every in-flight round — and every attempt whose
-                # `finish_attempt` was rolled back — was counted here and not
-                # there. `sum(by_model.attempts) > attempts` on any dashboard
-                # opened during a live run, with no explanation available to the
-                # reader, and costs and tokens agreed (the unfinished rows are
-                # 0) so only the count diverged — which reads as a rounding
-                # artefact rather than as two aggregates measuring two different
-                # things.
+    def run_metrics(self, project_id: int | None = None) -> dict:
+        """Run-level rollup across all tasks (spec §6).
+
+        `project_id=None` is unfiltered — byte-for-byte today's exact query.
+        An int scopes every aggregate via a join to `tasks` on the relevant
+        foreign key, filtered `tasks.project_id=?` — `attempts` and
+        `tool_requests` have no `project_id` of their own, so every one of
+        these joins through the task that owns the row, exactly the shape
+        `Store.events`'s own `project_id` filter already uses."""
+        if project_id is None:
+            totals = self._conn.execute(
+                "SELECT COALESCE(SUM(tokens_in),0) AS tin,"
+                " COALESCE(SUM(tokens_out),0) AS tout,"
+                " COALESCE(SUM(cache_creation_tokens),0) AS cwrite,"
+                " COALESCE(SUM(cache_read_tokens),0) AS cread,"
+                " COALESCE(SUM(cost_usd),0.0) AS cost,"
+                " COUNT(*) AS attempts,"
+                " COALESCE(SUM(finished_at-started_at),0) AS wall"
                 " FROM attempts WHERE finished_at IS NOT NULL"
-                " GROUP BY model ORDER BY cost_usd DESC"
-            ).fetchall()
-        ]
-        revisions = self._conn.execute(
-            "SELECT COALESCE(SUM(revision_count),0) AS r FROM tasks"
-        ).fetchone()
-        # How many tool requests are waiting on a human, run-wide: the queue is
-        # only useful if it is visible without opening a task.
-        waiting = self._conn.execute(
-            "SELECT COUNT(*) AS n FROM tool_requests WHERE status=?",
-            (ToolRequestStatus.PENDING.value,),
-        ).fetchone()
+            ).fetchone()
+            by_status = {
+                r["status"]: r["n"]
+                for r in self._conn.execute(
+                    "SELECT status, COUNT(*) AS n FROM tasks GROUP BY status"
+                ).fetchall()
+            }
+            by_model = [
+                dict(r)
+                for r in self._conn.execute(
+                    "SELECT model, COUNT(*) AS attempts,"
+                    " COALESCE(SUM(tokens_in),0) AS tokens_in,"
+                    " COALESCE(SUM(tokens_out),0) AS tokens_out,"
+                    " COALESCE(SUM(cost_usd),0.0) AS cost_usd"
+                    # Same population as the headline totals above, which filter on
+                    # `finished_at IS NOT NULL`. An attempt row exists from
+                    # `start_attempt` and is completed only by `finish_attempt`, so
+                    # every in-flight round — and every attempt whose
+                    # `finish_attempt` was rolled back — was counted here and not
+                    # there. `sum(by_model.attempts) > attempts` on any dashboard
+                    # opened during a live run, with no explanation available to the
+                    # reader, and costs and tokens agreed (the unfinished rows are
+                    # 0) so only the count diverged — which reads as a rounding
+                    # artefact rather than as two aggregates measuring two different
+                    # things.
+                    " FROM attempts WHERE finished_at IS NOT NULL"
+                    " GROUP BY model ORDER BY cost_usd DESC"
+                ).fetchall()
+            ]
+            revisions = self._conn.execute(
+                "SELECT COALESCE(SUM(revision_count),0) AS r FROM tasks"
+            ).fetchone()
+            # How many tool requests are waiting on a human, run-wide: the queue is
+            # only useful if it is visible without opening a task.
+            waiting = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM tool_requests WHERE status=?",
+                (ToolRequestStatus.PENDING.value,),
+            ).fetchone()
+        else:
+            totals = self._conn.execute(
+                "SELECT COALESCE(SUM(a.tokens_in),0) AS tin,"
+                " COALESCE(SUM(a.tokens_out),0) AS tout,"
+                " COALESCE(SUM(a.cache_creation_tokens),0) AS cwrite,"
+                " COALESCE(SUM(a.cache_read_tokens),0) AS cread,"
+                " COALESCE(SUM(a.cost_usd),0.0) AS cost,"
+                " COUNT(*) AS attempts,"
+                " COALESCE(SUM(a.finished_at-a.started_at),0) AS wall"
+                " FROM attempts a JOIN tasks t ON a.task_id = t.id"
+                " WHERE a.finished_at IS NOT NULL AND t.project_id=?",
+                (project_id,),
+            ).fetchone()
+            by_status = {
+                r["status"]: r["n"]
+                for r in self._conn.execute(
+                    "SELECT status, COUNT(*) AS n FROM tasks"
+                    " WHERE project_id=? GROUP BY status",
+                    (project_id,),
+                ).fetchall()
+            }
+            by_model = [
+                dict(r)
+                for r in self._conn.execute(
+                    "SELECT a.model AS model, COUNT(*) AS attempts,"
+                    " COALESCE(SUM(a.tokens_in),0) AS tokens_in,"
+                    " COALESCE(SUM(a.tokens_out),0) AS tokens_out,"
+                    " COALESCE(SUM(a.cost_usd),0.0) AS cost_usd"
+                    " FROM attempts a JOIN tasks t ON a.task_id = t.id"
+                    " WHERE a.finished_at IS NOT NULL AND t.project_id=?"
+                    " GROUP BY a.model ORDER BY cost_usd DESC",
+                    (project_id,),
+                ).fetchall()
+            ]
+            revisions = self._conn.execute(
+                "SELECT COALESCE(SUM(revision_count),0) AS r FROM tasks"
+                " WHERE project_id=?",
+                (project_id,),
+            ).fetchone()
+            waiting = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM tool_requests tr"
+                " JOIN tasks t ON tr.task_id = t.id"
+                " WHERE tr.status=? AND t.project_id=?",
+                (ToolRequestStatus.PENDING.value, project_id),
+            ).fetchone()
         cwrite, cread = int(totals["cwrite"]), int(totals["cread"])
         return {
             "tokens_in": int(totals["tin"]),

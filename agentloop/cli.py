@@ -44,9 +44,49 @@ from .store import Store
 from .toolpolicy import declared_tools, decision_effect
 
 
+def _project_ref(raw: str | None) -> int | str | None:
+    """Every `--project`/positional project argument on this CLI is typed
+    `str` by argparse (none of them declare `type=int`, because the same
+    flag also has to accept a name) -- so `Store.resolve_project`'s `int`
+    branch, which is what makes a numeric id resolve, was unreachable from
+    the CLI: `resolve_project("3")` took the name-lookup branch and raised
+    `unknown project '3'` even when project 3 exists. Every CLI call site
+    funnels its raw project text through this first. A project name that is
+    itself all digits becomes untypeable through this CLI after this fix --
+    the same trade-off `resolve_project` already made by using
+    `isinstance(project, int)` as its own dispatch."""
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return raw
+
+
 def _memory_cmd(store: Store, args) -> int:
+    """`--project` is resolved here, once, only for the two sub-commands
+    that need it to scope a QUERY or a WRITE (`list`/`add`) -- a bad
+    name/id raises `KeyError`, caught by `main`'s existing handler.
+    `approve`/`reject`/`pin`/`unpin` operate on a `memory_id` that already
+    identifies its own project row; `--project` is accepted on those four
+    for symmetry/discoverability but never consulted.
+
+    `list` and `add` resolve an omitted `--project` DIFFERENTLY, on
+    purpose: `Store.memory_list`'s own docstring names this the one place
+    `project_id=None` ("every project", matching `list_tasks`'s unfiltered
+    convention) and `resolve_project(None)` ("the default project") would
+    otherwise collide -- `list` must pass the raw, unresolved `None`
+    through so an unflagged `agentloop memory list` still shows every
+    registered project's facts, exactly as it did before this slice. `add`
+    is the opposite: a write must land in exactly one concrete project, so
+    resolving an omitted `--project` to the default there is correct."""
     if args.mem_cmd == "list":
-        rows = store.memory_list()
+        project_id = (
+            None
+            if args.project is None
+            else store.resolve_project(_project_ref(args.project))
+        )
+        rows = store.memory_list(project_id=project_id)
         if not rows:
             print("(no memory yet)")
         for r in rows:
@@ -62,8 +102,14 @@ def _memory_cmd(store: Store, args) -> int:
         store.memory_delete(args.memory_id)
         print(f"Memory {args.memory_id} deleted.")
     elif args.mem_cmd == "add":
+        project_id = store.resolve_project(_project_ref(args.project))
         store.memory_write(
-            args.tier, args.key, args.value, approved=args.approved, pinned=args.pinned
+            args.tier,
+            args.key,
+            args.value,
+            approved=args.approved,
+            pinned=args.pinned,
+            project_id=project_id,
         )
         state = "approved" if args.approved else "pending approval"
         pin = ", pinned" if args.pinned else ""
@@ -652,10 +698,15 @@ def main(argv: list[str] | None = None) -> int:
 
     m = sub.add_parser("memory", help="Inspect and gate the memory store")
     msub = m.add_subparsers(dest="mem_cmd", required=True)
-    msub.add_parser("list", help="Show all facts, both tiers")
+    mlist = msub.add_parser("list", help="Show all facts, both tiers")
+    mlist.add_argument("--project", default=None, help="Project name or id")
     for name in ("approve", "reject", "pin", "unpin"):
         mc = msub.add_parser(name, help=f"{name} a memory fact")
         mc.add_argument("memory_id", type=int)
+        # A memory_id already identifies its own project row -- --project is
+        # not needed to resolve it, but the flag stays available here for
+        # symmetry/discoverability with list/add, unused by these four.
+        mc.add_argument("--project", default=None, help="Project name or id")
     ma = msub.add_parser("add", help="Add a fact directly")
     ma.add_argument("key")
     ma.add_argument("value")
@@ -666,6 +717,7 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Pin: always injected, ahead of the cap (still needs approval to be read)",
     )
+    ma.add_argument("--project", default=None, help="Project name or id")
 
     tl = sub.add_parser("tools", help="The agent-requested tool queue")
     tlsub = tl.add_subparsers(dest="tools_cmd", required=True)
@@ -791,9 +843,13 @@ def main(argv: list[str] | None = None) -> int:
         # output byte-for-byte, never "every project" unfiltered.
         if args.cmd == "run":
             raw = getattr(args, "project", None)
-            args.project_id = store.resolve_project(raw) if raw is not None else None
+            args.project_id = (
+                store.resolve_project(_project_ref(raw)) if raw is not None else None
+            )
         elif args.cmd in ("add", "plan", "status", "events"):
-            args.project_id = store.resolve_project(getattr(args, "project", None))
+            args.project_id = store.resolve_project(
+                _project_ref(getattr(args, "project", None))
+            )
         return _dispatch(args, store, loop)
     except (KeyError, ValueError) as exc:
         # Bad id (no such task/memory row), or an id used with the wrong command
@@ -990,12 +1046,12 @@ def _project_cmd(store: Store, args) -> int:
         print(f"Project {pid} registered: {args.name}")
 
     elif args.project_cmd == "rename":
-        pid = store.resolve_project(args.old_name)
+        pid = store.resolve_project(_project_ref(args.old_name))
         store.rename_project(pid, args.new_name)
         print(f"Project {pid} renamed: {args.old_name} -> {args.new_name}")
 
     elif args.project_cmd == "repoint":
-        pid = store.resolve_project(args.name)
+        pid = store.resolve_project(_project_ref(args.name))
         # --workspace-mode omitted means "keep the current one" -- never a
         # silent reset to scratch, which would discard a worktree-mode
         # project's durability guarantees (round commits, recoverable
@@ -1017,12 +1073,12 @@ def _project_cmd(store: Store, args) -> int:
             )
 
     elif args.project_cmd == "archive":
-        pid = store.resolve_project(args.name)
+        pid = store.resolve_project(_project_ref(args.name))
         store.archive_project(pid)
         print(f"Project {pid} archived: {args.name}")
 
     elif args.project_cmd == "use":
-        pid = store.resolve_project(args.name)
+        pid = store.resolve_project(_project_ref(args.name))
         store.set_default_project(pid)
         print(f"Project {pid} is now the active default: {args.name}")
     return 0

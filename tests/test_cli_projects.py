@@ -391,3 +391,106 @@ def test_status_shows_the_tasks_own_project_workspace_not_the_global_config(
     # `<workspace_root>/task-1` path with no repo identity in it at all.
     assert "repo-kappa" in ws_line
     assert ws_line.rstrip().endswith("task-1")
+
+
+# -- agentloop memory --project (Phase 6) ------------------------------------
+
+
+def test_memory_list_with_project_flag_scopes_facts(capsys, tmp_path):
+    repo = tmp_path / "repo-lambda"
+    repo.mkdir()
+    main(["project", "add", "Lambda", "--repo-root", str(repo)])
+    capsys.readouterr()
+
+    main(["memory", "add", "style", "use tabs", "--project", "Lambda"])
+    main(["memory", "add", "style", "use spaces"])  # goes to Default
+    capsys.readouterr()
+
+    rc = main(["memory", "list", "--project", "Lambda"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "use tabs" in out
+    assert "use spaces" not in out
+
+
+def test_memory_add_with_unknown_project_is_a_clean_error(capsys):
+    rc = main(["memory", "add", "k", "v", "--project", "NoSuchProject"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "unknown project 'NoSuchProject'" in err
+    assert "Traceback" not in err
+
+
+def test_memory_list_with_no_project_flag_shows_every_project(capsys, tmp_path):
+    """[RED-FIRST, HIGH regression] `Store.memory_list`'s own docstring names
+    this the one place `project_id=None` ("every project") and
+    `resolve_project(None)` ("the default project") would collide if a
+    caller isn't careful -- an omitted `--project` on `memory list` must
+    show every registered project's facts, exactly as it did before this
+    slice, never silently narrow to just the default."""
+    repo = tmp_path / "repo-mu"
+    repo.mkdir()
+    main(["project", "add", "Mu", "--repo-root", str(repo)])
+    capsys.readouterr()
+
+    main(["memory", "add", "style", "use tabs", "--project", "Mu"])
+    main(["memory", "add", "style", "use spaces"])  # goes to Default
+    capsys.readouterr()
+
+    rc = main(["memory", "list"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "use tabs" in out
+    assert "use spaces" in out
+
+
+# -- numeric `--project`/positional project ids (hunter HIGH #2) -----------
+
+
+def test_project_flag_accepts_a_numeric_id_not_only_a_name(capsys, tmp_path):
+    """[RED-FIRST, HIGH regression] `Store.resolve_project` has always
+    accepted an `int` id directly, but every `--project`/positional project
+    argument on this CLI is typed `str` by argparse -- so
+    `resolve_project("3")` took the name-lookup branch and raised
+    `unknown project '3'` even when project 3 existed, making the id half of
+    "Project name or id" (the CLI's own `--project` help text) unreachable.
+    Before the fix (`_project_ref`), this failed with exactly that error."""
+    repo = tmp_path / "repo-nu"
+    repo.mkdir()
+    rc = main(["project", "add", "Nu", "--repo-root", str(repo)])
+    assert rc == 0
+    out = capsys.readouterr().out
+    # "Project {pid} registered: {name}"
+    pid = int(out.split("Project ", 1)[1].split(" registered", 1)[0])
+
+    # --project as a numeric id (memory list/add, and `add`/`plan`/`status`
+    # all resolve through the same _project_ref path).
+    rc = main(["memory", "add", "style", "use tabs", "--project", str(pid)])
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "Traceback" not in err
+
+    rc = main(["memory", "list", "--project", str(pid)])
+    assert rc == 0
+    assert "use tabs" in capsys.readouterr().out
+
+
+def test_project_positional_name_or_id_accepts_a_numeric_id(capsys, tmp_path):
+    """[RED-FIRST, HIGH regression] `project rename/repoint/archive/use` take
+    a positional NAME_OR_ID; before the fix this only ever resolved a name,
+    identically to the --project flag case above."""
+    repo = tmp_path / "repo-xi"
+    repo.mkdir()
+    rc = main(["project", "add", "Xi", "--repo-root", str(repo)])
+    assert rc == 0
+    out = capsys.readouterr().out
+    pid = int(out.split("Project ", 1)[1].split(" registered", 1)[0])
+
+    rc = main(["project", "rename", str(pid), "Xi2"])
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "Traceback" not in err
+
+    rc = main(["project", "use", str(pid)])
+    assert rc == 0
+    assert "Traceback" not in capsys.readouterr().err
