@@ -722,12 +722,26 @@ def workspace_for(
     something this function forces on them. Total like every `vcs` entry
     point: a failed `init_repo` is not raised here, it is returned by `vcs` and
     the path is handed back regardless — the caller's own retry/escalation
-    path (unchanged by this slice) is what acts on it."""
-    if (
-        config is not None
-        and config.workspace_mode == "worktree"
-        and repo_root is not None
-    ):
+    path (unchanged by this slice) is what acts on it.
+
+    **Dispatch is on `repo_root is not None` alone (slice 10 Phase 3), never
+    `config.workspace_mode`.** Before slice 10 those two signals were always
+    identical — one `Loop` had exactly one `LoopConfig`, so its global
+    `workspace_mode` and "was a repo_root resolved" always agreed. Phase 3
+    made a per-task `repo_root` resolution ( `Loop._worktree_repo_root(task)`
+    can answer worktree mode for a task belonging to a DIFFERENT project than
+    whatever `self.config.workspace_mode` the `Loop` itself was constructed
+    with) independently variable from the `Loop`'s own global config — so
+    gating here on `config.workspace_mode` reads the wrong (stale, global)
+    signal and silently falls through to the scratch-shaped path while
+    `vcs.init_repo` (this function's own callee, a few lines below) dispatches
+    on `repo_root is not None` alone and takes the worktree branch anyway —
+    checking out a real worktree at the wrong location, inside whatever
+    `root`/`workspace_root` scratch mode uses, escaping `worktree_root`'s
+    isolation entirely. `config` is still required in this branch (for
+    `worktree_root_for(config, repo_root)` and the `vcs.*` knobs below), just
+    no longer part of the *decision* of which branch to take."""
+    if config is not None and repo_root is not None:
         ws = worktree_root_for(config, repo_root) / f"task-{task_id}"
         if create:
             from . import vcs
