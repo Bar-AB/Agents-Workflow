@@ -38,12 +38,34 @@ export interface Task {
   kind: TaskKind
   // Which plan produced this task; null for hand-defined ones.
   plan_id: number | null
+  // Which project this task belongs to. Always populated — Store.add_task
+  // resolves an omitted project to the default project before the row is ever
+  // written, so this is never null the way `plan_id` legitimately is.
+  project_id: number
   // Task ids this one waits on. A pending task with an unfinished dependency is
   // not stuck — it is simply not claimable yet.
   depends_on: number[]
   // Only meaningful on a plan row (null elsewhere): until a human signs the plan
   // off, none of its tasks are claimable.
   plan_approved: boolean | null
+}
+
+// Mirrors the `projects` table verbatim (Store.list_projects/get_project,
+// `SELECT *` wrapped in `dict(row)` with no coercion) — `is_default` and
+// `archived` are SQLite INTEGER columns, so the server sends 0/1, never a
+// JSON boolean. Typed `number` here rather than `boolean` for the same
+// reason `MemoryFact.approved`/`.pinned` are: a `boolean` type would be a
+// lie the compiler couldn't catch, since `JSON.parse` hands back whatever
+// the wire actually carried.
+export interface Project {
+  id: number
+  name: string
+  repo_root: string
+  workspace_mode: string
+  is_default: number
+  archived: number
+  created_at: number
+  updated_at: number
 }
 
 // Mirrors models.ToolRequestStatus. `auto` and `approved` *are* the grant —
@@ -344,6 +366,9 @@ export interface LoopConfigView {
   // config the running process already loaded, not a live knob.
   repo_root: string
   workspace_mode: string
+  // slice 10: which project to select on first load, before a switcher choice
+  // (localStorage or a user click) overrides it.
+  default_project_id: number
 }
 
 // Mirrors the POST /api/config/repo request body and its 200 response (same

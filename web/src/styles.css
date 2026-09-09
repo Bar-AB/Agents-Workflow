@@ -70,6 +70,10 @@ body {
 
 .spacer { flex: 1; }
 
+/* Overrides the generic `select { width: 100% }` below, which would
+   otherwise fight the header's flex row for space. */
+.project-switcher { width: auto; max-width: 220px; margin-bottom: 0; }
+
 /* ---- generic panel ---- */
 .panel {
   background: var(--panel);
