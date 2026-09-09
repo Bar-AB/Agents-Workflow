@@ -1760,13 +1760,34 @@ class Store:
             (task_id, time.time(), kind, json.dumps(payload)),
         )
 
-    def events(self, task_id: int | None = None) -> list[dict]:
-        if task_id is None:
-            rows = self._conn.execute("SELECT * FROM events ORDER BY id").fetchall()
-        else:
+    def events(
+        self, task_id: int | None = None, project_id: int | None = None
+    ) -> list[dict]:
+        """`task_id` and `project_id` are mutually exclusive filters --
+        `task_id` given wins, matching the CLI's own "task_id present ->
+        per-task, absent -> per-project" branching. `project_id` filters via
+        a LEFT JOIN to `tasks` (never INNER): task-less global events
+        (`project_created`, `config_warning`, `charter_*`, `memory_*`, ...)
+        stay visible regardless of the filter, matching this project's own
+        design ("same register as charter/config staying global") and the
+        identical LEFT-JOIN shape `events_since` uses for its own project
+        scoping -- an INNER JOIN would silently exclude every task-less row
+        whenever a project filter is applied, which was measured live and is
+        NOT what "audit trail for a project" is supposed to mean.
+        `agentloop events` with neither filter still returns every row,
+        unchanged."""
+        if task_id is not None:
             rows = self._conn.execute(
                 "SELECT * FROM events WHERE task_id=? ORDER BY id", (task_id,)
             ).fetchall()
+        elif project_id is not None:
+            rows = self._conn.execute(
+                "SELECT e.* FROM events e LEFT JOIN tasks t ON e.task_id = t.id"
+                " WHERE e.task_id IS NULL OR t.project_id=? ORDER BY e.id",
+                (project_id,),
+            ).fetchall()
+        else:
+            rows = self._conn.execute("SELECT * FROM events ORDER BY id").fetchall()
         return [dict(r) | {"payload": json.loads(r["payload"])} for r in rows]
 
     # -- memory (spec §7) ----------------------------------------------------
