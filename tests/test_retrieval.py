@@ -11,7 +11,7 @@ import sys
 import pytest
 
 from agentloop.config import LoopConfig
-from agentloop.memory import MemoryService, _MAX_FACTS_IN_PROMPT
+from agentloop.memory import _MAX_FACTS_IN_PROMPT, MemoryService
 from agentloop.models import Task
 from agentloop.retrieval import (
     HashingBackend,

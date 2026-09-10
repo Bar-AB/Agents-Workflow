@@ -12,7 +12,6 @@ snapshot was attempted and the read itself failed.
 
 from __future__ import annotations
 
-
 import pytest
 
 from agentloop import vcs

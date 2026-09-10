@@ -12,8 +12,8 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 import shutil
+import subprocess
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -23,7 +23,6 @@ import pytest
 from agentloop import vcs
 from agentloop.config import LoopConfig
 from agentloop.executor import clear_workspace
-
 
 # -- fixtures and helpers ----------------------------------------------------
 

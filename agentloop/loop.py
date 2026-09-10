@@ -80,7 +80,6 @@ from .runner import (
 )
 from .store import Store
 
-
 _IDLE_POLL_SECONDS = 0.5
 
 _PARK_REASON_PREFIX = "Awaiting tool approval: "

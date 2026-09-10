@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from agentloop import runner
 from agentloop.config import (
     CACHE_READ_MULTIPLIER,
     CACHE_WRITE_MULTIPLIER,
@@ -14,7 +15,6 @@ from agentloop.config import (
 from agentloop.loop import Loop
 from agentloop.models import RunResult, Task, TaskStatus
 from agentloop.registry import Registry
-from agentloop import runner
 from agentloop.runner import MockRunner, extract_usage
 from agentloop.store import Store
 from tests.test_loop import APPROVE, REVISE  # reuse scripted verdicts

@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from agentloop.agents import _MAX_TOOL_INPUT_CHARS
 from agentloop import loop as loop_module
+from agentloop.agents import _MAX_TOOL_INPUT_CHARS
 from agentloop.config import LoopConfig
 from agentloop.executor import TestExecutor
 from agentloop.loop import Loop
@@ -14,7 +14,6 @@ from agentloop.models import RunResult, Task, TaskStatus
 from agentloop.registry import Registry
 from agentloop.runner import MockRunner
 from agentloop.store import Store
-
 
 APPROVE = "VERDICT: approve CONFIDENCE: 0.92 TESTS: pass\nMeets all criteria."
 REVISE = (

@@ -16,10 +16,8 @@ from pathlib import Path
 import pytest
 
 from agentloop import vcs
-
 from agentloop.config import LoopConfig
 from tests.test_worktree_vcs import git, git_write, make_config, make_repo
-
 
 # Fixtures are defined here rather than imported: pytest resolves them by name
 # and ruff reads an imported-then-shadowed fixture as a redefinition.

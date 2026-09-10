@@ -41,7 +41,7 @@ from .runner import (
 )
 from .server import serve_forever
 from .store import Store
-from .toolpolicy import declared_tools, decision_effect
+from .toolpolicy import decision_effect, declared_tools
 
 
 def _project_ref(raw: str | None) -> int | str | None:

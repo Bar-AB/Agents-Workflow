@@ -21,7 +21,6 @@ import pytest
 from agentloop import vcs
 from agentloop.config import LoopConfig
 
-
 # -- fixtures and helpers ----------------------------------------------------
 
 

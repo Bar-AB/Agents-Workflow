@@ -55,7 +55,6 @@ from .models import (
     ToolRequestStatus,
     Verdict,
 )
-
 from .runner import resolve_tools, tools_sharing_capability
 
 _CLAIM_ATTEMPTS = 100

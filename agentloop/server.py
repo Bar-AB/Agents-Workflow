@@ -32,7 +32,7 @@ from .models import Task, ToolRequest, ToolRequestStatus
 from .registry import Registry
 from .runner import LOGICAL_TOOL_MAP, resolve_tools, tools_sharing_capability
 from .store import Store
-from .toolpolicy import declared_tools, decision_effect
+from .toolpolicy import decision_effect, declared_tools
 
 _WEB_DIST = Path(__file__).resolve().parent.parent / "web" / "dist"
 

@@ -5,7 +5,6 @@ disables")."""
 
 from __future__ import annotations
 
-
 from agentloop.config import LoopConfig
 from agentloop.executor import credential_like_names
 from agentloop.loop import Loop

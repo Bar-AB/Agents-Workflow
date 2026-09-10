@@ -28,9 +28,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from agentloop import vcs
 from agentloop.cli import main
 from agentloop.store import Store
-from agentloop import vcs
 from tests.test_worktree_vcs import git_write, make_repo
 
 

@@ -4,7 +4,7 @@ dropped by the alphabetical tail-off past the cap."""
 
 import pytest
 
-from agentloop.memory import MemoryService, _MAX_FACTS_IN_PROMPT, _MAX_PINNED_FACTS
+from agentloop.memory import _MAX_FACTS_IN_PROMPT, _MAX_PINNED_FACTS, MemoryService
 from agentloop.store import Store
 
 

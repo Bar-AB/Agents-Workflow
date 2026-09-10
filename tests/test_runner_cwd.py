@@ -28,7 +28,6 @@ from agentloop.registry import Registry
 from agentloop.runner import ClaudeAgentOptions, ClaudeSDKRunner, MockRunner
 from agentloop.store import Store
 
-
 # `[claude]` is an optional extra (`pip install -e ".[dev]"` is the documented
 # install), and `ClaudeAgentOptions` is None without it. Three tests here are
 # claims about the *vendor's* option object and cannot run without the vendor;
