@@ -216,7 +216,11 @@ instead of claimed away.
   id extends at a `-` boundary (so `gpt-5-mini-…` prices as `gpt-5-mini`, not
   `gpt-5`). It normalizes at the *pricing* boundary only — `RunResult.model`
   keeps the serving snapshot, because which snapshot ran is provenance.
-- `models.py` — Task (incl. `kind` 'task'|'plan' and `plan_id`), TaskStatus,
+- `models.py` — Task (incl. `kind` 'task'|'plan', `plan_id`, and `project_id`
+  (slice 10): `int | None`, resolved to a concrete project by
+  `Store.add_task` before the row is ever written — the field on the
+  in-memory dataclass may be `None`, but a row read back from the store
+  never is), TaskStatus,
   Verdict (incl. `findings`: what the validator checked, a *copy* of a slice of
   `reasoning` and never a piece removed from it), VerdictKind, AgentSpec (incl.
   `runner`: which backend serves this role, `None` = the loop's default —
@@ -255,7 +259,8 @@ instead of claimed away.
   tool, for one task, by one role; `UNIQUE(task_id, role, tool)` and deliberately
   no foreign keys — an FK would raise inside a paid transaction; an `auto`/`approved`
   row *is* the grant — no separate grant table, so a permission never exists without
-  the request that justifies it). Schema is plain SQL so Postgres migration isn't a
+  the request that justifies it), and projects (slice 10 — see the dedicated
+  paragraph below `task_deps`). Schema is plain SQL so Postgres migration isn't a
   rewrite; `_migrate()` adds later columns to existing dbs (a whole new table needs
   no entry — `CREATE TABLE IF NOT EXISTS` covers it). `release_claim` — written
   only by `set_status` when returning to `pending` — clears the `claimed_by` lease,
@@ -349,6 +354,48 @@ instead of claimed away.
   edge that would close a cycle (incl. self-edges) — a store-level invariant,
   not a hope about the planner. Also `dependencies`/`dependents`/`plan_tasks`/
   `set_plan_approved`/`is_plan_approved`.
+  `projects` (slice 10) is the multi-project registry: `id`, `name`
+  (`UNIQUE`), `repo_root`, `workspace_mode`, `is_default`, `archived`,
+  timestamps — plain `INTEGER` for `is_default`/`archived`, so every reader
+  (`server.py`'s JSON responses included) sees `0`/`1`, never a coerced
+  boolean. `_ensure_default_project()` is a three-way branch run at
+  `Store.__init__`: a project already marked default wins outright; an
+  empty table bootstraps one via `INSERT OR IGNORE` (race-safe against two
+  `agentloop` processes opening a brand-new db at once); a table with rows
+  but none marked default repairs by promoting the lowest-id row rather
+  than minting a second bootstrap project and orphaning the real one.
+  `resolve_project(project: int | str | None) -> int` is the one seam every
+  later caller — CLI, server, memory, loop — goes through: `None` is the
+  default project's id (never raises), an `int` must exist or raises
+  `KeyError`, a `str` is looked up by name or raises the same. Also
+  `create_project`/`get_project`/`get_project_by_name`/`list_projects`/
+  `rename_project`/`repoint_project`/`set_default_project`/
+  `archive_project` (refuses the default project or any project holding a
+  non-terminal task, the whole check-and-write **inside one
+  `transaction()`** after a hunter reproduced a real gap between a separate
+  check and write under live `ThreadingHTTPServer` concurrency — a task
+  created in that gap was invisible to the refusal). `list_tasks`/
+  `claim_next_task`/`events`/`events_since`/`run_metrics`/`memory_list` all
+  gain an optional `project_id` filter where **`None` means unfiltered —
+  every project**, matching the pre-slice-10, single-repository loop's
+  behavior exactly when nothing is scoped; `events`/`events_since` use a
+  `LEFT JOIN` against `tasks`, not an `INNER JOIN`, so a task-less global
+  event (`project_created`, `charter_set`, `memory_promoted`,
+  `config_warning`) always passes a project filter rather than being
+  silently dropped by it. `add_dependency` refuses an edge across two
+  different projects' tasks — a planner graph has no shared lifecycle to
+  reconcile the ordering against. The `memory` table itself gained a
+  `project_id` column and moved its uniqueness from `UNIQUE(tier, key)` to
+  `UNIQUE(project_id, tier, key)` — the **one** deliberate exception to
+  "`_migrate()` only ever adds a column," since SQLite cannot `ALTER` a
+  `UNIQUE` constraint in place. `_rebuild_memory_unique_constraint` recreates
+  the table under the new constraint id-preserving (an existing
+  `memory_hits` row or `retrieval` event payload still resolves to the same
+  fact afterward) and `AUTOINCREMENT`-preserving (reads the old table's
+  `sqlite_sequence` value before dropping it and carries it forward, so an
+  id freed by a pre-rebuild delete can never be reused by a later insert —
+  the original version of this rebuild missed exactly that half and was a
+  hunter CRITICAL finding). Full narrative: `docs/history/slice-10.md`.
 - `registry.py` — agent registry: role, model, system prompt, tools, context
   budget, version, and (slice 4) the `runner` a role is pinned to. Defaults in
   code (`worker`, `validator`, `summarizer`
@@ -511,6 +558,11 @@ instead of claimed away.
   raw previous-output+feedback block when a handoff has fired.
   Validator first line: `VERDICT: <kind> CONFIDENCE: <0-1> TESTS: <pass|fail|na>`.
   Injects approved memory facts and real test results into prompts.
+  `_memory_block(memory, query="", task_id=None, project_id=None)` (slice 10)
+  passes `project_id` through to `MemoryService.facts_for_prompt`; its three
+  call sites (`run_worker`/`run_planner`/`run_validator`) pass the task's or
+  plan-task's own `project_id`, so a worker never sees another registered
+  project's facts injected into its prompt.
   `_charter_block(store)` returns `(block, version)` and `("", None)` when there
   is no charter — the same "empty means absent" convention `_memory_block` uses,
   which is what makes the byte-for-byte guarantee hold structurally rather than
@@ -563,6 +615,14 @@ instead of claimed away.
   gained a read-only-retry handler: `rmtree(ignore_errors=True)` cannot delete
   the read-only objects git writes, so before slice 6 fixed it the redo fallback
   left the workspace standing with the previous round still in it.
+  `workspace_for`'s worktree-mode dispatch (slice 10) reads
+  `config is not None and repo_root is not None`, not
+  `config.workspace_mode == "worktree" and repo_root is not None` as it did
+  before this slice — the old condition read the **process-global**
+  `LoopConfig`'s mode rather than the calling task's own resolved project,
+  a reviewer CRITICAL that could land a worktree-mode project's checkouts
+  inside the orchestrator's own repository. Now mode-agnostic, matching
+  `vcs.init_repo`'s contract, which was already correct.
 - `vcs.py` — **per-task workspace version control (slice 6).** One throwaway git
   repo per `.agentloop/ws/task-{id}/`, no remote and no shared timeline, so
   `redo`/`reject` recover the discarded round instead of destroying it.
@@ -686,6 +746,16 @@ instead of claimed away.
   attached to the attempt it fed, so `agents._invoke` logs it. With no query (or
   `backend=None`) provenance is None: exactly the pre-slice-2 alphabetical
   selection, and nothing logged.
+  `facts_for_prompt`/`read`/`remember`/`maybe_promote`/`_find`/
+  `_record_reads` all gained `project_id` (slice 10) — **a different
+  "project" than the tier name above**, the registered-repo kind from
+  `store.projects`, resolved once via `Store.resolve_project` at the top of
+  `facts_for_prompt`/`maybe_promote` so a worker's prompt is only ever
+  injected with its own project's facts. `maybe_promote` originally never
+  resolved it at all — a hunter CRITICAL, since under `Store.memory_list`'s
+  own "`None` means every project" convention that made a fact's promotion
+  candidacy get decided against every registered project's facts, not just
+  its own.
 - `retrieval.py` — **RetrievalBackend protocol: the memory-relevance seam**
   (slice 2), same shape as `ModelRunner`. `embed()` is a stdlib hashed
   bag-of-words vector (blake2b, *not* builtin `hash` — that is salted per
@@ -794,10 +864,43 @@ instead of claimed away.
   gap audited (`history_preserved`), since `clear_workspace` would rmtree exactly
   the ref `vcs.rollback` had just refused to lose, under a warning reading
   "nothing happened".
+  `_worktree_repo_root(self, task: Task | None = None)` (slice 10) reads the
+  given task's own project row for its `repo_root`/`workspace_mode` unless
+  that project is still sitting at the bootstrap placeholder
+  (`repo_root="."`, `workspace_mode="scratch"`), in which case it defers to
+  the process's own `LoopConfig` — narrowed to that exact condition after a
+  broader "always defer for the Default project" version was found to make
+  a later `project repoint` on Default permanently inert. `Loop.__init__`
+  reconciles the bootstrap Default project against the process's own
+  `LoopConfig` on startup, gated specifically on
+  `config.workspace_mode == "worktree"` so an ordinary scratch-mode config
+  with unused worktree knobs filled in never mutates the shared Default
+  row. `plan()`/`run()`/`_run_serial`/`_run_parallel` all gain an optional
+  `project_id` — `run(project_id=None)` spans every registered project in
+  one pass (the sequential-loop-unchanged default); a concrete id scopes
+  the claim to one project only.
 - `server.py` — REST + SSE dashboard backend, stdlib `http.server` only. The
   append-only `events` table *is* the change feed: SSE is a `WHERE id > cursor`
   query, so reconnects resume losslessly via `Last-Event-ID` and the dashboard
   never mirrors state into a second store.
+  Slice 10 adds `GET/POST /api/projects` and
+  `POST /api/projects/{id}/{rename|repoint|archive|use}`, plus `?project=`
+  scoping on `GET /api/tasks`, `/api/metrics`, `/api/memory`,
+  `/api/tool_requests` and `/api/stream` (deliberately **not**
+  `/api/events`, which nothing in `web/` calls — the live feed comes from
+  `/api/stream`). `_parse_project_query` is the shared parser: absent
+  `?project=` is `None` (unfiltered), a malformed value is a `400`, and a
+  well-formed id naming no real project is a `404` — not a `200` with an
+  empty list, which used to be indistinguishable from "this real project
+  just has nothing yet." `_tool_requests_list` cross-checks `?project=` and
+  `?task_id=` against each other when both are given, answering empty on a
+  mismatch rather than silently honoring `task_id` alone and leaking the
+  other project's row through the `project` filter that was supposed to
+  gate it. `_project_action` (the shared handler behind
+  `rename`/`repoint`/`archive`/`use`) fails closed on an unrecognized verb
+  rather than falling through to a fake 200 success — unreachable through
+  real HTTP today only because `do_POST`'s own routing guard already
+  restricts the verb, so this is defense in depth, not a live gap.
 - `cli.py` — argparse CLI, structured plain output. `charter show|set|clear|
   history` is the human write surface for the project charter; a `ValueError`
   from `charter_set` renders through `main`'s handler as `error: ...`, which is
@@ -807,6 +910,25 @@ instead of claimed away.
   an agents.json decision and are applied on top of it. `eval` additionally
   takes `--mode verdict|batch` (slice 6); `--mode batch` with a non-mock
   `--runner` is refused with a non-zero exit rather than quietly downgraded.
+  Slice 10 adds `--project` to `add`/`plan`/`run`/`status`/`events` and
+  `agentloop memory list|approve|reject|add|pin|unpin`, plus a new
+  `agentloop project add|rename|repoint|list|archive|use` subcommand.
+  `--project` is deliberately **not** resolved on `run` when omitted
+  (`Loop.run(project_id=None)` spans every registered project, and
+  resolving a bare `agentloop run` to just the default would make that
+  unreachable from the CLI); every other project-aware command resolves an
+  omission to the default. `_project_ref(raw)` tries `int(raw)` before
+  falling back to the raw string, applied at every `--project`/positional
+  project-name call site — without it, argparse hands `Store.resolve_project`
+  a plain `str` even for a numeric id, so `--project 3` always took the
+  name-lookup branch and raised `unknown project '3'` even when project 3
+  existed. `_memory_cmd`'s `list` and `add` resolve an omitted `--project`
+  **differently** on purpose: `Store.memory_list`'s own `None` means "every
+  project," `Store.resolve_project(None)` means "the default project," and
+  the two would otherwise collide — `list` passes the raw, unresolved `None`
+  through so a bare `agentloop memory list` still shows every registered
+  project's facts, and `add` (a write, which must land in exactly one
+  project) resolves it as before.
 - `web/` — Vite + React + TypeScript dashboard. `types.ts` mirrors the server's
   JSON shapes; keep them in sync when changing an endpoint. `test_runs` reaches
   the API wholesale (`server.py` returns the rows), so `coverage_percent` needed
@@ -817,6 +939,26 @@ instead of claimed away.
   `discarded_ref`, `degraded` and `unrecoverable_nested_repos` are **absent, not
   null**, when they do not apply, so each is tested before it is rendered and the
   nested-repo line names the gap rather than implying a recovery surface.
+  Slice 10 adds `ProjectSwitcher.tsx` (a header dropdown driving `?project=`
+  on every fetch and the SSE subscription — never a client-side filter) and
+  a `Project` interface with `is_default`/`archived` typed `number`, not
+  `boolean` — confirmed empirically that the server sends SQLite's raw
+  `0`/`1`, the same reason `MemoryFact.approved`/`.pinned` are typed that
+  way. `useLiveLoop(projectId)` guards every fetch with a "latest ref"
+  check before its `setState` calls — without it, a slower response from a
+  project the user has since switched away from can resolve after the new
+  project's own response and silently overwrite it, a genuine race two
+  independent review passes found and a third confirmed fixed.
+  `ProjectSwitcher`'s choice persists to `localStorage` with a **three-state
+  encoding** (unset / explicit `"all"` / a specific id) — collapsing
+  "nothing chosen yet" and "explicitly chose All projects" onto one
+  sentinel (a missing key) would make choosing "All projects" not survive a
+  reload, since the next load would read the same missing key and
+  re-resolve the default project. `App.tsx`'s own default-project
+  resolution (from `/api/config`) is guarded by a `userChoseProject` ref,
+  checked inside that fetch's own `.then` — without it, a project chosen
+  manually while that fetch was still in flight could be silently reverted
+  the moment it landed.
 
 ## Decision rules (do not change without updating tests + README)
 - approve + confidence ≥ approve_threshold (0.70) + tests not failing → DONE,
@@ -1151,6 +1293,20 @@ instead of claimed away.
   differs — and on a pre-slice-6 workspace with no `.git`, not even that: the
   guard refuses, reject leaves the tree untouched and redo falls back to the
   wipe, which is the pre-slice-6 behaviour precisely.
+- **Slice 10 adds no decision rule**, same register as slice 6's own
+  negative: no threshold, revision count or budget check reads a project id
+  anywhere in `loop.py`. `project_id=None` is byte-for-byte the
+  pre-slice-10 behaviour everywhere it is read as a *filter* —
+  `list_tasks`, `claim_next_task`, `events`, `events_since`, `run_metrics`
+  and `memory_list` all treat an absent project as "every project," which
+  is what the single-repository loop already did before this slice existed.
+  The one place `None` resolves to something concrete rather than staying
+  unfiltered is a *write*: `Store.resolve_project(None)` lands an omitted
+  `--project` on the default project, matching what every pre-slice-10 call
+  site already did implicitly (none of them ever set `project_id`, so they
+  always wrote to whatever the store now calls "Default"). Nothing about
+  *when* a task moves between statuses, *whether* a memory fact is
+  approved, or *how much* budget a task has spent reads a project anywhere.
 
 ## Conventions
 - Python ≥ 3.10, stdlib-only core (no runtime deps); claude-agent-sdk and
@@ -1226,24 +1382,29 @@ instead of claimed away.
    real `git worktree` checkout of `repo_root` instead of an empty scratch
    directory; scratch mode (the default) is a **proven** no-op, in the same
    register as `vcs_enabled=False`.
-10. Multi-project dashboard: one running `agentloop serve` / one `agentloop.db`,
-    several projects, switchable from the UI and the CLI. **Designed and
-    planned (2026-09-08), not built.** Design:
-    `docs/plans/2026-09-08-multi-project-dashboard-design.md` (5 decisions
-    settled via live interview: project identity is a named row mapped to a
-    `repo_root`, not the raw path; pre-existing tasks/memory backfill into one
-    "Default" project; config — agents.json/loopconfig.json — stays global
-    across all projects this slice; the CLI gets `--project` too, not just the
-    dashboard; dashboard switching is a real server-side scoped query, never a
-    client-side filter). Plan: `docs/plans/2026-09-08-multi-project-dashboard-plan.md`
-    (8 phases, `execution_plan`/`critical_path`, confidence 88/100 after 3
-    revision passes — two review passes found 5 blocking issues total,
-    including a dropped `AUTOINCREMENT` in a table rebuild and a memory-leak
-    fix that missed the dominant prompt-injection code path; all closed and
-    independently re-verified). Ready for a BUILD workflow starting at Phase 1
-    (`projects` table + `tasks.project_id` + migration/backfill in
-    `store.py`). No decision rule needs to change — same register as slices
-    4-9's own inertness claims.
+10. ~~Multi-project dashboard: one running `agentloop serve` / one
+    `agentloop.db`, several projects, switchable from the UI and the CLI.~~
+    **Done (Slice 10)** — full write-up in `docs/history/slice-10.md`.
+    Design: `docs/plans/2026-09-08-multi-project-dashboard-design.md`. Plan:
+    `docs/plans/2026-09-08-multi-project-dashboard-plan.md` (8 phases,
+    confidence 88/100 after 3 revision passes). Built phase-by-phase with a
+    fresh code-reviewer + failure-hunter pair per phase (never
+    self-certified) and a falsified regression test for every finding — see
+    the write-up for the full list, including a TOCTOU race in
+    `Store.archive_project` reproduced under real `ThreadingHTTPServer`
+    concurrency and two React stale-response races in the Phase 7 switcher.
+    **No decision rule changed** — same register as slices 4-9's own
+    inertness claims; `project_id=None` is byte-for-byte the pre-slice-10
+    "every project"/"the default project" behavior everywhere it already
+    was. The **one** deliberate departure from "`_migrate()` only ever adds"
+    is Phase 2's `memory` table rebuild (`UNIQUE(tier, key)` →
+    `UNIQUE(project_id, tier, key)`, which SQLite cannot `ALTER` in place),
+    done id-preserving and `AUTOINCREMENT`-preserving so no existing
+    `memory_hits`/`retrieval`-event reference breaks. Phase 7's `human_verify`
+    checkpoint (no agent in this project can see rendered `web/` output) was
+    reviewed by the operator against a seeded three-project demo
+    (`temp/seed_slice10_demo.py` + `temp/slice10-ui-checklist.md`) and
+    confirmed correct.
 
 ## Slice 8 and Slice 9: hardening pass + existing-repository workspaces
 
