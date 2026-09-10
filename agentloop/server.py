@@ -34,14 +34,8 @@ from .runner import LOGICAL_TOOL_MAP, resolve_tools, tools_sharing_capability
 from .store import Store
 from .toolpolicy import declared_tools, decision_effect
 
-# Where the built frontend lands (`npm run build` in web/).
 _WEB_DIST = Path(__file__).resolve().parent.parent / "web" / "dist"
 
-# Hostnames that mean "this machine" and cannot be re-pointed by a DNS answer.
-# `""` is deliberately **not** here: an absent `Host` used to pass, and while
-# HTTP/1.1 makes the header mandatory so no browser can produce that request, it
-# is the same fail-open shape as the `Origin: null` hole one function down and
-# costs nothing to close.
 _LOOPBACK_NAMES = frozenset({"localhost", "localhost.localdomain"})
 
 
@@ -78,16 +72,7 @@ class DashboardServer(ThreadingHTTPServer):
         self.loop = loop
         self.registry = registry
         self.config = config
-        # The loopconfig.json path the running `agentloop serve` process was
-        # started with (`args.config or "loopconfig.json"` in `cli.py`), kept
-        # only so `POST /api/config/repo` can find the *file* to edit. Never
-        # read to build `self.config` — that already happened in `cli.py`
-        # before this object existed.
         self.config_path = config_path or "loopconfig.json"
-        # The name the operator asked to be reachable at, kept verbatim for the
-        # `Host` check. `server_address` holds the *resolved* bind address, which
-        # for a hostname bind is an IP and so cannot answer "was this the name
-        # the operator chose?".
         self.bound_host = str(addr[0] or "").lower()
         self._shutdown_flag = threading.Event()
         super().__init__(addr, _Handler)
@@ -95,8 +80,6 @@ class DashboardServer(ThreadingHTTPServer):
 
 class _Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-
-    # -- plumbing ------------------------------------------------------------
 
     def log_message(self, fmt, *args):  # keep CLI output clean
         pass
@@ -129,32 +112,6 @@ class _Handler(BaseHTTPRequestHandler):
     def _error(self, status: int, message: str) -> None:
         self._send_json({"error": message}, status=status)
 
-    # -- same-origin enforcement ---------------------------------------------
-    #
-    # This is an unauthenticated mutation API on a documented default port, so
-    # the only thing standing between it and any page the operator happens to
-    # have open is these two checks. Measured before they existed: a browser
-    # *simple request* (`Content-Type: text/plain`, no preflight, permitted
-    # cross-origin without asking) reached `POST /api/charter` and replaced the
-    # charter body — and `agents._charter_block` injects that body verbatim into
-    # every worker, validator and planner prompt, so a stranger's page could
-    # write the standing instructions for an agent holding `file_io`, `git` and
-    # Bash. Task approval, tool-request approval and `abort` are the same shape.
-    #
-    # Two conditions, because they stop two different attacks, and neither
-    # subsumes the other:
-    #   * `Origin` catches the ordinary cross-site request — the browser knows
-    #     it is somewhere else and says so.
-    #   * `Host` catches DNS rebinding, where the browser believes the attacker's
-    #     name *is* this server, so the request is same-origin by its reckoning
-    #     and carries no foreign `Origin` at all.
-    #
-    # Deliberately not a token: the operator chose the cheapest guard that
-    # closes the remote attacker, and a token would also have to be threaded
-    # through the frontend, the CLI and every curl example in the README.
-    # An attacker who is already executing code on this machine is out of scope
-    # here, as they are for `executor.py`'s env scrub.
-
     def _host_ok(self) -> bool:
         """Whether `Host` names this machine rather than a re-resolvable name.
 
@@ -163,19 +120,11 @@ class _Handler(BaseHTTPRequestHandler):
         be the vehicle — and refusing them would break `serve --host 0.0.0.0`
         reached over the LAN, which is a supported setup."""
         raw = (self.headers.get("Host") or "").strip()
-        # `[::1]:8765` -> `::1`; `127.0.0.1:8765` -> `127.0.0.1`.
         if raw.startswith("["):
             name = raw[1:].split("]", 1)[0]
         else:
             name = raw.rsplit(":", 1)[0] if ":" in raw else raw
         name = name.lower()
-        # This machine's own hostname, so `serve --host 0.0.0.0` reached from
-        # the LAN as `http://devbox:8765` still works. Without it `bound_host`
-        # is the literal `"0.0.0.0"`, which no browser ever sends, so every
-        # route — including `GET /` — answered 403 and the operator got a JSON
-        # blob where their dashboard should be. It does not weaken the
-        # rebinding guard: an attacker's domain is still a name that is neither
-        # loopback, nor this host, nor an IP literal.
         if name in _LOOPBACK_NAMES or name == self.bound_host or name == _OWN_HOST:
             return True
         try:
@@ -284,8 +233,6 @@ class _Handler(BaseHTTPRequestHandler):
             raise ValueError("request body must be a JSON object")
         return data
 
-    # -- routing -------------------------------------------------------------
-
     def do_GET(self) -> None:
         if not self._same_origin():
             return
@@ -311,11 +258,6 @@ class _Handler(BaseHTTPRequestHandler):
             elif path.startswith("/api/tasks/"):
                 self._task_detail(path)
             elif path == "/api/events":
-                # A malformed cursor is a 400, not the 500 an `int()` escaping
-                # `do_GET` produced — the same class as `_tool_requests_list`'s two
-                # filters, and for the same reason: a 500 reads as "the server is
-                # broken" for what is a bad request, and the caller cannot tell
-                # which it was.
                 raw = (query.get("since") or ["0"])[0]
                 try:
                     since = int(raw)
@@ -348,7 +290,10 @@ class _Handler(BaseHTTPRequestHandler):
             elif path == "/api/tool_requests":
                 self._tool_requests_list(query)
             elif path == "/api/charter":
-                self._send_json(self._charter_json())
+                project_id = self._parse_project_query(query)
+                if project_id is False:
+                    return
+                self._send_json(self._charter_json(project_id))
             elif path == "/api/metrics":
                 project_id = self._parse_project_query(query)
                 if project_id is False:
@@ -365,36 +310,20 @@ class _Handler(BaseHTTPRequestHandler):
                         "max_cost_usd_per_task": cfg.max_cost_usd_per_task,
                         "human_review_risk_level": cfg.human_review_risk_level,
                         "test_command": cfg.test_command,
-                        # The two knobs the tool panel needs to explain *why* a
-                        # request is gated rather than just that it is.
                         "tool_readonly_allowlist": list(cfg.tool_readonly_allowlist),
                         "gate_declared_tools": cfg.gate_declared_tools,
-                        # Slice 9: which repository (if any) worktree-mode
-                        # workspaces are checked out from. Read from the live
-                        # `LoopConfig`, so this reflects what the running loop
-                        # actually uses, not what a POST to `/api/config/repo`
-                        # has since written to disk (that needs a restart).
                         "repo_root": cfg.repo_root,
                         "workspace_mode": cfg.workspace_mode,
-                        # Slice 10: which project to select on first load.
                         "default_project_id": self.store.default_project_id(),
                     }
                 )
             elif path == "/api/stream":
                 self._stream(query)
             elif path.startswith("/api/"):
-                # Before this, an unmatched `/api/*` fell through to the static
-                # handler, which answers anything that is not a file with
-                # `index.html` — so `GET /api/tsaks` returned 200 and a page of
-                # HTML, and a client could not tell a typo'd endpoint from a
-                # real one that happened to return no data.
                 self._error(404, f"No such endpoint: {path}")
             else:
                 self._serve_static(path)
         except ConnectionError:  # client navigated away mid-response
-            # BrokenPipeError / ConnectionResetError (Windows WinError 10054) /
-            # ConnectionAbortedError all subclass ConnectionError. The socket is
-            # gone; there is nothing to report and nowhere to report it.
             pass
         except Exception as exc:  # never take the server down
             self._safe_error(500, f"{type(exc).__name__}: {exc}")
@@ -406,10 +335,8 @@ class _Handler(BaseHTTPRequestHandler):
         parts = [p for p in url.path.split("/") if p]
         try:
             body = self._read_json()  # inside try: malformed body -> 400 below
-            # /api/tasks
             if parts == ["api", "tasks"]:
                 self._create_task(body)
-            # /api/tasks/{id}/{approve|reject|redo}
             elif (
                 len(parts) == 4
                 and parts[0] == "api"
@@ -420,7 +347,6 @@ class _Handler(BaseHTTPRequestHandler):
                     int(parts[2]), body.get("note", "")
                 )
                 self._send_json({"task": self._task_json(task)})
-            # /api/tasks/{id}/{pause|resume|abort} — mid-run control
             elif (
                 len(parts) == 4
                 and parts[0] == "api"
@@ -433,10 +359,8 @@ class _Handler(BaseHTTPRequestHandler):
                 else:
                     task = getattr(loop, parts[3])(int(parts[2]))
                 self._send_json({"task": self._task_json(task)})
-            # /api/projects — register a new project.
             elif parts == ["api", "projects"]:
                 self._create_project(body)
-            # /api/projects/{id}/{rename|repoint|archive|use}
             elif (
                 len(parts) == 4
                 and parts[0] == "api"
@@ -444,16 +368,10 @@ class _Handler(BaseHTTPRequestHandler):
                 and parts[3] in ("rename", "repoint", "archive", "use")
             ):
                 self._project_action(int(parts[2]), parts[3], body)
-            # /api/charter — the human write surface; agents have none.
             elif parts == ["api", "charter"]:
                 self._set_charter(body)
-            # /api/config/repo — writes the on-disk loopconfig.json only; the
-            # live `self.server.config` the running loop/registry hold is
-            # never touched, so this needs a restart to take effect (see
-            # `_set_config_repo`).
             elif parts == ["api", "config", "repo"]:
                 self._set_config_repo(body)
-            # /api/memory/{id}/{approve|reject|pin|unpin}
             elif (
                 len(parts) == 4
                 and parts[0] == "api"
@@ -468,13 +386,6 @@ class _Handler(BaseHTTPRequestHandler):
                 else:
                     self.store.memory_set_pinned(mem_id, parts[3] == "pin")
                 self._send_json({"memory": self.store.memory_list()})
-            # /api/tool_requests/{id}/{approve|reject} — the human decision on an
-            # agent-requested tool. A missing id raises KeyError -> 404, and an
-            # already-decided row raises ValueError -> 400, both through
-            # `do_POST`'s existing handlers. This server is threading and a CLI
-            # invocation is a second process, so two humans can arrive at once;
-            # the store's compare-and-swap already lets exactly one win, and the
-            # loser's error is surfaced rather than guarded against here.
             elif (
                 len(parts) == 4
                 and parts[0] == "api"
@@ -486,10 +397,6 @@ class _Handler(BaseHTTPRequestHandler):
                 getattr(loop, f"{verb}_tool_request")(
                     int(parts[2]), body.get("note", "")
                 )
-                # The refreshed list, mirroring /api/memory: a decision can
-                # change more rows than the one named (a release clears every
-                # `parked` flag on the task), so returning the single row would
-                # leave the panel showing state the decision already changed.
                 self._send_json(self._tool_requests_json())
             else:
                 self._error(404, f"No such endpoint: {url.path}")
@@ -502,8 +409,6 @@ class _Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._safe_error(500, f"{type(exc).__name__}: {exc}")
 
-    # -- handlers ------------------------------------------------------------
-
     def _create_task(self, body: dict) -> None:
         title = (body.get("title") or "").strip()
         goal = (body.get("goal") or "").strip()
@@ -515,10 +420,6 @@ class _Handler(BaseHTTPRequestHandler):
         if risk not in (0, 1, 2):
             self._error(400, "risk_level must be 0, 1 or 2")
             return
-        # `store.add_task` already resolves a bare `None` to the default
-        # project internally (Phase 1) -- an unknown id/name in the body
-        # raises `KeyError`, already mapped to a clean 404 by `do_POST`'s
-        # existing handler, so nothing extra is validated here.
         task = Task(
             id=None,
             title=title,
@@ -596,16 +497,8 @@ class _Handler(BaseHTTPRequestHandler):
             "known": req.tool in LOGICAL_TOOL_MAP,
             "effect": {
                 "in_effect": effect.in_effect,
-                # The concrete counterpart of `in_effect`, and the only honest
-                # basis for saying a capability is unavailable: the two diverge on
-                # the whole `refused` population, which subtracts nothing while
-                # its logical name is still absent from `allowed`.
                 "capability_live": effect.capability_live,
                 "capability_missing": effect.capability_missing,
-                # The headline claim, computed rather than keyed on `status`. It is
-                # served because `web/` has no test runner: a verb decided in TSX
-                # is a permission-screen assertion no gate covers, and it read
-                # `grants [Bash]` over a body saying `NOT in force`.
                 "verb": effect.verb,
                 "costs_now": effect.costs_now,
                 "approve_grants": effect.approve_grants,
@@ -689,9 +582,6 @@ class _Handler(BaseHTTPRequestHandler):
         if project_id is False:
             return
         if project_id is not None and task_id is None:
-            # store.tool_requests is keyed by task_id, not project_id -- no
-            # new store method needed, since a project's set of task ids is
-            # cheap to compute here and cross-reference against.
             project_task_ids = {
                 t.id for t in self.store.list_tasks(project_id=project_id)
             }
@@ -702,27 +592,16 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(body)
             return
         if project_id is not None and task_id is not None:
-            # Both filters given together: `?project=X&task_id=Y` where Y
-            # does not belong to X used to silently ignore `project` and
-            # answer with task Y's requests regardless -- a real leak across
-            # the project boundary this whole endpoint exists to enforce.
-            # Empty, not an error: an inconsistent combination is a client
-            # bug, but this is a *read* filter, and the existing task_id-only
-            # branch below already answers "no such task" with an empty list
-            # rather than a 404, so this stays consistent with that.
             task = self.store.get_task(task_id)
             if task is None or task.project_id != project_id:
                 self._send_json({"tool_requests": []})
                 return
         self._send_json(self._tool_requests_json(task_id=task_id, status=status))
 
-    def _charter_json(self) -> dict:
-        # One transaction so the two reads are a consistent snapshot: taken
-        # separately, a `charter_set` landing between them serves "v3 in effect"
-        # beside a history whose newest row is v4.
+    def _charter_json(self, project_id: int | None = None) -> dict:
         with self.store.transaction():
-            active = self.store.charter_active()
-            history = self.store.charter_history()
+            active = self.store.charter_active(project_id)
+            history = self.store.charter_history(project_id)
         by_id = {r["id"]: r for r in history}
         return {
             "active": dict(by_id[active[0]]) if active else None,
@@ -737,12 +616,18 @@ class _Handler(BaseHTTPRequestHandler):
         trimmed or emptied by accident, so it has to fail loudly here. Clearing
         is deliberately not a side effect of submitting an empty box — it is its
         own audited operation, on the CLI (`agentloop charter clear --note ...`).
+
+        `project_id` in the body, not a query param — POST bodies are where
+        every other project-aware write already reads it from (`POST
+        /api/tasks`); an unknown id raises `KeyError`, mapped to 404 by
+        `do_POST`'s existing handler like any other bad reference.
         """
         text = body.get("body")
         if not isinstance(text, str):
             raise ValueError("body must be a string")
-        self.store.charter_set(text, str(body.get("note") or ""))
-        self._send_json(self._charter_json())
+        project_id = body.get("project_id")
+        self.store.charter_set(text, str(body.get("note") or ""), project_id)
+        self._send_json(self._charter_json(project_id))
 
     def _set_config_repo(self, body: dict) -> None:
         """POST /api/config/repo — persist `repo_root`/`workspace_mode` to the
@@ -776,16 +661,11 @@ class _Handler(BaseHTTPRequestHandler):
             )
 
         path = self.server.config_path
-        # Same read convention as `LoopConfig.load`: utf-8-sig, so a
-        # BOM-writing editor doesn't turn a config edit into a stack trace.
         if os.path.exists(path):
             raw = Path(path).read_text(encoding="utf-8-sig")
             data = json.loads(raw) if raw.strip() else {}
         else:
             data = {}
-        # Only these two keys change; every other existing key survives
-        # untouched, so this can never silently revert an operator's other
-        # settings back to defaults.
         data["repo_root"] = repo_root
         data["workspace_mode"] = workspace_mode
         with open(path, "w", encoding="utf-8") as f:
@@ -823,9 +703,6 @@ class _Handler(BaseHTTPRequestHandler):
             repo_root = body.get("repo_root")
             if not isinstance(repo_root, str) or not repo_root.strip():
                 raise ValueError("repo_root is required")
-            # Omitted workspace_mode preserves the project's current one --
-            # never a silent reset to scratch (the same fix cli.py's own
-            # `project repoint` needed).
             workspace_mode = body.get("workspace_mode")
             if workspace_mode is None:
                 current = self.store.get_project(project_id)
@@ -838,12 +715,6 @@ class _Handler(BaseHTTPRequestHandler):
         elif verb == "use":
             self.store.set_default_project(project_id)
         else:
-            # do_POST's own routing guard (`parts[3] in (...)`) is the only
-            # thing stopping an unrecognized verb from reaching here today --
-            # without this branch, one ever would silently fall through to
-            # the 200 success response below, having done nothing. Fail
-            # closed here too, so this function's own contract does not
-            # depend on staying in sync with a guard three call-frames away.
             raise ValueError(f"unknown project action {verb!r}")
         self._send_json({"project": self.store.get_project(project_id)})
 
@@ -868,11 +739,6 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _stream(self, query: dict) -> None:
         """SSE: replay everything after the cursor, then tail the audit log."""
-        # Same 400-not-500 rule `/api/events` already applies, and this is the
-        # endpoint that needs it more: `Last-Event-ID` is client-supplied on
-        # *every* EventSource reconnect, so a bad cursor here is a routine
-        # client state, not an exotic one. A bare `int()` here answered 500,
-        # which tells the caller the server is broken for what is a bad request.
         raw = self.headers.get("Last-Event-ID") or (query.get("since") or ["0"])[0]
         try:
             cursor = int(raw)
@@ -898,20 +764,15 @@ class _Handler(BaseHTTPRequestHandler):
                     cursor = row["id"]
                     self._emit(row["id"], "event", row)
                 if rows:
-                    # State changed; push the rollup so tiles update in step.
                     self._emit(
                         cursor, "metrics", self.store.run_metrics(project_id=project_id)
                     )
                 elif time.time() - last_beat > 15:
-                    # Comment frame keeps proxies/idle sockets from timing out.
                     self.wfile.write(b": keep-alive\n\n")
                     self.wfile.flush()
                     last_beat = time.time()
                 time.sleep(interval)
         except (ConnectionError, OSError):
-            # The browser disconnected (reset/broken pipe). End the stream
-            # quietly — do NOT fall through to the generic 500 handler, which
-            # would try to write to the same dead socket.
             return
 
     def _emit(self, event_id: int, name: str, data) -> None:
@@ -935,11 +796,6 @@ class _Handler(BaseHTTPRequestHandler):
 
         rel = path.lstrip("/") or "index.html"
         target = (_WEB_DIST / rel).resolve()
-        # Containment, not a string prefix. `startswith` treated the parent as a
-        # *text* prefix, so a sibling directory whose name merely begins with
-        # the same characters passed: measured, `/../dist-backup/secret.txt`
-        # resolved outside `dist` and was served. `vcs._is_within` already got
-        # this right two modules over; this is the same predicate.
         try:
             contained = target.is_relative_to(_WEB_DIST.resolve())
         except (OSError, ValueError):
@@ -962,9 +818,6 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _task_json(self, task: Task) -> dict:
-        # `depends_on` is served with the task rather than as its own endpoint:
-        # the dashboard needs it to explain why a pending task isn't moving, and
-        # a separate round trip per row would defeat that.
         return {
             "id": task.id,
             "title": task.title,

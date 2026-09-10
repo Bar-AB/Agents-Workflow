@@ -192,16 +192,11 @@ def _tool_outcome(request, effect) -> str:
         elif not resolved:
             approving = "approving grants no capability — this name confers none"
         else:
-            # Not granted, not already held, and the name does confer something:
-            # the only remaining cause is another withheld row on this task
-            # conferring the same concrete tool and still subtracting it.
             approving = (
                 f"approving does not deliver {_and_list(resolved)} — another "
                 f"withheld request on this task confers it too"
             )
         if effect.reject_removes:
-            # No agreement to fix here or on `approving grants …`: the subject of
-            # both is the gerund, not the list.
             rejecting = (
                 f"rejecting also stops {_and_list(effect.reject_removes)} working"
             )
@@ -224,27 +219,14 @@ def _tool_outcome(request, effect) -> str:
                 if resolved
                 else "in force"
             )
-        # An empty `resolved` is not a withheld capability, it is no capability:
-        # a name in `tool_readonly_allowlist` that `LOGICAL_TOOL_MAP` lacks is an
-        # `auto` row conferring nothing, and this branch rendered it as
-        # `NOT in force:  is withheld on account of another request on this task`
-        # — an empty list and a withholding that never happened, in one sentence.
         if not resolved:
             return "confers no capability — nothing to be in force"
-        # "another *request*", not "another decision": the sibling that subtracts
-        # the capability may be `pending`, which is nobody's decision.
         return (
             f"NOT in force: {_and_list(resolved)} is withheld on account of "
             f"another request on this task"
         )
     if not resolved:
         return "nothing to withhold — this name confers no capability"
-    # `capability_live`, never `in_effect`: the sentence below is about the
-    # *concrete* capability, and for a `refused` row the two disagree —
-    # `withheld_tools` never sees `refused`, so the row subtracts nothing while its
-    # logical name is still absent from `allowed`. Branching on the logical test
-    # told a human `Bash is not available to this role` about a `Bash` the gate was
-    # handing to the runner through the worker's declared `git`.
     missing = effect.capability_missing
     if not missing:
         return f"no effect: the role has {_and_list(effect.capability_live)} regardless"
@@ -258,9 +240,6 @@ def _tool_outcome(request, effect) -> str:
             else ""
         )
     )
-    # "not available", not "withheld by this": a `refused` row (an unknown name, or
-    # the per-task cap) subtracts nothing at all — `withheld_tools` never sees it —
-    # so this states the outcome without claiming this row caused it.
     return (
         f"{_and_list(missing)} {_agrees(missing, 'is', 'are')} "
         f"not available to this role{still}"
@@ -304,8 +283,6 @@ def _tools_cmd(store: Store, loop: Loop, args) -> int:
                 f"[{r.id:3d}] {r.status.value:8s} {flags:16s} task={r.task_id}"
                 f" {r.agent_kind}/{r.role}  {_tool_consequence(r.tool)}"
             )
-            # The map's sharing statement above says what a decision *touches*;
-            # this says what it would actually do to this role on this task.
             print(f"        effect: {_tool_effect(store, loop, r)}")
             if r.reason:
                 print(f"        reason: {r.reason}")
@@ -314,11 +291,6 @@ def _tools_cmd(store: Store, loop: Loop, args) -> int:
                 print(f"        decided by {r.decided_by}{note}")
         return 0
 
-    # A bad id raises KeyError, and an already-decided row raises ValueError;
-    # both reach main()'s handler as `error: ...` with exit 1. Two humans (or one
-    # double-click) racing is exactly that ValueError — the store's
-    # compare-and-swap picks the winner and the loser is told, rather than being
-    # guarded against here and silently reported as a success.
     request = store.tool_request_get(args.request_id)
     if request is None:
         raise KeyError(f"No tool request {args.request_id}")
@@ -329,14 +301,8 @@ def _tools_cmd(store: Store, loop: Loop, args) -> int:
         task = loop.reject_tool_request(args.request_id, args.note)
         verb = "rejected"
     print(f"Tool request {args.request_id} {verb}: {_tool_consequence(request.tool)}")
-    # Read `parked` back rather than reusing the pre-decision row: a release
-    # clears it, so the pre-decision value would report a lifted park as still
-    # holding the task.
     decided = store.tool_request_get(args.request_id)
     if decided is not None:
-        # The outcome of the decision just made, computed against the rows as they
-        # now stand — so an approve that granted nothing (a rejected sibling still
-        # withholds the capability) says so instead of echoing the request.
         print(f"        effect: {_tool_effect(store, loop, decided)}")
     parked = " (still parked on this request)" if decided and decided.parked else ""
     print(f"Task {task.id} -> {task.status.value}{parked}")
@@ -344,18 +310,24 @@ def _tools_cmd(store: Store, loop: Loop, args) -> int:
 
 
 def _charter_cmd(store: Store, args) -> int:
-    """The human write surface for the project charter. Agents have none."""
+    """The human write surface for the project charter. Agents have none.
+
+    `--project` is resolved once, here, through the same `_project_ref` +
+    `resolve_project` path every other project-aware command uses — an
+    omitted flag resolves to the default project, since a charter read or
+    write always targets exactly one project, never "every project"."""
+    project_id = _project_ref(args.project)
     if args.charter_cmd == "show":
         if args.version:
-            row = store.charter_version(args.version)
+            row = store.charter_version(args.version, project_id)
             if row is None:
-                raise KeyError(f"No charter version {args.version}")
+                raise KeyError(f"No charter version {args.version} on this project")
             print(f"--- charter v{row['id']} ---")
             if row["note"]:
                 print(f"note: {row['note']}")
             print(row["body"] or "(cleared)")
             return 0
-        active = store.charter_active()
+        active = store.charter_active(project_id)
         if active is None:
             print("(no charter set — agent prompts are unchanged)")
             return 0
@@ -366,26 +338,20 @@ def _charter_cmd(store: Store, args) -> int:
         if bool(args.file) == bool(args.text):
             raise ValueError("give exactly one of --file or --text")
         try:
-            # utf-8-sig: a rules file is hand-written, often on Windows.
             body = (
                 Path(args.file).read_text(encoding="utf-8-sig")
                 if args.file
                 else args.text
             )
         except OSError as exc:
-            # An unreadable path is user input, not a crash — render it like a
-            # bad id rather than a traceback.
             raise ValueError(f"cannot read {args.file}: {exc}") from exc
-        # A ValueError from the store (oversize, or whitespace-only) surfaces
-        # through main()'s handler as `error: ...`, which is the loud write-time
-        # refusal the charter trades for never being trimmed at inject time.
-        version = store.charter_set(body, args.note)
+        version = store.charter_set(body, args.note, project_id)
         print(f"Charter v{version} set ({len(body)} chars) — every agent prompt now.")
     elif args.charter_cmd == "clear":
-        version = store.charter_clear(args.note)
+        version = store.charter_clear(args.note, project_id)
         print(f"Charter cleared (v{version}); prompts return to having no charter.")
     elif args.charter_cmd == "history":
-        rows = store.charter_history()
+        rows = store.charter_history(project_id)
         if not rows:
             print("(no charter history)")
         for r in rows:
@@ -445,9 +411,6 @@ def _workspace_cmd(store: Store, config: LoopConfig, args) -> int:
     repo_root_arg = args.repo_root or config.repo_root
     if args.workspace_cmd == "prune":
         if config.workspace_mode != "worktree":
-            # `repo_root` is unread in scratch mode (the proven-no-op
-            # contract), so it must not be able to break this fast path —
-            # checked *before* the relative-path refusal below.
             print("workspace_mode is 'scratch' — nothing to prune.")
             return 0
 
@@ -487,13 +450,6 @@ def _workspace_cmd(store: Store, config: LoopConfig, args) -> int:
             else:
                 skipped += 1
                 print(f"  task {t.id}: not removed ({result.reason}) — {ws}")
-        # The catch-all: clears any *agentloop* admin entry `git worktree
-        # list` still reports for a directory that is already gone by some
-        # other means (a manual rm, a redo's rollback fallback) — the case
-        # `remove_worktree` refuses rather than repairs. Scoped to
-        # `vcs_branch_prefix` (HIGH 2, P3 remediation cycle 3): a bare
-        # `git worktree prune` is repo-wide and would clear the operator's
-        # own unrelated worktree registrations too.
         pruned = vcs.prune_worktrees(
             repo_root, config, branch_prefix=config.vcs_branch_prefix
         )
@@ -544,11 +500,6 @@ def _eval_cmd(store: Store, args) -> int:
     )
     if getattr(args, "mode", "verdict") == "batch":
         if args.runner != "mock":
-            # Same refusal, and the same reason, as `--runner openai` falling
-            # through to the mock branch used to earn: batch fixtures are
-            # scripted round-by-round, so a real provider cannot consume one and
-            # anything printed afterwards would be a number that measured
-            # nothing -- which is worse than none.
             raise ValueError(
                 f"eval --mode batch requires --runner mock (got {args.runner!r}): "
                 "batch fixtures are scripted whole-task transcripts, and a real "
@@ -559,7 +510,6 @@ def _eval_cmd(store: Store, args) -> int:
         return 0
 
     if args.runner == "claude":
-        # Opt-in and skipped without credentials — never a hard failure in CI.
         from .runner import anyio as _sdk
 
         if _sdk is None or not os.environ.get("ANTHROPIC_API_KEY"):
@@ -572,10 +522,6 @@ def _eval_cmd(store: Store, args) -> int:
 
         runner = ClaudeSDKRunner()
     elif args.runner == "openai":
-        # The choice was accepted and then fell through to the mock branch, so
-        # an operator asking for an OpenAI calibration got scripted-fixture
-        # agreement numbers printed as a calibration report, with no warning and
-        # exit 0. A calibration number that measured nothing is worse than none.
         if not os.environ.get("OPENAI_API_KEY"):
             print(
                 "eval --runner openai skipped: set OPENAI_API_KEY to run a real "
@@ -680,12 +626,6 @@ def main(argv: list[str] | None = None) -> int:
     sv = sub.add_parser("serve", help="Run the live dashboard (Phase 2)")
     sv.add_argument("--host", default=None)
     sv.add_argument("--port", type=int, default=None)
-    # Kept for argument-shape compatibility, but `serve` never invokes a model:
-    # its routes call only the human decision methods (`approve`/`reject`/`redo`,
-    # `pause`/`resume`/`abort`, the tool-request decisions), none of which run an
-    # agent. An operator reasonably reads `serve --runner claude` as "the
-    # dashboard will now drive real work", and it does nothing at all — so the
-    # help text says so rather than leaving it to be discovered.
     sv.add_argument(
         "--runner",
         default="mock",
@@ -703,9 +643,6 @@ def main(argv: list[str] | None = None) -> int:
     for name in ("approve", "reject", "pin", "unpin"):
         mc = msub.add_parser(name, help=f"{name} a memory fact")
         mc.add_argument("memory_id", type=int)
-        # A memory_id already identifies its own project row -- --project is
-        # not needed to resolve it, but the flag stays available here for
-        # symmetry/discoverability with list/add, unused by these four.
         mc.add_argument("--project", default=None, help="Project name or id")
     ma = msub.add_parser("add", help="Add a fact directly")
     ma.add_argument("key")
@@ -737,13 +674,17 @@ def main(argv: list[str] | None = None) -> int:
     cshow.add_argument(
         "--version", type=int, default=None, help="Show a past version instead"
     )
+    cshow.add_argument("--project", default=None, help="Project name or id")
     cset = chsub.add_parser("set", help="Publish a new charter version")
     cset.add_argument("--file", default=None, help="Read the charter from a file")
     cset.add_argument("--text", default=None, help="Charter body inline")
     cset.add_argument("--note", default="", help="Why this edit was made")
+    cset.add_argument("--project", default=None, help="Project name or id")
     cclear = chsub.add_parser("clear", help="Turn the charter off (audited)")
     cclear.add_argument("--note", default="")
-    chsub.add_parser("history", help="Every version, oldest first")
+    cclear.add_argument("--project", default=None, help="Project name or id")
+    chist = chsub.add_parser("history", help="Every version, oldest first")
+    chist.add_argument("--project", default=None, help="Project name or id")
 
     ws = sub.add_parser("workspace", help="Worktree-mode workspace maintenance")
     wssub = ws.add_subparsers(dest="workspace_cmd", required=True)
@@ -819,28 +760,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         store, loop = _build(args)
     except (KeyError, ValueError, RunnerConfigError) as exc:
-        # Construction happens before the store exists, so it needs its own
-        # handler rather than the one below: there is nothing to `close()` yet.
-        # A bad `--runner`, an unparseable loopconfig.json or an OPENAI_BASE_URL
-        # the runner refuses are all user input, and the whole point of raising
-        # them loudly at construction is defeated if they arrive as a traceback.
         print(f"error: {exc.args[0] if exc.args else exc}", file=sys.stderr)
         return 1
 
     try:
-        # Resolved once, right after `_build()` succeeds, before dispatch — a
-        # bad name/id raises KeyError, already caught by this same handler
-        # below and rendered as `error: unknown project '<name>'`.
-        #
-        # `run` is deliberately NOT resolved when `--project` is omitted:
-        # `Loop.run(project_id=None)` (Phase 3) spans every registered
-        # project in one pass, and resolving a bare `agentloop run` to just
-        # the default would make that capability unreachable from the CLI.
-        # Every other project-aware command (`add`/`plan`/`status`/`events`)
-        # DOES resolve when omitted — a task must belong to exactly one
-        # concrete project, and `status`/`events` with no `--project` show
-        # "the active default project", matching today's single-project
-        # output byte-for-byte, never "every project" unfiltered.
         if args.cmd == "run":
             raw = getattr(args, "project", None)
             args.project_id = (
@@ -852,10 +775,6 @@ def main(argv: list[str] | None = None) -> int:
             )
         return _dispatch(args, store, loop)
     except (KeyError, ValueError) as exc:
-        # Bad id (no such task/memory row), or an id used with the wrong command
-        # (approve-plan on an ordinary task), and similar expected user-input
-        # errors surface as a clean message, never a raw traceback. KeyError's
-        # str() wraps the message in quotes; unwrap it.
         msg = exc.args[0] if exc.args else str(exc)
         print(f"error: {msg}", file=sys.stderr)
         return 1
@@ -884,8 +803,6 @@ def _dispatch(args, store: Store, loop: Loop) -> int:
         )
         children = store.plan_tasks(plan.id)
         if not children:
-            # Every plan failure ends here: no tasks exist, and the reason the
-            # planner was rejected is the only useful thing to print.
             print(f"Plan {plan.id} produced no tasks.", file=sys.stderr)
             print(f"  {plan.escalation_reason}", file=sys.stderr)
             return 1
@@ -934,8 +851,6 @@ def _dispatch(args, store: Store, loop: Loop) -> int:
             else:
                 deps = store.dependencies(t.id)
                 if deps:
-                    # Say which of them is actually holding this task up — "has
-                    # dependencies" doesn't explain why nothing is happening.
                     unmet = [
                         d
                         for d in deps
@@ -946,19 +861,6 @@ def _dispatch(args, store: Store, loop: Loop) -> int:
                         print(f"  blocked by: {', '.join(str(d) for d in unmet)}")
                 if t.plan_id and not store.is_plan_approved(t.plan_id):
                     print(f"  blocked by: plan {t.plan_id} (awaiting sign-off)")
-                # Slice 9 residual 4: a worktree survives DONE and lives
-                # outside the repository it works on (`worktree_root`), so an
-                # operator debugging a task can no longer just look beside
-                # their project directory — this is the other half of that
-                # trade, `agentloop workspace prune` being the first. Printed
-                # rather than probed for existence: the path is deterministic
-                # from config + task id whether or not anything has created it
-                # yet, and a task that never ran still has a workspace it
-                # *would* use.
-                # Resolved from the task's OWN project (Phase 3's
-                # per-task _worktree_repo_root), not loop.config directly —
-                # a task in a different project than whatever this process's
-                # loopconfig.json names must show ITS OWN workspace path.
                 repo_root = loop._worktree_repo_root(t)
                 ws = workspace_for(
                     loop.config.workspace_root,
@@ -1052,11 +954,6 @@ def _project_cmd(store: Store, args) -> int:
 
     elif args.project_cmd == "repoint":
         pid = store.resolve_project(_project_ref(args.name))
-        # --workspace-mode omitted means "keep the current one" -- never a
-        # silent reset to scratch, which would discard a worktree-mode
-        # project's durability guarantees (round commits, recoverable
-        # reject/redo; scratch mode is a proven no-op for that whole layer)
-        # the moment an operator repoints only its repo_root.
         workspace_mode = args.workspace_mode
         if workspace_mode is None:
             workspace_mode = store.get_project(pid)["workspace_mode"]

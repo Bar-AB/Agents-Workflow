@@ -1,4 +1,4 @@
-"""Tool policy — the capability seam (roadmap slice 5).
+"""Tool policy — the capability seam.
 
 Agents may *request* tools at run time: read-only ones are auto-approved,
 side-effecting ones queue for a human. This module holds every judgment behind
@@ -76,67 +76,12 @@ if TYPE_CHECKING:  # imports for annotations only; no cycle at run time
     from .store import Store
 
 
-# How much of an agent's stated reason is kept. A reason is a sentence about why
-# a capability is needed, read by the human clearing the queue; it is not a place
-# for the agent to store prose, and the field reaches `log_event`'s one
-# `json.dumps` inside a paid transaction.
 MAX_TOOL_REASON_CHARS = 200
 
-# `TOOL_REQUEST: <tool> (blocking|optional) - <reason>`
-#
-# Line-anchored, but the anchor admits one leading markdown list, quote or
-# emphasis marker, because **LLM output is markdown**. A bare `^[ \t]*` dropped
-# `- TOOL_REQUEST: shell (blocking) - …` entirely: an agent enumerating two
-# capability needs writes them as a bullet list at least as readily as it writes
-# the four reason separators this grammar already tolerates for that same reason.
-# The failure was silent rather than safe — no row, no event, a capability
-# withheld with nothing in the ledger — and under the park rule it is worse than
-# that: a dropped `(blocking)` ask means the park never fires, so "I cannot
-# finish without this" becomes "continue without it and tell no human".
-#
-# The prefix is a closed set of punctuation, never `.*`: `please TOOL_REQUEST:
-# shell` and `the tool: TOOL_REQUEST: shell` must stay non-matches, or a marker
-# quoted mid-sentence becomes a live request and the grammar stops being
-# something an agent can quote at all.
-#
-# Case-insensitive on both the label and the flag. The tool is
-# a bare logical name, and the lookahead after it is what makes a malformed name
-# *no match at all* rather than a silently truncated one: without it
-# `TOOL_REQUEST: sh!ell` would record a request for `sh`, and a 41-character name
-# would record its first 40. (It does *not* save `TOOL_REQUEST: sh ell!!`, which
-# is a legal short name followed by prose and is deliberately a request for `sh`
-# — the ledger refuses and audits that rather than the parser guessing.)
-#
-# `\r?$` rather than `$`: under `re.MULTILINE` `$` matches before `\n` but not
-# before `\r`, so on CRLF input — mainstream, this project is developed on
-# Windows — the flagless, reasonless form (the shortest the grammar permits, and
-# the one an agent asking for a read-only tool actually types) matched nothing at
-# all. That failure is silent rather than safe: no row, no event, a capability
-# withheld with nothing in the ledger, which is precisely what the module
-# docstring says must not happen.
-#
-# The flag is optional in the grammar and **absent means optional**: a malformed
-# marker must never gain the power to stall a task, the same direction
-# `_extract_findings` degrades in. The separator before the reason may be `-`, an
-# em-dash, `:` or nothing at all, because an agent writing prose will use all
-# four and a request lost to punctuation is a capability silently withheld.
-#
-# Known limitation, deliberately not fixed: a marker inside a fenced code block
-# is a live request. Understanding markdown fences is not this parser's job, and
-# a fence-aware grammar would be a second, lossy model of the reply. It matters
-# to slice 5's park rule (a quoted `(blocking)` example would stall a task), so
-# it is stated here rather than discovered there.
-#
-# The other half of the same closed-set trade, stated because it is the failure
-# that is silent rather than loud: the prefix group admits **exactly one** token,
-# so `- > TOOL_REQUEST:`, `> - TOOL_REQUEST:`, `| TOOL_REQUEST:` (a table cell),
-# `<!-- TOOL_REQUEST:`, `### TOOL_REQUEST:`, `- [ ] TOOL_REQUEST:` and a
-# backticked `` `TOOL_REQUEST:` `` all drop. Accepted rather than widened:
-# repeating the group makes `please TOOL_REQUEST:` reachable through no more than
-# a couple of tokens, and the direction of *that* failure is a quotation becoming
-# a live park. Each of these is one combination further out than the plain bullet
-# the group exists for, and the withheld capability is recoverable by a human;
-# a manufactured park on quoted prose is not.
+# `\r?$`, not bare `$`: under re.MULTILINE, `$` doesn't match before `\r`, so
+# on CRLF (this project is developed on Windows) the shortest, flagless
+# marker form silently matched nothing — no row, no event, capability
+# withheld with zero trace. Don't simplify this back to `|$)`.
 _MARKER_RE = re.compile(
     r"^[ \t]*(?:[-*+>][ \t]*|\d+[.)][ \t]*|\*\*)?TOOL_REQUEST[ \t]*:[ \t]*"
     r"(?P<tool>[A-Za-z0-9_.\-]{1,40})(?=[ \t(]|\r?$)"
@@ -174,35 +119,14 @@ class ParsedToolRequest:
 def classify(tool: str, config: LoopConfig) -> ToolClass:
     """Which tier a *marker-named* tool falls in.
 
-    `config` is required and is never `None`. A policy function whose config may
-    be absent would have to invent a risk judgment — what this project considers
-    read-only — out of a missing argument, which is exactly the silent degrade to
-    a working default that `retrieval.get_backend` refuses by raising. Callers
-    with no config (`run_summarizer`, the eval harness) do not classify at all.
-
-    It does not defend against a config of the wrong *type* either, and that is
-    also deliberate: `tool in None` used to raise `TypeError` here — inside
-    `_invoke`'s closing transaction, over a paid `finish_attempt`, three times.
-    Swallowing it would mean inventing the same missing risk judgment; the fix is
-    upstream, where `LoopConfig` normalizes and refuses field types at
-    construction, so `tool_readonly_allowlist` is a `list[str]` by the time any
-    policy reads it.
-
-    The allowlist is consulted first, so widening it is how a project moves the
-    line, and it wins over the `LOGICAL_TOOL_MAP` check rather than the reverse.
-
-    Note this does **not** consult `baseline_tools`: the baseline is about a
-    role's *declared* list, while this answers "may a marker's ask be granted
-    without a human". A marker naming a baseline tool therefore still queues a
-    row, and that row is an audited ask, not a grant.
-
-    What it is emphatically **not** is a revocation. A `pending` row is nobody's
-    decision — no human is ever prompted for a non-blocking one — so it must not
-    cost the role a capability it already holds unconditionally, while a
-    `rejected` row must, or a human's denial would be cosmetic. That distinction
-    is applied in `tools_for`, which knows both halves of "already holds" (the
-    read-only allowlist and `baseline_tools`); it is stated here because this
-    function's silence about the baseline is only safe while that holds.
+    `config` is required, never `None` — a caller with no config
+    (`run_summarizer`, the eval harness) doesn't classify at all rather than
+    guessing a read-only judgment. The allowlist wins over `LOGICAL_TOOL_MAP`
+    when both apply. Doesn't consult `baseline_tools`: this answers "may a
+    marker be auto-granted", not "does the role already have it" — a marker
+    naming a baseline tool still queues an audited row, not a silent grant.
+    That distinction (a `pending` row must not cost an already-held
+    capability; a `rejected` row must) is applied in `tools_for`.
     """
     if tool in config.tool_readonly_allowlist:
         return ToolClass.AUTO
@@ -230,27 +154,9 @@ def parse_tool_requests(text: str) -> list[ParsedToolRequest]:
     version of what the agent said.
     """
     try:
-        # Line boundaries are normalized before matching, and that closes a class
-        # rather than a case. `\r?$` in the pattern fixed CRLF, but a lookahead
-        # enumerating terminators leaks once per terminator nobody thought of:
-        # a lone `\r` (classic Mac) and ` `/`` are also line breaks to
-        # `str.splitlines` and *not* to `$`, so each silently dropped a
-        # well-formed marker — the same no-row, no-event, capability-withheld
-        # failure CRLF had, discovered one terminator at a time. `splitlines`
-        # already knows every Unicode line boundary, so joining its result on
-        # `\n` makes the question "which terminators did we remember?" stop
-        # existing. The pattern keeps `\r?$` regardless: it must stay correct for
-        # a caller who hands it raw text directly.
         text = "\n".join(str(text).splitlines())
         found: dict[str, ParsedToolRequest] = {}
         for match in _MARKER_RE.finditer(text):
-            # Lower-cased because the pattern is `IGNORECASE` over its whole
-            # length: `File_Read` therefore *matches*, while `classify` and
-            # `LOGICAL_TOOL_MAP` are case-sensitive and would call it UNKNOWN. A
-            # grammar that advertises a tolerance the classifier lacks turns a
-            # well-formed ask into an audited refusal, so the capture is
-            # normalized to the case the tables are written in. Case-folding also
-            # makes `SHELL` and `shell` in one reply the one request they are.
             tool = match.group("tool").lower()
             flag = (match.group("flag") or "").lower()
             blocking = flag == "blocking"
@@ -266,26 +172,16 @@ def parse_tool_requests(text: str) -> list[ParsedToolRequest]:
             )
         return list(found.values())
     except Exception:
-        # Safe precisely because this function touches no store and no
-        # transaction: there is nothing half-written to leave behind, and an
-        # unparseable reply means "no request", which withholds the tool.
         return []
 
 
 def baseline_tools(role: str) -> list[str]:
-    """The tools this role ships with, read from the registry at call time.
-
-    Derived rather than transcribed into config: a hand-written baseline would be
-    a second source of truth against `DEFAULT_AGENTS`, and drift there fails
-    silently *in the withholding direction* — a shipped agent quietly losing a
-    tool it was built around.
-
-    A role with no shipped entry gets `[]`, so everything it declares is gated.
-    That is the fail-safe direction: a bespoke role's capabilities are approved
-    once rather than assumed.
+    """The tools this role ships with, read from the registry at call time —
+    derived rather than duplicated into config, so it can't drift from
+    `DEFAULT_AGENTS`. A role with no shipped entry gets `[]` (fail-safe: a
+    bespoke role's capabilities are approved once, not assumed).
     """
     spec = DEFAULT_AGENTS.get(role)
-    # A copy: the registry's own list must not be mutable through a policy read.
     return list(spec.tools) if spec else []
 
 
@@ -295,19 +191,14 @@ def subtract_withheld(
     """`allowed` minus every concrete capability `withheld` names.
 
     Returns `(kept, lost, capability)`: the surviving logical names, the ones
-    subtracted that were **not themselves** withheld (the collateral loss a human
-    has to be told about), and the concrete tools that did the subtracting.
+    subtracted that were **not themselves** withheld (collateral loss a human
+    must be told about), and the concrete tools that did the subtracting.
 
-    Pure — it reads `LOGICAL_TOOL_MAP` and nothing else — and applied **once, over
-    the whole resolution**, never per request. Per request it could not be
-    correct: `tools_for` appends grants *after* the declared loop, so a granted
-    `git` would re-introduce the `Bash` a rejected `shell` had just removed, and
-    which of the two won would depend on which loop ran last. Applied to the final
-    list the answer is the same in either order, and it is the closed one.
-
-    A name resolving to nothing (`task_state`, or a name outside the map) can
-    neither withhold nor be withheld here: it confers no capability, so there is
-    nothing to subtract and nothing to lose.
+    Pure, and applied **once over the whole resolution**, never per request —
+    per request the order requests are processed in would change the answer
+    (a later grant could re-introduce a capability an earlier denial removed).
+    A name resolving to nothing (`task_state`, or outside the map) confers no
+    capability, so it can neither withhold nor be withheld here.
     """
     denied = set(resolve_tools(withheld))
     if not denied:
@@ -320,9 +211,6 @@ def subtract_withheld(
         if not overlap:
             kept.append(tool)
             continue
-        # A tool that is *itself* withheld is an ordinary denial, not collateral:
-        # the ledger already says why it is gone. Only a name the role legitimately
-        # held and lost anyway is news.
         if tool not in withheld:
             lost.append(tool)
         for concrete in overlap:
@@ -335,16 +223,13 @@ def subtract_withheld(
 class ToolEffect:
     """What one role would actually get, given one set of rows.
 
-    The **single** implementation of that question. `tools_for` computes the
-    enforced list from it and then does its writes; the CLI and the dashboard
-    compute the *consequence of a decision* from it and write nothing. Two
-    implementations would drift, and drift between what the screen promises and
-    what the gate enforces is this slice's recurring defect — the panel used to
-    render "approving grants it too" from `LOGICAL_TOOL_MAP` alone, which knows
-    neither the role's declared list nor the sibling rows' statuses, so it
-    asserted a consequence it could not know.
+    The **single** implementation of that question: `tools_for` computes the
+    enforced list from it and then writes; the CLI and dashboard compute the
+    *consequence of a decision* from it and write nothing, so the two can't
+    drift the way a screen re-deriving the answer from `LOGICAL_TOOL_MAP`
+    alone (blind to declared lists and sibling rows) used to.
 
-    `queued` is the declared names that need a row; it is advice to a caller that
+    `queued` is the declared names that need a row — advice to a caller that
     may write, never a write of its own.
     """
 
@@ -360,73 +245,26 @@ class ToolEffect:
 class DecisionEffect:
     """What approving or rejecting one request would actually do.
 
-    Every list field is a *difference between two `effective_tools` results*, so
-    none of them can claim a consequence the gate would not produce. `verb` is the
-    one field that is not — it is a branch over those differences, which is exactly
-    why it lives here and not on a screen. The three states
-    that falsified the old sharing-map text are each one of these fields being
-    empty where the map alone said otherwise:
-
-    - `approve_grants == []` — approving grants nothing, because another withheld
-      row on the task confers the same concrete capability.
-    - `reject_removes == []` with `costs_now != []` — the sibling is *already*
-      withheld while this row is pending, so approving restores it and rejecting
-      takes nothing further away.
-    - `reject_removes == []` with `costs_now == []` — this role never held the
-      sibling, so denial costs it nothing. An invented cost attached to *denial*
-      pushes a human toward granting, which is the direction that matters.
+    Every list field is a *difference between two `effective_tools` results*,
+    so none can claim a consequence the gate wouldn't produce; `verb` is a
+    branch over those differences, computed here rather than on a screen so
+    a permission label is never an assertion no gate backs. Fields can come
+    out empty in ways worth knowing: `approve_grants` is empty when another
+    withheld row already confers the same capability; `reject_removes` is
+    empty with `costs_now` non-empty when the sibling is already withheld
+    (approving restores it, rejecting takes nothing further); both empty
+    means this role never held the sibling, so denial costs it nothing.
     """
 
-    # Is this request's own tool available to the role right now? An `approved`
-    # row whose capability another denial still subtracts is not in force, and a
-    # green chip beside "grants Bash" would say it is.
-    #
-    # **This is a logical-name membership test, and the surfaces must not state
-    # anything about the concrete capability from it.** The two diverge on the
-    # whole `refused` population: `withheld_tools` deliberately never sees
-    # `refused` (`store.withheld_tools`), so such a row subtracts nothing, while
-    # its logical name is still absent from `allowed`. Both surfaces read
-    # "{resolved} is not available to this role" off this flag and so told a human
-    # a capability was withheld while the gate handed it over through another
-    # declared name — a gate a human believes is closed but is not, which the
-    # module docstring names as the worse direction. `capability_live` is the
-    # concrete answer; this one stays for the questions that really are about the
-    # logical name.
     in_effect: bool
-    # This row's own concrete capability that the role actually has right now: its
-    # `resolve_tools` footprint intersected with the footprint of the enforced
-    # list. Computed like every other field here — out of an `effective_tools`
-    # evaluation rather than out of `LOGICAL_TOOL_MAP`, which knows neither the
-    # role's declared list nor the sibling rows. Empty is the only honest basis
-    # for saying a capability is not available.
     capability_live: list[str]
-    # The complement of `capability_live` over the same footprint: this row's own
-    # concrete capability the role does **not** have. It is served rather than
-    # derived on each surface because it is the *subject* of the sentence a human
-    # reads as a closed gate ("Write and Edit are not available to this role"), and
-    # the coarse subtraction makes a partial split reachable — a `refused`
-    # `file_io` on a role holding `file_read` keeps `Read` and loses the other two.
     capability_missing: list[str]
-    # The headline claim the surfaces put above the consequence, as one word or
-    # two, reading directly into the row's resolved chip ("would grant" + Bash).
-    #
-    # It lives here rather than in each surface because it is a *claim*, and this
-    # slice's recurring defect is a claim the code does not back. The panel's own
-    # `verbFor(status)` keyed on the status alone and contradicted the body two
-    # lines under it in three reachable states, and `web/` has no test runner — so
-    # a verb computed in TSX is a permission-screen assertion no gate covers.
-    # Computed here, `tests/test_tool_policy.py` pins every state.
     verb: str
-    # Other logical names not working *because* this row stands as it does.
-    costs_now: list[str]
-    # Concrete capability the role would gain by approving...
-    approve_grants: list[str]
-    # ...and the other logical names that would start working again with it.
-    approve_enables: list[str]
-    # Other logical names that would stop working if this were rejected...
-    reject_removes: list[str]
-    # ...and the concrete capability that would go with them.
-    reject_loses: list[str]
+    costs_now: list[str]  # other logical names not working because of this row
+    approve_grants: list[str]  # concrete capability gained by approving...
+    approve_enables: list[str]  # ...and the logical names that come with it
+    reject_removes: list[str]  # logical names that would stop working on reject...
+    reject_loses: list[str]  # ...and the concrete capability that goes with them
 
 
 def declared_tools(registry, role: str) -> list[str]:
@@ -445,38 +283,15 @@ def effective_tools(
     withheld: list[str],
     undecided: list[str],
 ) -> ToolEffect:
-    """The tools `role` may actually use, given these rows. **Pure: it writes
-    nothing — no rows, no events — and reads no store.**
-
-    That purity is the point of the extraction, not a bonus: `tools_for` writes
-    rows and logs events, so a read-only surface calling *it* to preview a
-    decision would turn a GET into a mutation. The resolution order, the
-    pending-vs-rejected distinction and the capability subtraction all live here;
-    `tools_for` adds the writes around it and nothing else.
-
-    See `tools_for` for what each step means and why — this is that docstring's
-    body, moved.
+    """The tools `role` may actually use, given these rows. **Pure: writes
+    nothing, reads no store** — so a read-only surface can call it to preview
+    a decision without turning a GET into a mutation. `tools_for` wraps this
+    with the writes and nothing else.
     """
     allowed: list[str] = []
-    # The names this role holds without anyone deciding anything — what a
-    # `pending` row must not be allowed to revoke.
     held: set[str] = set()
     queued: list[str] = []
     for tool in declared:
-        # A declared name is only as trustworthy as `agents.json`, which loads
-        # unvalidated through `AgentSpec(**spec)` — `tools: [null]` handed a `None`
-        # to a `NOT NULL` column, and `tools: [["file_io"]]` an unhashable value to
-        # a `set` membership test. Coerced here, unconditionally, rather than in
-        # the gated branch alone: with the gate off the raw entry used to travel
-        # into the subtraction below and raise `TypeError` during prompt
-        # construction, inside `_with_retry` — three retries reported as
-        # `infra_error`, pointing the human at the network instead of at the
-        # registry, which is the classification the config-error rule exists to
-        # prevent. A `str` passes through as itself, so the inertness guarantee is
-        # untouched for every list that is one. `tools_for` writes `queued` to the
-        # ledger, so a human reads back what was actually declared instead of a
-        # NULL, and an unusable name is refused rather than dropped: withholding it
-        # silently is the one outcome this module's docstring rules out.
         name = tool if isinstance(tool, str) else str(tool)
         if not config.gate_declared_tools:
             allowed.append(name)
@@ -493,75 +308,24 @@ def effective_tools(
         queued.append(name)
 
     for tool in granted:
-        # A grant for a name that maps to no SDK tool is not a capability, so it
-        # is never returned however the row was decided.
         if tool not in allowed and tool in LOGICAL_TOOL_MAP:
             allowed.append(tool)
-        # ...and a granted name is **held**, which is what the pending exemption
-        # below is asking about. `held` was built only from the declared paths,
-        # so with `gate_declared_tools=True` a human could approve `git` and the
-        # agent's next `TOOL_REQUEST: shell` — the registry's own worked example,
-        # undecided, never shown to anyone — would subtract the `Bash` that human
-        # had just granted. A grant is the strongest form of "already holds"
-        # there is; leaving it out made the exemption weakest exactly where a
-        # human had been most explicit.
         if tool in LOGICAL_TOOL_MAP:
             held.add(tool)
 
-    # An undecided ask for something the role already holds is not a denial of
-    # it; a decided one is. One filter rather than a branch inside the
-    # subtraction, so `subtract_withheld` stays pure over its arguments.
-    #
-    # The exemption is decided in the **same currency as the subtraction** —
-    # concrete capabilities, not logical names. `LOGICAL_TOOL_MAP` is not
-    # injective, so a name test and a capability subtraction disagree on exactly
-    # the collision pairs this module was written around. Measured with the
-    # shipped `worker` spec and the default config (`gate_declared_tools=False`,
-    # so every declared name is held):
-    #
-    #   declares:                    ['file_io', 'git', 'search', 'task_state']
-    #   pending, optional 'shell' -> ['file_io', 'search', 'task_state']  # !!
-    #   pending, optional 'git'   -> ['file_io', 'git', 'search', 'task_state']
-    #
-    # `shell` and `git` both resolve to `Bash`, so an *undecided, non-blocking*
-    # ask — nobody's decision, never shown to a human — silently cost the role a
-    # capability it already had, for the rest of the task. The trigger is the
-    # shipped system prompt's own worked example: `registry.py` teaches
-    # `TOOL_REQUEST: shell (blocking) - the criteria require running the build`,
-    # and the worker declares `git`, not `shell`.
-    #
-    # Only the *pending* exemption widens. A **rejected** row still subtracts
-    # unconditionally, baseline or not — that is the fail-closed half, and it is
-    # what stops an agent revoking its own baseline by asking for it.
     pending = set(undecided)
     held_capabilities = set(resolve_tools(sorted(held)))
 
     def _pending_costs_nothing(tool: str) -> bool:
-        """Whether subtracting this undecided row would take away a capability
-        the role already holds.
-
-        **Intersection, not subset**, and the difference is a live defect one
-        collision pair over from the one this exemption was written for.
-        `LOGICAL_TOOL_MAP` has *partial* overlaps as well as exact collisions:
-        `file_io` resolves to `[Read, Write, Edit]` and `file_read` to `[Read]`,
-        and the shipped **planner** declares `file_read`. Under a subset test
-        `{Read, Write, Edit} <= {Read, ...}` is False, so the row was not exempt
-        and `subtract_withheld` removed every name overlapping `Read` — measured:
-
-            planner declares:          ['file_read', 'search', 'task_state']
-            pending optional file_io -> ['search']   lost ['file_read']
-
-        An **optional, undecided** ask — never shown to a human, nobody's
-        decision — silently cost the planner the `Read` it already had. That is
-        the same self-revocation CLAUDE.md's rule forbids, and the same one the
-        `git`/`shell` fix closed; only the exact-collision case had been
-        measured.
-
-        Exempting cannot fail open. A pending row's tool is in `queued`, never
-        in `allowed`, so skipping the subtraction can only *keep* capabilities
-        the role independently declared — it can never hand over a new one. And
-        only the **pending** side is widened: a rejected row is not in
-        `pending`, so a human's denial still subtracts unconditionally."""
+        """Whether subtracting this undecided row would take a capability the
+        role already holds. **Intersection, not subset** — `LOGICAL_TOOL_MAP`
+        has partial overlaps as well as exact collisions (`file_io` resolves
+        to `[Read, Write, Edit]`, `file_read` to `[Read]`), so a subset test
+        would miss a partially-overlapping pending ask and let it strip a
+        capability the role does hold. Exempting can't fail open: a pending
+        tool is never in `allowed` regardless, so skipping the subtraction
+        only ever *keeps* something the role independently declared.
+        """
         if tool in held:
             return True
         return bool(set(resolve_tools([tool])) & held_capabilities)
@@ -617,15 +381,9 @@ def _verb(
     if status is ToolRequestStatus.PENDING:
         if approve_grants:
             return "would grant"
-        # Nothing to gain and the capability is already live: the role holds it
-        # through a name it declared, so approving changes nothing rather than
-        # failing to deliver.
         return "already has" if capability_live else "would not deliver"
     if status in (ToolRequestStatus.APPROVED, ToolRequestStatus.AUTO):
         return "grants" if capability_live else "does not deliver"
-    # `rejected` or `refused`. A `refused` row subtracts nothing at all
-    # (`withheld_tools` never sees it), so whether anything is actually denied
-    # here is a question about the concrete capability and not about the status.
     return "does not withhold" if capability_live else "denied"
 
 
@@ -689,11 +447,6 @@ def decision_effect(
     mine = resolve_tools([tool])
     capability_live = [c for c in mine if c in now_concrete]
     approve_grants = [c for c in resolve_for(approved) if c not in now_concrete]
-    # Only a `pending` row can be rejected (`store.tool_request_decide` refuses
-    # every other status), so on any other status these two describe a decision
-    # nobody can take. Computed for the one status that can, rather than computed
-    # always and rendered nowhere: a field that is dead but populated is what a
-    # later surface renders by accident.
     decidable = request.status is ToolRequestStatus.PENDING
     return DecisionEffect(
         in_effect=tool in now.allowed,
@@ -801,18 +554,11 @@ def tools_for(
     """
     role = spec.role
     if task_id is None:
-        # No row to attach a request to, so a gated tool is withheld and nothing
-        # is recorded: failing open would hand over the capability the gate exists
-        # to hold back.
         return effective_tools(config, role, list(spec.tools), [], [], []).allowed
 
     effect = effective_tools(
         config, role, list(spec.tools), *_row_facts(store, task_id, role)
     )
-    # `effect.queued` is already coerced to `str` by `effective_tools` (see the
-    # comment there), so every value reaching the ledger below is a plain bounded
-    # string — which is what keeps this call, inside a paid transaction, unable to
-    # raise.
     for name in effect.queued:
         unknown = name not in LOGICAL_TOOL_MAP
         store.tool_request_add(
@@ -834,12 +580,6 @@ def tools_for(
         )
 
     if effect.queued:
-        # Recomputed against the rows that now exist, rather than against a
-        # prediction of them: a name this very call queued is withheld in the list
-        # this very call returns — the alternative hands over a capability for one
-        # invocation and records it as withheld in the same breath. Re-reading is
-        # also the only way to be right about a row the per-task cap `refused`
-        # instead of queueing, which `withheld_tools` deliberately does not see.
         effect = effective_tools(
             config, role, list(spec.tools), *_row_facts(store, task_id, role)
         )
@@ -847,24 +587,9 @@ def tools_for(
     allowed, withheld = effect.allowed, effect.withheld
     lost, capability, removed = effect.lost, effect.capability, effect.removed
     if removed:
-        # Audited where a human reads the trail, not merely warned. The event is
-        # per invocation, beside the `{kind}_prompt` it explains, because that is
-        # when the capability was actually withheld; the row-level fact ("deciding
-        # this also decides that") rides `tool_requested` instead.
-        #
-        # The guard is `removed`, not `lost`. `lost` is the *collateral* half by
-        # construction — `subtract_withheld` excludes a tool that is itself
-        # withheld — so a denial that removes only the tool a human denied fired
-        # nothing at all, and that is the one case with no other signal in the
-        # ledger (the ask's own `tool_requested` event says a row was created, not
-        # that a capability went away). A conditional whose predicate excludes the
-        # requested tool cannot report the loss of the requested tool.
         cause = [
             w
             for w in withheld
-            # Only the names that actually did the subtracting: a withheld
-            # `task_state` resolves to nothing, so saying it "confers" the lost
-            # capability names a tool that confers none.
             if any(c in capability for c in LOGICAL_TOOL_MAP.get(w, []))
         ]
         store.log_event(
@@ -876,10 +601,6 @@ def tools_for(
                 "withheld": list(withheld),
                 "removed": removed,
                 "also_lost": lost,
-                # The concrete names appear in the event payload only, exactly as
-                # `tool_requested`'s `resolved` does: the ledger's columns, the
-                # prompts and the dashboard stay provider-neutral, and this is the
-                # one field that can answer "why did *that* stop working".
                 "capability": capability,
                 "message": (
                     f"{_and_list(removed)} stopped working for role {role!r} on "
@@ -887,12 +608,6 @@ def tools_for(
                     f"capability {_and_list(cause)} confers, and that is withheld "
                     f"(rejected, or awaiting approval)."
                     + (
-                        # NOT "was never requested": `lost` is "removed and not
-                        # itself withheld", which is not the same claim. A
-                        # collateral name can be an *approved* row — a human
-                        # approving `shell` while another denied `git` puts
-                        # `shell` here — and the event then asserted a human's own
-                        # decision never happened. Say only what `lost` proves.
                         f" {_and_list(lost)} shares that capability, so approving "
                         f"the withheld request restores both; there is no way to "
                         f"deny one and keep the other."

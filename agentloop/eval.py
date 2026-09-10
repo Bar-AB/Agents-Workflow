@@ -34,9 +34,6 @@ from .registry import Registry
 from .runner import MockRunner
 from .store import Store
 
-# Bucket edges chosen to straddle the two live thresholds (0.40, 0.70) so the
-# table directly informs "is there signal at these boundaries?". Upper edge is
-# 1.01 so a confidence of exactly 1.0 lands in the top bucket.
 CALIBRATION_EDGES = [0.0, 0.40, 0.70, 0.85, 1.01]
 
 
@@ -56,12 +53,7 @@ class EvalFixture:
     mock_line: str  # scripted validator output for the MockRunner path
 
 
-# ~20 fixtures across three categories. `gold` is the verdict a well-calibrated
-# validator should reach; `mock_line` is what the scripted mock validator
-# "says" — deliberately wrong on a handful, so the confusion matrix and
-# calibration table have off-diagonal / sub-1.0 cells to exercise.
 FIXTURES: list[EvalFixture] = [
-    # -- clearly good: gold approve -----------------------------------------
     EvalFixture(
         "g-slugify",
         "good",
@@ -122,8 +114,6 @@ FIXTURES: list[EvalFixture] = [
         "Order preserved, works on any hashable, tested.",
         "def dedup(xs):\n seen=set(); out=[]\n for x in xs:\n"
         "  if x not in seen: seen.add(x); out.append(x)\n return out",
-        # Validator is over-harsh here: gold is approve, mock says revise at low
-        # confidence -> a low-confidence *wrong* verdict (calibration signal).
         VerdictKind.APPROVE,
         _v("revise", 0.55, "na", "Wants a docstring; no real defect."),
     ),
@@ -150,7 +140,6 @@ FIXTURES: list[EvalFixture] = [
         VerdictKind.APPROVE,
         _v("approve", 0.91, "pass", "Correct semantics."),
     ),
-    # -- subtly wrong: gold revise ------------------------------------------
     EvalFixture(
         "sw-offbyone",
         "subtly_wrong",
@@ -178,8 +167,6 @@ FIXTURES: list[EvalFixture] = [
         "sorted_copy(xs) returns a sorted copy, leaving xs unchanged.",
         "Input list not mutated, returns new sorted list, tested.",
         "def sorted_copy(xs): xs.sort(); return xs   # mutates the caller's list",
-        # Validator misses the mutation bug and approves at high confidence:
-        # a high-confidence *wrong* verdict — the key miscalibration case.
         VerdictKind.REVISE,
         _v("approve", 0.80, "pass", "Looks correct, returns sorted list."),
     ),
@@ -210,8 +197,6 @@ FIXTURES: list[EvalFixture] = [
         "round2(x) rounds to 2 decimals, half away from zero.",
         "2.675 -> 2.68 (not banker's rounding), tested.",
         "def round2(x): return round(x, 2)   # banker's rounding: 2.675 -> 2.67",
-        # Validator approves at moderate-high confidence but gold is revise:
-        # another high-confidence wrong verdict.
         VerdictKind.REVISE,
         _v("approve", 0.74, "pass", "round() to 2 dp looks fine."),
     ),
@@ -225,7 +210,6 @@ FIXTURES: list[EvalFixture] = [
         VerdictKind.REVISE,
         _v("revise", 0.52, "na", "No range check and no tests, as required."),
     ),
-    # -- ambiguous / unsalvageable: gold escalate ---------------------------
     EvalFixture(
         "am-locale",
         "ambiguous",
@@ -263,8 +247,6 @@ FIXTURES: list[EvalFixture] = [
         "Make it 'fast'.",
         "Be 'fast enough' (no measurable criterion given).",
         "def f(x): return x*2   # 'fast' is not a checkable criterion",
-        # Validator picks revise instead of escalate: a wrong verdict kind that
-        # is neither approve nor a confident escalate (matrix off-diagonal).
         VerdictKind.ESCALATE,
         _v("revise", 0.48, "na", "Asks for a benchmark; treats it as fixable."),
     ),
@@ -403,28 +385,6 @@ def format_report(result: dict) -> str:
     return "\n".join(lines)
 
 
-# ---------------------------------------------------------------------------
-# Batch whole-loop evaluation (slice 6, Part 3)
-#
-# `run_eval` above measures one validator verdict at a time against a gold
-# `VerdictKind`. That is structurally blind to the thing the loop actually is:
-# the decision rules. Whether a `revise` at 0.55 produces a *revision round*
-# rather than an escalation, whether an exhausted revision budget lands at
-# NEEDS_HUMAN, whether a severe verdict skips the revision loop entirely -- none
-# of those is visible one verdict at a time.
-#
-# A batch fixture is therefore a whole task: a definition, a scripted sequence
-# of runner replies covering every round it will take, and the gold final
-# `TaskStatus`. `run_batch_eval` drives each through a real `Loop` and reports
-# the same three-part shape (`agreement`, a confusion matrix, per-fixture
-# detail) -- with `agreement` counting matched *final statuses*, which is what
-# `eval_runs.kind='batch'` says it counts.
-#
-# This is a regression harness, never a gate: no decision rule reads a batch
-# result (DD-8), and the row it writes is a measurement of the loop, not an
-# input to it.
-
-
 @dataclass
 class BatchFixture:
     id: str
@@ -434,22 +394,13 @@ class BatchFixture:
     criteria: str
     risk_level: int
     script: list[str]  # scripted runner replies, in the order the loop pops them
-    gold: TaskStatus  # the final status the decision rules must reach
-    # How many scripted replies this fixture expects the loop **not** to
-    # consume. Almost always 0. `b-empty-output` scripts a validator reply the
-    # loop must never reach, and that unreached reply *is* the assertion, so
-    # the count is declared per fixture rather than assumed globally -
-    # otherwise the fidelity check below could only be written by dropping the
-    # one fixture whose script proves a call did not happen.
+    gold: TaskStatus
     unused_script: int = 0
 
 
 _APPROVE = _v("approve", 0.92, "pass", "Meets every acceptance criterion.")
 _REVISE = _v("revise", 0.55, "fail", "Empty input is unhandled; add a guard.")
 _SEVERE = _v("escalate", 0.10, "fail", "Wrong approach; solves another problem.")
-# An `approve` kind whose confidence is below `severe_threshold`. The kind is
-# the *agreeing* one on purpose: this fixture pins that the threshold, not the
-# word, is what escalates.
 _UNSURE = _v("approve", 0.30, "na", "Cannot tell whether this is correct.")
 
 
@@ -481,8 +432,6 @@ BATCH_FIXTURES: list[BatchFixture] = [
         "Write pct(a, b) returning a/b as a percentage.",
         "Handles b == 0, tested.",
         1,
-        # An approve *below* approve_threshold is not a completion: it forces a
-        # revision round first, then the confident approve completes the task.
         [
             "def pct(a, b): ...",
             _v("approve", 0.60, "pass", "Probably fine."),
@@ -498,8 +447,6 @@ BATCH_FIXTURES: list[BatchFixture] = [
         "Write parse_port(s) -> int in 1..65535 or ValueError.",
         "Range-checked and tested.",
         1,
-        # One more worker/validator pair than `max_revisions`, all revise: the
-        # budget runs out and the task escalates instead of looping forever.
         ["v1", _REVISE, "v2", _REVISE, "v3", _REVISE, "v4", _REVISE],
         TaskStatus.NEEDS_HUMAN,
     ),
@@ -540,10 +487,6 @@ BATCH_FIXTURES: list[BatchFixture] = [
         "Write @retry(n) retrying a call n times then re-raising.",
         "Retries then re-raises, tested.",
         1,
-        # An empty worker output is the *absence* of work; the validator must
-        # never see it, so the scripted approve here is deliberately never
-        # consumed - declared as such, so "the script was consumed as scripted"
-        # can be asserted for every fixture including this one.
         ["", _APPROVE],
         TaskStatus.NEEDS_HUMAN,
         unused_script=1,
@@ -555,8 +498,6 @@ BATCH_FIXTURES: list[BatchFixture] = [
         "Write purge(db) removing rows older than 30 days.",
         "Removes only stale rows, tested.",
         2,
-        # An approve at 0.92 that would complete a risk-1 task: at risk 2 it
-        # parks for human sign-off instead.
         ["def purge(db): ...", _APPROVE],
         TaskStatus.NEEDS_HUMAN,
     ),
@@ -603,33 +544,18 @@ def run_batch_eval(
                 scratch.add_task(task)
                 runner = MockRunner(list(fx.script))
                 Loop(scratch, runner, registry, config).run_task(task)
-                # The **row**, never the in-hand object: `set_status` assigns
-                # the new status onto the task it was handed *before* its
-                # lease-predicated write, so the object can claim a transition
-                # the row never took (`human_approve` documents exactly this).
-                # Latent in a single-worker harness, and the wrong default for
-                # something whose entire output is a measurement.
                 row = scratch.get_task(task.id)
                 measured = row.status if row else task.status
                 revision_count = row.revision_count if row else task.revision_count
                 escalation_reason = (
                     row.escalation_reason if row else task.escalation_reason
                 )
-                # Script fidelity, measured on the same run as the status.
                 unscripted = runner.unscripted
                 remaining = len(runner.outputs)
                 metrics = scratch.task_metrics(task.id)
             finally:
                 scratch.close()
 
-            # Reaching gold off the end of the script is not agreement.
-            # `MockRunner` improvises "(mock output)" forever once its script
-            # runs out; that parses as no verdict, which escalates, which is
-            # the gold status of most of these fixtures - so a regression in
-            # the severe-verdict rule, the risk gate or the revision budget
-            # could overrun the script and still score `correct`. A fixture
-            # scripts every call the loop makes, so an extra or a missing call
-            # is a rule change and the fixture no longer measures what it says.
             script_consumed = unscripted == 0 and remaining == fx.unused_script
             correct = measured == fx.gold and script_consumed
             n_correct += int(correct)
@@ -650,11 +576,6 @@ def run_batch_eval(
                 }
             )
 
-    # Rows and columns are the statuses this run actually involved, rather than
-    # every member of `TaskStatus`: the loop's transient statuses can never be a
-    # final one, and a dense matrix over all ten would be mostly zeros. Built
-    # from the union of gold and measured, so every fixture has a cell and the
-    # cells always sum to `n` -- reconciliation is structural, not asserted.
     statuses = sorted({d["gold"] for d in detail} | {d["measured"] for d in detail})
     confusion = {g: {p: 0 for p in statuses} for g in statuses}
     for d in detail:
@@ -693,8 +614,6 @@ def format_batch_report(result: dict) -> str:
     for g in statuses:
         row = s["confusion"][g]
         lines.append(f"  {g:>11s} " + "".join(f"{row[p]:>{width}d}" for p in statuses))
-    # Sized off the widest id actually present, so a longer fixture id shifts
-    # the whole table rather than overflowing its own row out of alignment.
     idw = max([len(d["id"]) for d in result["detail"]] + [2]) + 1
     lines += [
         "",

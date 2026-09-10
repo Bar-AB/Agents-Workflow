@@ -1,136 +1,46 @@
-"""The orchestration loop (spec §4).
+"""Orchestration state machine (spec §4).
 
-A `planner` agent decomposes a goal into a graph of tasks (`Loop.plan`), and the
-loop drains that graph — sequentially by default, or `max_parallel_workers` at a
-time. It holds no schedule in memory: "what may run now" is a predicate the
-store evaluates inside the atomic claim, so dependency order and plan gating
-hold identically for one worker and for many.
+A `planner` agent decomposes a goal into a task graph (`Loop.plan`); `Loop.run`
+drains it — sequentially by default, or `max_parallel_workers` at a time. No
+schedule is held in memory: claimability is a predicate the store evaluates
+inside the atomic claim (`store.claim_next_task`), so ordering holds the same
+for one worker or many.
 
-Decision rules per validation round:
-- worker replies `ESCALATE:`            -> needs_human (genuine ambiguity)
-- verdict escalate OR conf < severe     -> needs_human (severe disagreement)
-- conf >= approve_threshold AND tests not failing
-                                        -> done (or needs_human sign-off if
-                                           risk_level >= human_review level)
-- otherwise                             -> revise, bounded by max_revisions;
-                                           exhausted retries -> needs_human
-- budget cap exceeded at any point      -> needs_human (never burn unbounded)
-- worker context >= context_handoff_     -> summarize the working state and
-  ratio of its AgentSpec budget              restart the worker from that summary
-                                             in place of the raw transcript
-                                             (a `context_handoff` event). Checked
-                                             at the boundary like the budget cap;
-                                             NOT a revision and not counted
-                                             against max_revisions.
-- a *worker or validator* asked for a  -> needs_human ("awaiting tool approval"),
-  tool it does not have and called        checked after the output is stored and
-  the ask `blocking`                      before TESTING. Partial output kept,
-                                          `revision_count` untouched, no
-                                          validator attempt and no test run: a
-                                          missing capability is not a quality gap
-                                          a worker can be told to fix, so it is
-                                          NOT a revision. The park stamps
-                                          `parked=1` on exactly the rows it named
-                                          and logs no event of its own (the
-                                          `status:needs_human` one is the record).
-                                          `approve_tool_request` lifts it only
-                                          when all three hold: the row's `parked`
-                                          is set, the task is at NEEDS_HUMAN *with
-                                          the park's own reason still on it*, and
-                                          no other pending+blocking+parked row
-                                          remains — so a tool decision can never
-                                          revert an escalation the tool queue did
-                                          not cause, including the four that fire
-                                          upstream of this check and leave the
-                                          same status behind.
-                                          `parked` is cleared by *every* exit from
-                                          the parked state (the firing release,
-                                          `human_redo`, `resume`'s PAUSED branch,
-                                          and the three terminal exits), because a
-                                          stale flag would make the four gates
-                                          above this one revertible. `reject`
-                                          records the denial and leaves the task
-                                          parked.
-                                          Scoped to worker/validator rounds on
-                                          purpose, because that is where the check
-                                          lives. `Loop.plan` passes the same config,
-                                          so a **planner**'s blocking marker does
-                                          create a pending+blocking row — but
-                                          `run_task` is never called on a
-                                          `kind='plan'` row, so nothing parks: the
-                                          plan proceeds, creates its children, and
-                                          the row sits in the queue for a human,
-                                          `blocking` and unhonored. Safe direction
-                                          (a plan is task definition a human signs
-                                          off anyway, and the planner is read-only
-                                          by construction), and stated here rather
-                                          than left to be discovered from a rule
-                                          that reads as though it applied to every
-                                          agent.
-- a tool is withheld (`pending`) or    -> its **concrete** capability is subtracted
-  denied (`rejected`) for this role        from the `tools` list handed to the
-  on this task                             runner, which also disables every other
-                                           logical tool sharing it: rejecting
-                                           `shell` removes `Bash`, so `git` stops
-                                           working even though the role declares it
-                                           and the baseline never gated it. Fail
-                                           closed on purpose — `LOGICAL_TOOL_MAP`
-                                           is not injective, so subtracting the
-                                           *name* left the capability in place and
-                                           the ledger recorded a withheld tool as
-                                           though it had held. Applied once over
-                                           the finished list (grants are appended
-                                           before it), never per request. The
-                                           collateral loss is audited as a
-                                           `tool_capability_withheld` event carrying
-                                           the sentence a human reads, and each
-                                           request's own event names what deciding
-                                           it also decides (`also_decides`), so the
-                                           consequence is legible before the click.
-                                           Not gated on `gate_declared_tools`: that
-                                           knob decides whether a declared tool
-                                           needs a grant, not whether a decision
-                                           already made is honored. A machine
-                                           `refused` row does not subtract — nobody
-                                           was shown a closed gate, and an over-cap
-                                           refusal would otherwise let an agent's
-                                           own chattiness strip its role's baseline.
-- this worker's `claimed_by` lease is  -> stand down: end the round, write no
-  no longer its own at the boundary        status, take nothing back. The task
-                                           belongs to whoever holds it now, so a
-                                           `claim_lost` event and a
-                                           RuntimeWarning are all this worker may
-                                           leave. NOT a revision and not counted
-                                           against max_revisions: nothing about
-                                           the work failed. The already-paid
-                                           attempt of the interrupted round stays
-                                           committed — it was bought.
-- transient infra failure (runner /     -> retried with backoff; if it persists
-  executor raises)                         -> needs_human with an infra_error
-                                           reason. Distinct from a revise
-                                           (infra failure is not a task-quality
-                                           failure) and NOT counted against
-                                           max_revisions. One flaky call does
-                                           not abort the rest of the batch.
+Per-round decision rules:
+- worker output starts `ESCALATE:`, or verdict is `escalate` / confidence <
+  severe_threshold -> NEEDS_HUMAN immediately (no revision).
+- confidence >= approve_threshold and tests not failing -> DONE, unless
+  risk_level >= human_review_risk_level, which requires a human sign-off first.
+- otherwise -> revise, bounded by max_revisions; exhausted -> NEEDS_HUMAN.
+- budget cap (tokens/cost) exceeded -> NEEDS_HUMAN.
+- worker context crosses context_handoff_ratio of its budget -> summarized by
+  the `summarizer` agent and restarted from the summary (`context_handoff`
+  event); not a revision.
+- a blocking `TOOL_REQUEST` -> NEEDS_HUMAN ("awaiting tool approval"); output
+  and revision_count are kept. Scoped to worker/validator rounds only — a
+  planner's blocking request queues but doesn't park the plan, since planning
+  is read-only and a human reviews the plan anyway.
+- a withheld/rejected tool request subtracts its *concrete* capability (not
+  just the logical name) from the tools list, since `LOGICAL_TOOL_MAP` is not
+  injective (`shell` and `git` both resolve to `Bash`). Audited as
+  `tool_capability_withheld`.
+- this worker's claim lease was stolen (a stranded claim reclaimed elsewhere)
+  -> stand down, write no status; the already-paid attempt stays committed.
+- transient infra failure -> retried with backoff, then NEEDS_HUMAN
+  (`infra_error`); not counted as a revision.
 
-Planning rules (`Loop.plan`), all failing the same safe way — the plan row
-escalates to NEEDS_HUMAN and no child tasks are created:
-- planner replies `ESCALATE:`            -> needs_human (genuine ambiguity)
-- unparseable / cyclic / dangling-ref /  -> needs_human ("Unusable plan"). The
-  oversized plan                            whole plan is discarded, never
-                                            partially applied or truncated.
-- plan_requires_approval (default True)  -> the plan's tasks are not claimable
-                                            until `approve_plan`; they wait as
-                                            ordinary `pending` rows.
-- a task is claimable only once every    -> a dependent of an escalated task is
-  dependency is DONE                        skipped, not failed; resolving the
-                                            dependency makes it claimable again.
+Planning rules (`Loop.plan`) all fail the same way — NEEDS_HUMAN, zero child
+tasks created, never partially applied:
+- planner replies `ESCALATE:`, or the reply is unparseable / cyclic / has a
+  dangling `depends_on` / exceeds `max_plan_tasks`.
+- `plan_requires_approval` (default True) blocks a plan's tasks from being
+  claimed until `approve_plan`.
+- a task is claimable only once every dependency is DONE; a blocked task is
+  skipped (not failed) and becomes claimable once its dependency resolves.
 
-"Tests not failing" means the *executed* result (spec §5). Tests run in the
-task's workspace between the worker and the validator; the validator sees the
-real output, and the gate consults the real status rather than the validator's
-self-reported TESTS: field. A validator claiming pass against an executed fail
-is recorded as a `test_disagreement` event — the loop measures its validators.
+"Tests not failing" means the *executed* result, not the validator's own
+`TESTS:` claim — a validator claiming pass over an executed fail is logged as
+`test_disagreement` and cannot approve the task.
 """
 
 from __future__ import annotations
@@ -142,8 +52,6 @@ import time
 import warnings
 from pathlib import Path
 
-# The **module**, never its names: P5/P6 patch this module attribute, and a
-# direct name binding would make that patch inert (`agents.py` is the scar).
 from . import vcs
 from .agents import (
     PlanError,
@@ -173,31 +81,8 @@ from .runner import (
 from .store import Store
 
 
-# How long an idle parallel worker parks before re-checking for claimable work.
-# In-process changes notify it directly; this only bounds how late it notices a
-# change made by another process.
 _IDLE_POLL_SECONDS = 0.5
 
-# How a park announces itself on the row, and the *only* thing that distinguishes
-# it from any other escalation holding the same status. Written by exactly one
-# place (`run_task`'s park) and read by exactly one place
-# (`approve_tool_request`'s condition 2), which is what makes it an internal
-# contract rather than string-matching a message.
-#
-# It exists because `parked=1` alone answers "was the loop ever holding this task
-# on this row", not "is that what is holding it now": a flag left standing by a
-# route that did not clear it sat on a task escalated for an empty output, a
-# worker `ESCALATE:`, a budget cap or an infra failure — all four fire *upstream*
-# of the park check — and every one of those leaves the task at NEEDS_HUMAN, so
-# the status term accepted them and approving the stale row blanked the very
-# diagnosis the human was asked to act on.
-#
-# Rejected alternative: clearing `parked` at each of those four escalations
-# instead. That is the paired-write shape this slice has already been bitten by
-# twice — one half conditional, the other half a line someone must remember to
-# add — and a fifth escalation added later would silently reopen the hole. A
-# positive test for "the park is what is holding this task" cannot be forgotten
-# by a new escalation, because a new escalation writes its own reason.
 _PARK_REASON_PREFIX = "Awaiting tool approval: "
 
 
@@ -228,9 +113,6 @@ class _ConfigError(Exception):
     inside the retry loop and would otherwise be retried like a network blip."""
 
 
-# A model id belonging to the Anthropic family. Pinned to an OpenAI-compatible
-# endpoint it is a guaranteed 404, so it is refused before the call rather than
-# after three paid round trips.
 _CLAUDE_MODEL_PREFIXES = ("claude-", "anthropic/")
 
 
@@ -317,17 +199,6 @@ class Loop:
     ):
         self.store = store
         self.runner = runner
-        # Backends a role may be pinned to by name (`AgentSpec.runner`), beyond
-        # the default `runner` above. Doubles as the cache for names resolved
-        # through `get_runner`: resolving per call would build a fresh backend
-        # for every invocation, and a MockRunner's script is per instance, so a
-        # test pinning a role would silently get an unscripted runner each round.
-        #
-        # What the lock guarantees is exactly one *construction* per name, so a
-        # backend holding state (a script, a connection, a rate limiter) is the
-        # same object for every thread. It does not make a backend thread-safe —
-        # that is the backend's own contract, and `MockRunner` explicitly does
-        # not offer it.
         self._runners: dict[str, ModelRunner] = dict(runners or {})
         self._runners_lock = threading.Lock()
         self.registry = registry
@@ -344,22 +215,8 @@ class Loop:
             promote_threshold=config.memory_promote_threshold,
             backend=get_backend(config.memory_retrieval_backend, config),
         )
-        # Stable id under which this loop claims tasks. Sequential today, so one
-        # id; it must stay constant so a restart resumes its own in-flight tasks
-        # (claim_next_task only resumes tasks a worker already owns).
         self.worker_id = "loop"
 
-        # A typo'd config key lands in the audit log, not only in a warning.
-        # `LoopConfig.load` has no store, so it records what it ignored and this
-        # is the first place with somewhere to put it. The stakes are a budget:
-        # an operator who writes `"max_cost_per_task"` (dropping `usd`) keeps
-        # the shipped default and bills every run against a cap they believe
-        # they lowered, while `/api/config` renders the *effective* value with
-        # nothing saying the file disagreed. A `warnings.warn` alone reaches
-        # neither `agentloop events`, the REST API nor the SSE feed — the same
-        # gap that made the original `print` insufficient, one channel up.
-        #
-        # Total: telemetry must never break construction.
         unknown = list(getattr(config, "unknown_keys", ()) or ())
         if unknown:
             try:
@@ -378,14 +235,6 @@ class Loop:
             except Exception:
                 pass
 
-        # Slice 9 P4, test 31. Same channel, same reasoning: a
-        # `sandbox_env_allowlist` entry that looks credential-shaped
-        # (`*_API_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`, `AWS_*`) is a
-        # config the operator wrote, not agent output, so it is warned rather
-        # than refused — but it must not be *silent*, since `_child_env` has
-        # no denylist and this knob is the one thing that re-admits what the
-        # scrub removes. A `warnings.warn` alone reaches neither `agentloop
-        # events`, the REST API nor the SSE feed.
         credential_like = credential_like_names(config.sandbox_env_allowlist)
         if credential_like:
             try:
@@ -407,25 +256,6 @@ class Loop:
             except Exception:
                 pass
 
-        # Bootstrap-project reconciliation (slice 10 Phase 3): make "one
-        # 'Default' project is created from today's loopconfig.json
-        # repo_root/workspace_mode" true for an operator upgrading a
-        # pre-slice-9 **worktree-mode** install. Gated on
-        # `config.workspace_mode == "worktree"` specifically, not merely
-        # "differs from the placeholder" -- a scratch-mode config's
-        # repo_root/worktree_root are proven inert everywhere else (scratch
-        # mode is a proven no-op), so a scratch-mode Loop construction with
-        # those knobs incidentally filled in (a real differential-test shape,
-        # not hypothetical) must never mutate the shared Default project row
-        # out from under a *different* Loop instance sharing the same store
-        # that actually is running worktree mode. A no-op for the common
-        # case (scratch mode, repo_root=".", matching the placeholder).
-        # Only the write (`repoint_project`) is guarded, matching the two
-        # sibling blocks above: a genuine failure reading `list_projects()`
-        # or evaluating the condition (a store bug, a future refactor) is a
-        # real defect that should surface normally rather than be absorbed
-        # with zero signal — this block's own "degraded but visible" promise
-        # would otherwise be broken by the one layer that swallows silently.
         projects = self.store.list_projects()
         if (
             len(projects) == 1
@@ -435,23 +265,12 @@ class Loop:
             and config.workspace_mode == "worktree"
         ):
             default_id = projects[0]["id"]
-            # Load-bearing: LoopConfig.repo_root is not required to be
-            # absolute (default is the literal relative "."), and slice
-            # 9's own _worktree_repo_root exists precisely because a
-            # relative repo_root is a real, supported worktree-mode
-            # configuration -- resolve to absolute BEFORE validating or
-            # storing it, the same lexical os.path.abspath convention
-            # _worktree_repo_root already uses at use time.
             resolved_repo_root = os.path.abspath(config.repo_root)
             try:
                 self.store.repoint_project(
                     default_id, resolved_repo_root, config.workspace_mode
                 )
             except Exception as exc:
-                # Bootstrapping the project record must never break loop
-                # construction, but unlike a bare except: pass, a
-                # genuine reconciliation failure (e.g. the configured
-                # directory no longer exists) is degraded-but-visible.
                 try:
                     self.store.log_event(
                         None,
@@ -469,8 +288,6 @@ class Loop:
                 except Exception:
                     pass
 
-    # -- public API ----------------------------------------------------------
-
     def run(self, max_tasks: int | None = None, project_id: int | None = None) -> int:
         """Process claimable tasks. Returns tasks processed.
         Safe to call after a crash/restart: state lives in the store.
@@ -484,8 +301,6 @@ class Loop:
         in one pass — the same filter every thread shares in the parallel
         case, no per-project scheduling."""
         n = max(1, int(self.config.max_parallel_workers))
-        # Checked for both paths: shrinking the pool *to* one worker is the most
-        # likely way to strand a claim, so the sequential path needs this most.
         self._warn_stranded_claims(self._worker_ids(n))
         if n == 1:
             return self._run_serial(self.worker_id, max_tasks, project_id)
@@ -496,8 +311,6 @@ class Loop:
     ) -> int:
         processed = 0
         while max_tasks is None or processed < max_tasks:
-            # Atomic claim (not a bare SELECT): a task is handed to exactly one
-            # worker, so two workers never grab the same row.
             task = self.store.claim_next_task(worker_id, project_id=project_id)
             if task is None:
                 break
@@ -538,27 +351,6 @@ class Loop:
         stopping = threading.Event()
 
         def drain(worker_id: str) -> None:
-            # The guard below used to cover only `run_task`, leaving
-            # `claim_next_task` — which opens a write transaction, and therefore
-            # raises `sqlite3.OperationalError: database is locked` after the
-            # busy timeout whenever two `agentloop run` processes share a
-            # database — outside it. The thread then died past the `try`,
-            # `errors` stayed empty, and `run()` returned a success count.
-            #
-            # Measured at `max_parallel_workers=3` with three pending tasks and
-            # the claim raising from the second call on:
-            #     RUN RETURNED: 1  -> reported success, no exception raised
-            #     tasks: [(1,'needs_human'), (2,'pending'), (3,'pending')]
-            # Two threads died, two tasks were silently dropped, and the only
-            # signal was a `threading.excepthook` traceback on stderr — a
-            # channel this project rules out everywhere else, because it reaches
-            # neither `agentloop events` nor the SSE feed.
-            #
-            # The comment on the inner handler already stated the property
-            # ("a thread that dies silently would leave the task claimed and the
-            # run reporting success"); this is the one place it did not hold. The
-            # sequential path propagates, so before this the two modes disagreed
-            # about what a failed batch even looks like.
             try:
                 _drain_body(worker_id)
             except BaseException as exc:  # noqa: BLE001 - re-raised by run()
@@ -575,21 +367,11 @@ class Loop:
                     if max_tasks is not None and state["claimed"] >= max_tasks:
                         cond.notify_all()
                         return
-                    # Counted at claim time, not completion: two threads that
-                    # both finish under the cap must not both claim past it.
                     task = self.store.claim_next_task(worker_id, project_id=project_id)
                     if task is None:
                         if state["busy"] == 0:
                             cond.notify_all()
                             return
-                        # A peer is mid-task and may unblock a dependent of it.
-                        # Every in-process state change notifies under this same
-                        # lock, so no wakeup is lost and the timeout is only a
-                        # backstop — it exists so a change made by *another*
-                        # process (an `approve-plan` mid-run) is noticed too.
-                        # Kept coarse: at 0.05s seven idle workers would fire
-                        # ~140 claim queries a second at the store lock the one
-                        # busy worker is trying to use.
                         cond.wait(timeout=_IDLE_POLL_SECONDS)
                         continue
                     state["claimed"] += 1
@@ -597,17 +379,12 @@ class Loop:
                 try:
                     self.run_task(task)
                 except BaseException as exc:  # noqa: BLE001 - re-raised below
-                    # A thread that dies silently would leave the task claimed
-                    # and the run reporting success. Surface it like the
-                    # sequential path does, once the other workers wind down.
                     errors.append(exc)
                     with cond:
                         state["busy"] -= 1
                         cond.notify_all()
                     return
                 with cond:
-                    # Finishing may have unblocked this task's dependents; wake
-                    # the workers parked above so they can claim them.
                     state["busy"] -= 1
                     cond.notify_all()
 
@@ -622,11 +399,6 @@ class Loop:
             for t in threads:
                 t.join()
         except KeyboardInterrupt:
-            # Sequential mode exits promptly on Ctrl-C; without this the
-            # parallel mode would not, because joining non-daemon threads waits
-            # for every in-flight model call *and* keeps claiming new tasks
-            # after the interrupt. Stop claiming, let the in-flight round
-            # finish, then re-raise.
             stopping.set()
             with cond:
                 cond.notify_all()
@@ -634,14 +406,6 @@ class Loop:
                 t.join()
             raise
         if errors:
-            # Every one of them is recorded before the first is raised. `errors`
-            # is a list because n workers can fail independently — a real bug in
-            # one thread and a locked database in two others is three
-            # exceptions — and raising `errors[0]` reports one while discarding
-            # the rest, on a path whose whole purpose is that a dying worker
-            # must not be silent. The raise still carries only the first, so the
-            # caller's behaviour is unchanged; what changes is that the others
-            # stop vanishing.
             for exc in errors:
                 try:
                     self.store.log_event(
@@ -659,17 +423,10 @@ class Loop:
         return state["claimed"]
 
     def _warn_stranded_claims(self, worker_ids: list[str]) -> None:
-        """Surface in-flight tasks held by a claim id no live worker will use.
-
-        Lowering `max_parallel_workers` between runs orphans whatever the
-        retired ids were holding: `claim_next_task` only re-offers in-flight
-        work to its exact owner, so those tasks become invisible to every
-        claimer while `run()` returns a success count that silently excludes
-        them. They are *not* reclaimed here — with the default worker id, a
-        second `agentloop run` process would look identical to a retired
-        worker, and stealing its live task is worse than leaving one stranded.
-        Reporting it turns silent loss into something an operator can act on
-        (`agentloop redo <id>`)."""
+        """Surface (never reclaim) in-flight tasks held by a claim id no live
+        worker will use — lowering `max_parallel_workers` orphans them, and
+        stealing one's task could be stealing a live process's work instead.
+        """
         stranded = self.store.stranded_claims(self.worker_id, worker_ids)
         for task in stranded:
             self.store.log_event(
@@ -681,8 +438,6 @@ class Loop:
                     "active_workers": worker_ids,
                 },
             )
-
-    # -- planning (roadmap slice 3) -------------------------------------------
 
     def plan(
         self,
@@ -704,9 +459,6 @@ class Loop:
         worse than none — the missing half is invisible, while the half that
         landed looks like a complete plan somebody approved.
         """
-        # Guard before the row exists: an empty goal would make the derived
-        # title raise IndexError, and a failure *before* the plan row is
-        # created is the one failure that cannot escalate a plan row.
         if not goal.strip():
             raise ValueError("A plan needs a goal to decompose (goal was empty).")
         if not acceptance_criteria.strip():
@@ -725,13 +477,6 @@ class Loop:
         )
         self.store.add_task(plan_task)
 
-        # Checked before the retry loop: a hand-edited agents.json predating the
-        # planner role is a configuration error, not a transient one, so
-        # retrying it with backoff would only burn the clock to reach the same
-        # conclusion — and reporting it as `infra_error` would point the human
-        # at the network instead of at their registry. Unlike the summarizer,
-        # there is no sane fallback: planning as a worker would decompose the
-        # goal with a prompt that never asked for a graph.
         try:
             self.registry.get("planner")
         except KeyError:
@@ -745,33 +490,14 @@ class Loop:
             )
             return plan_task
 
-        # Resolved before the retry loop for the same reason the role itself is:
-        # a runner name that does not exist is a config error, not a transient
-        # one, and it escalates the plan row with no child tasks created.
         try:
             planner_runner = self._runner_for("planner")
         except _ConfigError as exc:
             self.store.set_status(plan_task, TaskStatus.NEEDS_HUMAN, reason=str(exc))
             return plan_task
 
-        # Slice 9 P4: the operator's repository, read-only (the planner
-        # declares `file_read`, not `file_io`, so surveying a codebase it may
-        # not modify is what the role is for) — `None` in scratch mode, where
-        # a plan row has no task workspace to point it at. `plan_task` is
-        # passed (slice 10 Phase 3) so a multi-project db resolves the
-        # plan's own project rather than the loop's global config.
         repo_root = self._worktree_repo_root(plan_task)
         try:
-            # HIGH-3 (slice 9 remediation): every worker/validator call site is
-            # preceded by `_require_workspace`, which refuses with a clean
-            # config error rather than letting the SDK's `CLIConnectionError`
-            # for a missing cwd fall into `_with_retry`'s transient branch —
-            # three paid retries and an `infra_error` blaming the network for
-            # a permanent condition (a `repo_root` typo, an unexpanded `~`, a
-            # deleted checkout). `run_planner`'s `cwd` had no equivalent guard.
-            # Scoped to worktree mode: scratch mode passes `cwd=None`, which
-            # `_require_workspace` would refuse as "does not exist" for a
-            # reason that has nothing to do with a missing repository.
             if repo_root is not None:
                 self._require_workspace("planner", repo_root)
             result = self._with_retry(
@@ -788,10 +514,6 @@ class Loop:
                 ),
             )
         except _ConfigError as exc:
-            # A config error the backend only discovers when called (a missing
-            # key, a model it does not serve). Same outcome as an unknown runner
-            # name resolved above: the plan row escalates with zero child tasks,
-            # no retry and no `infra_error`.
             self.store.set_status(plan_task, TaskStatus.NEEDS_HUMAN, reason=str(exc))
             return plan_task
         except _InfraError as exc:
@@ -805,8 +527,6 @@ class Loop:
             )
             return plan_task
 
-        # Same rule the worker has: an agent that hits genuine ambiguity asks
-        # instead of guessing, and guessing here would fabricate a whole graph.
         if result.output.strip().upper().startswith("ESCALATE:"):
             self.store.set_status(
                 plan_task,
@@ -823,16 +543,6 @@ class Loop:
             )
             return plan_task
 
-        # One transaction: the tasks, their edges and the audit event land
-        # together, so a crash mid-write can't leave a graph missing the edges
-        # that are the only thing keeping its tasks in order.
-        #
-        # The except is not decoration. `parse_plan` already rejects cycles, so
-        # `add_dependency`'s own refusal should be unreachable — but "should be
-        # unreachable" is not the same as "cannot happen", and without this an
-        # unexpected failure here would roll the graph back correctly and then
-        # propagate, leaving a plan row parked at `pending` with no reason on
-        # it. That is the one shape this method promises never to produce.
         try:
             with self.store.transaction():
                 ids: dict[str, int] = {}
@@ -905,37 +615,18 @@ class Loop:
                 f"Task {plan_id} is not a plan (kind={task.kind!r}); "
                 f"use approve/reject for ordinary tasks."
             )
-        # A plan that produced no tasks is a *failed* plan (unparseable, cyclic,
-        # planner escalation). Approving it would turn an escalation into a
-        # green DONE goal with nothing under it, and would blank the diagnosis
-        # off the row. The decision rules fail safe toward NEEDS_HUMAN; this is
-        # the one place a human click could push the other way.
         if not self.store.plan_tasks(plan_id):
             raise ValueError(
                 f"Plan {plan_id} produced no tasks and cannot be approved "
                 f"({task.escalation_reason or 'planning did not complete'}). "
                 f"Re-plan the goal instead."
             )
-        # One transaction: the audit event, the approval flag and the status
-        # are one decision. Committed separately, a crash between them leaves
-        # the log claiming an approval that never released the children, or
-        # children released under a plan row still reading needs_human.
         with self.store.transaction():
             self.store.log_event(plan_id, "human_approve_plan", {"note": note})
             self.store.set_plan_approved(plan_id, True)
-            # Clear the "awaiting sign-off" reason: it is answered, and leaving
-            # it on a released plan reads as though it were still blocked.
             task.escalation_reason = ""
             self.store.set_status(task, TaskStatus.DONE)
         return self._require(plan_id)
-
-    # -- durability (slice 6): call, log, discard -----------------------------
-    #
-    # Every one of these is orchestration with **no logic in it**: no status,
-    # threshold, revision count or budget rule reads a `VcsResult` (DD-8), and
-    # none of them runs inside an open `Store.transaction()` (DD-10) — a 30s
-    # `vcs_timeout_s` there would stall every dashboard reader on the shared
-    # connection, and a raise would roll back the paired audit event.
 
     def _vcs_degraded(
         self, task_id: int, op: str, result, extra: dict | None = None
@@ -950,10 +641,6 @@ class Loop:
         Both channels, per the `executor.py` precedent: a warning alone reaches
         neither `agentloop events` nor the SSE feed.
         """
-        # A degradation is not always an *absence*: `rollback` can return
-        # `ok=True, reason="residue"`, which means the call ran and files
-        # survived it. Saying "ran without durability" there would be a
-        # misdiagnosis of the same kind `no-workspace` was added to remove.
         if result.ok:
             message = (
                 f"git {op} degraded ({result.reason}); task {task_id} kept a "
@@ -1194,9 +881,6 @@ class Loop:
             branch_prefix=self.config.vcs_branch_prefix,
         )
         if not after.ok:
-            # A failed detection is still a fact about the detection, and it
-            # used to return in silence - so a reader of the audit log could
-            # not tell "the validator wrote nothing" from "nobody looked".
             self.store.log_event(
                 task_id,
                 "validator_write_detection_failed",
@@ -1283,10 +967,6 @@ class Loop:
             ),
             ref,
             self.config,
-            # The pin recorded when this workspace's repo was created. Read
-            # from the store because that is the one place a worker cannot
-            # write: a rollback runs `reset --hard` and `clean -ffdqx`, so a
-            # config it did not vet is a command the worker chose.
             pin=self._worktree_pin(task_id, repo_root),
             repo_root=repo_root,
             task_id=task_id,
@@ -1295,34 +975,17 @@ class Loop:
         if result.ok:
             payload = {"ref": "base"}
             if result.sha:
-                # The pair is *absent*, not null, when HEAD was already at the
-                # target and nothing was discarded: these two keys name the
-                # recovery surface, and a null would assert one exists.
                 payload["discarded_sha"] = result.sha
                 payload["discarded_ref"] = f"{prefix}/{result.sha}"
             payload["files_removed"] = result.files_removed
             if result.nested_repos:
-                # The ref above holds everything the rollback deleted *except*
-                # a nested repository, which a commit can only record as a bare
-                # gitlink. Named rather than quietly omitted: a log asserting a
-                # recovery surface that does not hold the work is the defect,
-                # not the bytes git cannot carry.
                 payload["unrecoverable_nested_repos"] = list(result.nested_repos)
             if result.reason:
-                # `reason` is `""` *exactly* when nothing degraded, so a
-                # non-empty one on an ok result is a degradation the audit has
-                # to carry: `"residue"` means the rollback ran and files
-                # survived it, which the payload above reports as clean.
                 payload["degraded"] = result.reason
             self.store.log_event(task_id, "vcs_rollback", payload)
             if result.reason:
                 self._vcs_degraded(task_id, "rollback", result)
         elif result.reason != "disabled":
-            # `sha` on a *failed* rollback means the discarded tip was recorded
-            # before the failure, so the history a caller might now wipe is
-            # exactly the history `vcs.rollback` refused to lose. The audit
-            # says which of the two failures this was, because "ran without
-            # durability" reads as "nothing happened" for both.
             preserved = bool(result.sha)
             extra: dict = {"history_preserved": preserved}
             if preserved:
@@ -1459,26 +1122,6 @@ class Loop:
         )
 
     def run_task(self, task: Task) -> Task:
-        # Both roles resolved up front, exactly as `plan()` resolves `planner`,
-        # and for the two reasons that rule already gives.
-        #
-        # `Registry.load` replaces the built-in defaults wholesale with no merge
-        # and no missing-role check, so a hand-edited agents.json that adds one
-        # role (the documented slice-4 "pin the validator to openai" edit, done
-        # by replacing the file) can leave `worker` undefined. `registry.get`
-        # then raised a bare `KeyError` from `_maybe_handoff`, which matches
-        # neither `except _ConfigError` nor `except _InfraError` and so escaped
-        # `run_task` entirely: measured, the batch aborted, task 1 was left
-        # `in_progress` still holding its lease with an empty
-        # `escalation_reason` — a task the dashboard shows as running that
-        # nothing is running — and every task behind it never ran. The next
-        # `agentloop run` re-claimed it and died identically: permanent
-        # starvation, with one stderr line as the only signal.
-        #
-        # A missing `validator` failed differently and no better: it was raised
-        # *inside* `_with_retry`, so it became three paid retries and an
-        # `infra_error` escalation, which CLAUDE.md names as pointing "the human
-        # at the network instead of at agents.json".
         for role in (task.worker_role, task.validator_role):
             try:
                 self.registry.get(role)
@@ -1495,41 +1138,12 @@ class Loop:
 
         feedback = ""
         test_result = TestResult()
-        # Worker context consumed as of the last handoff. Measured, not reset in
-        # the store, so it stays an in-loop local: a post-crash restart simply
-        # re-measures from 0 and does one safe handoff at the first boundary if
-        # the accumulated context already exceeds the threshold.
         handoff_watermark = 0
-        # Durability locals (slice 6). `vcs_ready` is None until C1 has run
-        # once for this `run_task` invocation, then a bool gating every later
-        # vcs call; `round_n` names the per-round commits. Both are in-loop
-        # locals for the same reason `handoff_watermark` is: a restart simply
-        # re-initialises the repo, which is idempotent.
         vcs_ready: bool | None = None
         vcs_pin = ""
         round_n = 0
-        # Slice 9 P4: computed once per `run_task` invocation, exactly like
-        # `vcs_ready`/`round_n` above — a restart simply re-derives it, which
-        # is idempotent (it is a pure function of `self.config`, or, since
-        # slice 10 Phase 3, of `task`'s own project).
         repo_root = self._worktree_repo_root(task)
         while True:
-            # Human control is read fresh from the store at each iteration
-            # boundary, so a pause/abort set from another process (CLI or
-            # dashboard) is honored between rounds rather than only on kill.
-            # Ownership first, before anything that writes. Both checks below
-            # stamp a status, and a status written by a worker that no longer
-            # holds the lease lands on somebody else's round.
-            # Every exit re-reads rather than returning the in-hand object.
-            # `human_approve` already documents why: "`set_status` assigns the
-            # new status onto it before the predicated write, so on a write that
-            # did not land the object claims a transition the row never took."
-            # `set_status` is lease-predicated and returns a bool, and these
-            # exits did not check it — they returned the loop's *intention*
-            # rather than the task's history. Latent only because all three
-            # `run_task` call sites discard the value; the first caller to read
-            # it (a `run --json`, a batch-eval assertion, a test) would get a
-            # falsehood with no signal, so it is closed while it is still cheap.
             if self._claim_lost(task):
                 return self._require(task.id)
             if self._control_stop(task):
@@ -1537,34 +1151,14 @@ class Loop:
             if self._budget_tripped(task):
                 return self._require(task.id)
 
-            # Agent/executor calls are wrapped so a transient infra failure
-            # (API 5xx, network blip) is retried and, if it persists, escalates
-            # to NEEDS_HUMAN rather than crashing the whole batch. This is not a
-            # "revise": infra failure is not a task-quality failure.
             try:
-                # Context-budget handoff (slice 1): when the worker's accumulated
-                # context on this task passes context_handoff_ratio of its
-                # AgentSpec budget, compact the working state and restart the
-                # worker from that summary instead of the raw transcript. Checked
-                # at the boundary alongside the budget cap; not a revision.
                 handoff_summary = self._maybe_handoff(
                     task, feedback, test_result, handoff_watermark
                 )
                 if handoff_summary is not None:
                     handoff_watermark = self.store.attempt_tokens(task.id, "worker")
 
-                # Worker self-checks in its own output (spec §4.2–4.3).
                 self.store.set_status(task, TaskStatus.IN_PROGRESS)
-                # `create=False`: in worktree mode the explicit `init_repo`
-                # call below is what creates the checkout (`git worktree add`
-                # creates its own directory and refuses one that already
-                # exists); passing `create=True` here as well would have
-                # `workspace_for`'s own delegation (`executor.py`) attempt the
-                # same worktree add every round. In scratch mode `repo_root`
-                # is `None` and `workspace_for` ignores `create` for anything
-                # but the `mkdir` scratch mode still needs, so this is
-                # unconditionally `True` there — byte-for-byte the pre-slice-9
-                # call.
                 ws = workspace_for(
                     self.config.workspace_root,
                     task.id,
@@ -1573,13 +1167,6 @@ class Loop:
                     repo_root=repo_root,
                 )
                 if vcs_ready is None:
-                    # C1: one repo per task workspace (DD-1), created once per
-                    # `run_task` invocation. `.git` is invisible to
-                    # `_has_any_file`, so this cannot flip the tests gate.
-                    #
-                    # Slice 9 P4: the pin is the repository-level baseline in
-                    # worktree mode (`Store.vcs_repo_pin`) and the per-task pin
-                    # in scratch mode (`Store.vcs_pin`) — see `_worktree_pin`.
                     vcs_pin = self._worktree_pin(task.id, repo_root)
                     init = vcs.init_repo(
                         ws,
@@ -1591,12 +1178,6 @@ class Loop:
                         branch_prefix=self.config.vcs_branch_prefix,
                     )
                     if init.pin:
-                        # Non-empty *only* when this call created the repo, so
-                        # this records a config git wrote a moment ago and can
-                        # never re-bless one a worker edited between rounds. It
-                        # is recorded even on a failed init: the config exists
-                        # either way, and a pin nobody recorded is a workspace
-                        # nothing can ever act on again.
                         vcs_pin = init.pin
                         self._record_vcs_pin(task.id, repo_root, vcs_pin)
                     vcs_ready = bool(init.ok or init.reason == "already")
@@ -1628,24 +1209,10 @@ class Loop:
                     )
                     return self._require(task.id)
                 if not result.output.strip():
-                    # An empty worker output is not work; it is the absence of
-                    # work, and every downstream step treats it as the former.
-                    # The validator would review a blank diff against criteria it
-                    # cannot check, and an approve there marks the task DONE —
-                    # which, under the slice-3 graph, is exactly what releases
-                    # dependents to run against upstream output that does not
-                    # exist. `human_approve` refuses a `pending` task for this
-                    # same reason; this is the same refusal one step earlier.
-                    #
-                    # Escalating (rather than revising) because emptiness is not
-                    # a quality gap a worker can be told to fix: it means the
-                    # provider returned nothing, and re-prompting the same way
-                    # burns the revision budget on a call that already failed
-                    # silently. A runner that knows *why* it is empty raises
-                    # instead (see OpenAICompatRunner's error-envelope and
-                    # finish_reason checks); this catches the backends that
-                    # cannot tell — ClaudeSDKRunner joins its chunks, so a stream
-                    # carrying no text is "" with nothing to report.
+                    # Escalate, not revise: empty output isn't a quality gap a
+                    # re-prompt can fix, and letting it through would let a
+                    # validator approve a blank diff and release dependents
+                    # against output that doesn't exist.
                     self.store.set_status(
                         task,
                         TaskStatus.NEEDS_HUMAN,
@@ -1660,10 +1227,6 @@ class Loop:
                 task.output = result.output
                 self.store.update_task(task)
                 if vcs_ready:
-                    # C2: the round's snapshot, taken after the output is in the
-                    # store (which stays the sole source of truth for it) and
-                    # *before* the pending-tool park, whose partial output is
-                    # explicitly preserved and so must be in the commit.
                     round_n += 1
                     committed = vcs.commit(
                         ws,
@@ -1683,85 +1246,17 @@ class Loop:
                     else:
                         self._vcs_degraded(task.id, "commit", committed)
 
-                # A capability the agent called load-bearing and does not have
-                # (slice 5). Checked here — after the output is stored, before
-                # TESTING — because that is the earliest point at which the work
-                # already done is safe and nothing further has been spent: the
-                # partial output is committed, no tests have run, and the
-                # validator is not asked to review work the agent said it could
-                # not finish. **Not a revision**: a missing capability is not a
-                # quality gap a worker can be told to fix, so re-prompting would
-                # burn the revision budget on a call that cannot succeed, and
-                # `revision_count` is left alone.
-                #
-                # Only a `pending` + `blocking` row parks. A marker inside a
-                # fenced code block *is* a live request — accepted, not worked
-                # around: `parse_tool_requests` deliberately does not model
-                # markdown fences (a second, lossy model of the reply that can
-                # also drop a genuine ask), and the two failure modes are not
-                # symmetric. A dropped request silently withholds a capability with
-                # nothing in the ledger to show it was ever wanted; a false park
-                # keeps the output, the workspace and the revision budget and asks
-                # a human.
-                #
-                # What that costs the human, stated accurately, because the first
-                # version of this comment claimed the recovery was free and it is
-                # not. Four of the five exits are lossy: `approve_tool_request`
-                # releases but *grants* the tool the quoted example named (a real
-                # permission for a request nobody made); `reject_tool_request`
-                # deliberately does not release, so it is a dead end;
-                # `human_reject` and `abort` are terminal. `human_redo` releases
-                # and wipes the workspace and resets `output` and
-                # `revision_count` — exactly the three things this comment used to
-                # promise were kept. **The neutral exit is `pause` then `resume`**:
-                # it releases the lease, clears the `parked` flags, decides nothing,
-                # and keeps all three. It is written down here because nothing else
-                # would tell a human that the cheap way out is the one route not
-                # named in the escalation reason.
-                #
-                # Not fixed by adding a release on rejection: a denial must never
-                # restart a paid worker run against a gap the human just confirmed
-                # will not be filled (`reject_tool_request`).
                 pending_tools = self.store.pending_blocking_tool_requests(task.id)
                 if pending_tools:
-                    # The asking agent is named, not just the tool: a validator
-                    # asking for `shell` to reproduce a bug and a worker unable to
-                    # build without it produce the same park and want different
-                    # answers from the human, and `agent_kind` is already on the
-                    # row. Without it the two messages were indistinguishable.
                     named = ", ".join(
                         f"{r.tool} (request {r.id}, asked by the {r.agent_kind})"
                         for r in pending_tools
                     )
-                    # One transaction: the `parked` stamp and the status event are
-                    # one fact, and `tool_requests_mark_parked` logs nothing of its
-                    # own precisely because `set_status` audits this transition
-                    # with its reason. A second event for the park would let
-                    # anyone counting escalations count them twice.
-                    #
-                    # The stamp is gated on the status write having *landed*, and
-                    # the order is that way round for exactly that reason.
-                    # `set_status` is lease-predicated, so it legitimately no-ops
-                    # when a human took this task mid-round — and an unguarded stamp
-                    # would then leave `parked=1` on a task that is not parked,
-                    # which is the stale flag that makes a later unrelated
-                    # escalation revertible by approving this request.
                     with self.store.transaction():
                         if self.store.set_status(
                             task,
                             TaskStatus.NEEDS_HUMAN,
                             reason=(
-                                # "approve or reject" offered rejection as a way
-                                # out, and it is not one: `reject_tool_request`
-                                # deliberately does not release, so a human who
-                                # followed this advice reached a dead end with the
-                                # reason still recommending it. Nor is `pause` +
-                                # `resume` or `redo` — each returns the task to the
-                                # queue with this blocking row still standing, so
-                                # the next round pays a worker call and parks
-                                # again. Approving is the only decision that
-                                # releases it, and the reason now says so instead
-                                # of naming the routes that look symmetrical.
                                 f"{_PARK_REASON_PREFIX}{named}. Partial output "
                                 f"kept. `agentloop tools approve <id>` is the only "
                                 f"decision that releases the task; rejecting "
@@ -1776,12 +1271,7 @@ class Loop:
                             )
                     return self._require(task.id)
 
-                # Tests are part of validation, executed for real (spec §5).
                 self.store.set_status(task, TaskStatus.TESTING)
-                # Residual 2 (slice 9 plan): the main repository's own state,
-                # snapshotted either side of the test command — detection
-                # only, see `_vcs_detect_out_of_branch_write`. `None` in
-                # scratch mode, where there is no `repo_root` to watch.
                 repo_before = (
                     self._vcs_snapshot_repo_root(repo_root, vcs_pin)
                     if vcs_ready
@@ -1795,19 +1285,9 @@ class Loop:
                     task.id, repo_root, vcs_pin, repo_before
                 )
 
-                # Validation runs in a separate context (spec §5).
                 self.store.set_status(task, TaskStatus.VALIDATING)
-                # The cross-validator (slice 4): when the validator's spec pins a
-                # different backend, the output is reviewed by a model from
-                # another family than produced it. Nothing below this line
-                # changes — the verdict path is identical either way.
                 validator_runner = self._runner_for(task.validator_role)
                 self._require_workspace("validator", ws)
-                # H3: the tree as the executor left it, so anything that
-                # appears below is the validator's own doing. Taken here and
-                # not before the tests for exactly that reason - a pytest cache
-                # attributed to the validator would be noise, and noise is how
-                # a real detection gets ignored.
                 tree_before = (
                     vcs.working_tree_state(
                         ws,
@@ -1832,20 +1312,10 @@ class Loop:
                         memory=self.memory,
                         test_result=test_result,
                         config=self.config,
-                        # The same workspace the worker was given, for the same
-                        # reason: the validator declares `file_io` and was
-                        # reading the orchestrator's own directory while
-                        # reviewing work that lives here. Spelled `cwd` and not
-                        # `workspace` because it changes the validator's working
-                        # directory *only* — the prompt is byte-for-byte what it
-                        # was, and the worker's identically-valued `workspace=`
-                        # eight lines up also feeds a prompt block.
                         cwd=str(ws),
                     ),
                 )
             except _ConfigError as exc:
-                # Escalates without a retry and without an infra_error event: a
-                # typo'd runner name is not going to resolve on the third try.
                 self.store.set_status(task, TaskStatus.NEEDS_HUMAN, reason=str(exc))
                 return self._require(task.id)
             except _InfraError as exc:
@@ -1864,9 +1334,6 @@ class Loop:
                 task.id, ws, vcs_pin, tree_before, repo_root
             )
 
-            # Executed truth beats the validator's account of it. Record the
-            # mismatch: a validator that rubber-stamps failing tests is a
-            # measurable reliability problem, not a silent one.
             tests_ok = test_result.passed
             if tests_ok is None:
                 tests_ok = verdict.tests_passed
@@ -1918,14 +1385,6 @@ class Loop:
                 else:
                     landed = self.store.set_status(task, TaskStatus.DONE)
                     if landed and vcs_ready:
-                        # C3: gated on the write *landing*, the one shape
-                        # C4 and C5 also use. `set_status` is lease-predicated
-                        # and returns whether the row was written, so a no-op
-                        # DONE write must not move `refs/agentloop/approved`.
-                        # The sibling high-risk branch above does not mark
-                        # approved
-                        # — that task is NEEDS_HUMAN, and its ref is written by
-                        # `human_approve` instead (C4).
                         self._vcs_mark_approved(task, ws, repo_root)
                 return self._require(task.id)
 
@@ -1940,13 +1399,7 @@ class Loop:
             self.store.set_status(task, TaskStatus.REVISING)
             feedback = verdict.reasoning
 
-    # -- mid-run human control (pause / resume / abort) -----------------------
-
     _TERMINAL = (TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.ABORTED)
-    # The statuses `claim_next_task` re-offers to their owner — i.e. the ones a
-    # live worker may still be inside. Distinct from "non-terminal": a parked
-    # NEEDS_HUMAN task also holds its lease (the park does not release it), and a
-    # redo there takes nothing from anybody.
     _IN_FLIGHT = (
         TaskStatus.IN_PROGRESS,
         TaskStatus.TESTING,
@@ -1976,59 +1429,10 @@ class Loop:
             return task
         self.store.set_control(task_id, "run")
         if task.status == TaskStatus.PAUSED:
-            # Only this branch, and what that buys is narrower than it looks.
-            # `resume` accepts any non-terminal task, including in-flight rows a
-            # live worker still owns, and stripping *that* lease would leave a row
-            # matching neither disjunct of the claim SELECT and invisible to
-            # `stranded_claims` while `next_pending_task` still reported it —
-            # "looks runnable, never runs", the failure the release exists to
-            # remove, in a new shape. So the confinement is about not
-            # manufacturing an unclaimable row.
-            #
-            # It is **not** what keeps two workers off one task, and must not be
-            # read as such. `pause` stamps PAUSED immediately and never touches
-            # the lease, so a worker inside a model call is still inside the task
-            # when this branch runs; the row it leaves is pending and unleased,
-            # which is exactly what the claim CAS matches. `Loop._claim_lost` is
-            # the mechanism: the evicted worker re-reads its lease at the next
-            # boundary and stands down. Nothing here can prove that worker gone.
-            #
-            # One transaction, not three: both parked accessors document "no
-            # event of its own" *on the grounds that their caller writes a status
-            # event in the same transaction*, and phase 5's release is specified
-            # to copy this shape. As three commits that invariant was simply
-            # false, and a crash between them left `parked=0` standing against
-            # the old status. (A `try/except` here would be the hazard ADR-4
-            # forbids; a transaction is not.)
             with self.store.transaction():
                 self.store.release_claim(task_id)
-                # The in-hand object has to learn what the store was just told, or
-                # the very next line writes nothing: `update_task` is
-                # lease-predicated, and the lease this object remembers no longer
-                # exists. Same three lines in `human_redo` and in the tool-request
-                # release, for the same reason.
                 task.claimed_by = None
-                # Resuming ends the parked state without deciding the request, so
-                # the live flag goes with it; the row stays pending, so the need
-                # is still recorded and the next round parks again.
                 self.store.tool_requests_clear_parked(task_id)
-                # Blanked explicitly, because `set_status(..., reason="")` does
-                # not: it assigns only a *truthy* reason, so the row keeps
-                # whatever it held. `pause` stamps "Paused by human; resume to
-                # continue." onto every task it touches, so before this every
-                # pause/resume cycle left that sentence on the row for the rest
-                # of its life — measured still reading it on a `done` task,
-                # asserting a suspension that had ended, directly above the
-                # dashboard's decision buttons.
-                #
-                # This is the fifth release-to-PENDING path and the only one
-                # that was missing the line: `reset_unowned_to_pending`,
-                # `approve_tool_request`, `human_redo` and `approve_plan` all
-                # blank it, and `store.py`'s own docstring explains why. Worse
-                # here than elsewhere, because CLAUDE.md names pause+resume as
-                # the *neutral* exit from a tool-request park — so the
-                # documented recovery route was the one that overwrote the
-                # park's diagnosis.
                 task.escalation_reason = ""
                 self.store.set_status(task, TaskStatus.PENDING, reason="")
         return self._require(task_id)
@@ -2043,20 +1447,6 @@ class Loop:
         self.store.set_control(task_id, "abort")
         with self.store.transaction():
             self.store.log_event(task_id, "human_abort", {"note": note})
-            # An aborted task is not being held at NEEDS_HUMAN on anything, so the
-            # live flag is false and goes — see `tool_requests_clear_parked`.
-            #
-            # **Gated on the status write having landed**, the park's shape and for
-            # the park's reason (`run_task`). `set_status` became lease-predicated
-            # while this clear stayed unconditional, so a lease released between
-            # this method's read and its write left `status=needs_human` with
-            # `parked=0`: the transition never happened, and the release predicate's
-            # condition 1 reads that flag, so the task was stuck at NEEDS_HUMAN with
-            # no route back. Gated, it fails *closed* — the park stands and remains
-            # liftable — which is why this is the fix rather than releasing the lease
-            # here as `resume` and `human_redo` do: those two release it because
-            # their own contract hands the task back, while a terminal human exit has
-            # no business taking a lease off work it is not restarting.
             if self.store.set_status(
                 task, TaskStatus.ABORTED, reason=note or "Aborted by human mid-run."
             ):
@@ -2066,18 +1456,16 @@ class Loop:
     def _claim_lost(self, task: Task) -> bool:
         """Has this worker's lease been taken away since the last boundary?
 
-        `PAUSED` is not a quiescence guarantee and never was: `pause` stamps the
-        status immediately (its own docstring says so) and never touches the
-        lease, so a worker learns of a pause only at its next boundary — after
-        the current model call returns. A human who pauses, sees nothing happen
-        and resumes therefore returns the row to `pending` with no lease, which
-        is exactly what the claim's compare-and-swap matches, while the first
-        worker is still inside the task. An idle peer takes it within
-        `_IDLE_POLL_SECONDS`, or a second `agentloop run` process does at any
-        parallelism, and then two workers are running one task: two paid worker
-        attempts against one budget, two validator rounds, both writing
-        `task.output`, either able to drive it terminal and release graph
-        dependents against output the other is overwriting.
+        `PAUSED` is not a quiescence guarantee: `pause` stamps the status
+        immediately without touching the lease, so a worker learns of it only
+        at its next boundary, after the current model call returns. A human
+        who pauses, sees nothing happen, and resumes returns the row to
+        `pending` with no lease — exactly what the claim CAS matches — while
+        the first worker is still inside the task. An idle peer or a second
+        `agentloop run` process can then claim it too, and two workers end up
+        running one task: two paid attempts against one budget, both writing
+        `task.output`, either able to release graph dependents against output
+        the other is overwriting.
 
         The lease cannot be proven dead from *outside* — a retired claim id is
         indistinguishable from a live second process in the same id-space, which
@@ -2116,10 +1504,6 @@ class Loop:
             stacklevel=2,
         )
         with self.store.transaction():
-            # Re-read inside the transaction. The read above decided *whether* to
-            # stand down, which is this worker's own business and safe to answer
-            # from a stale row; what gets written below is the shared row, and
-            # between the two a human can approve, reject or redo the task.
             current = self.store.get_task(task.id)
             holder = current.claimed_by if current else None
             self.store.log_event(
@@ -2131,29 +1515,6 @@ class Loop:
                     "status": (current.status.value if current else None),
                 },
             )
-            # The one case where standing down must *also* write: nobody holds the
-            # lease and the row sits at a transient status. Only this worker could
-            # have stamped that status — it happened between the release landing
-            # and this boundary — and the row is now unreachable: it matches
-            # neither disjunct of the claim SELECT (`status='pending'` is false and
-            # `claimed_by=?` cannot match NULL) and is invisible to
-            # `stranded_claims`, while `next_pending_task` still advertises it. So
-            # `agentloop status` shows work the loop can never hand out, and only
-            # `agentloop redo` recovers it.
-            #
-            # Deliberately *not* the general case: with `holder` set the row
-            # belongs to whoever holds it now and this worker writes nothing, which
-            # is the rule the rest of this method exists to enforce.
-            #
-            # Both halves of "unowned and mid-flight" are re-checked *by the
-            # UPDATE*, not asserted here. The previous version read them, released
-            # the lock, formatted a warning and then wrote — so "the row is unowned
-            # by construction" was true of the read and false of the write, and a
-            # `human_approve` landing in the gap had its signed-off `DONE` returned
-            # to `PENDING` and re-claimed, with the graph dependents that `DONE`
-            # released now racing a second worker. `set_status` cannot be the guard
-            # (it writes the whole row from a `Task` object, unconditionally), so
-            # the swap lives in the store beside the three other CASes.
             if holder is None:
                 self.store.reset_unowned_to_pending(task.id, list(self._IN_FLIGHT))
         return True
@@ -2163,8 +1524,6 @@ class Loop:
         if the loop should stop working this task."""
         control = self.store.get_control(task.id)
         if control == "abort":
-            # Preserve a reason the human's abort() call already stored (e.g. a
-            # --note); only fall back to the generic message when there is none.
             current = self.store.get_task(task.id)
             reason = (
                 current.escalation_reason
@@ -2180,22 +1539,10 @@ class Loop:
             return True
         return False
 
-    # -- human decisions (spec §4.6–4.7) --------------------------------------
-
     def human_approve(self, task_id: int, note: str = "") -> Task:
         task = self._require(task_id)
-        # Approving a plan means "run what it proposed", not "this goal is
-        # finished". Without this, the dashboard's approve button and
-        # `agentloop approve <plan-id>` would mark the plan DONE while leaving
-        # its children blocked on an approval that never happened.
         if task.kind == "plan":
             return self.approve_plan(task_id, note)
-        # Approval is a human signing off on work that was *done and reviewed*.
-        # A PENDING task has produced nothing: no worker attempt, no validator
-        # verdict, no output. Marking it DONE would not just mis-record it —
-        # with a task graph, DONE is what satisfies a dependency, so approving
-        # an unrun task releases its dependents to run against upstream output
-        # that does not exist. Fail safe: refuse rather than complete.
         if task.status == TaskStatus.PENDING:
             raise ValueError(
                 f"Task {task_id} has not run yet (status=pending); there is "
@@ -2204,28 +1551,10 @@ class Loop:
             )
         with self.store.transaction():
             self.store.log_event(task_id, "human_approve", {"note": note})
-            # A DONE task is not parked on anything: `parked=1` asserts "the loop
-            # stopped this task on this row and has not resumed past it", which is
-            # false here, so clearing it is correct by definition rather than
-            # defensive (`tool_requests_clear_parked` states the sentence, and why
-            # `pause` — a suspension, not an exit — is the one caller absent). The
-            # request row itself stays undecided — a human may still want to grant
-            # it before a later redo.
-            #
-            # Gated on the status write, for the reason spelled out in `abort`.
             landed = self.store.set_status(task, TaskStatus.DONE)
             if landed:
                 self.store.tool_requests_clear_parked(task_id)
-        # Re-read rather than returning the in-hand object: `set_status` assigns the
-        # new status onto it *before* the predicated write, so on a write that did
-        # not land the object claims a transition the row never took.
         fresh = self._require(task_id)
-        # C4: outside the transaction (DD-10), and only for a row that actually
-        # reached DONE. A `risk_level >= human_review_risk_level` task reaches
-        # DONE *only* through here, so without this the approved ref would be
-        # absent for exactly the tasks a human vetted. Plan rows returned above.
-        # `create=False` (the default) is load-bearing: approving a task whose
-        # workspace never existed must not conjure one — the guard then refuses.
         if landed:
             repo_root = self._worktree_repo_root(fresh)
             self._vcs_mark_approved(
@@ -2244,28 +1573,9 @@ class Loop:
         task = self._require(task_id)
         with self.store.transaction():
             self.store.log_event(task_id, "human_reject", {"note": note})
-            # Both the gate and the clear: see `human_approve` and `abort`.
             landed = self.store.set_status(task, TaskStatus.FAILED, reason=note)
             if landed:
                 self.store.tool_requests_clear_parked(task_id)
-        # C5: outside the transaction (DD-10), and gated on the write landing -
-        # the same shape as C3 and C4. `set_status` is lease-predicated, so
-        # "the row is already FAILED and committed" is exactly what its return
-        # value exists to *not* assume: on a predicated miss the task was not
-        # rejected, a live worker may be mid-round, and rolling its workspace
-        # back would destroy the round that worker is still writing. On a
-        # refusal, or a miss, the workspace simply keeps its files -
-        # byte-for-byte what `human_reject` did before this slice, since it
-        # touched the workspace not at all.
-        #
-        # There is deliberately no residue fallback here, and that is a
-        # decision rather than an omission. Redo falls back to
-        # `clear_workspace`, which rmtrees `.git` and with it the discarded
-        # ref; a reject *keeps* the rejected work so a human can recover it, so
-        # wiping the one thing that makes it recoverable would invert the point
-        # of the call. Residue is audited instead - `_vcs_rollback_to_base`
-        # logs `degraded` on the event and a `vcs_unavailable` row - so what
-        # survived on disk is visible rather than hidden behind an ok result.
         if landed:
             self._vcs_rollback_to_base(task_id, self._worktree_repo_root(task))
         return self._require(task_id)
@@ -2342,9 +1652,6 @@ class Loop:
             `human_redo` clears `parked` without deciding the row.
             """
             current_req = self.store.tool_request_get(request_id)
-            # Freshly loaded: `set_status` writes the whole row from this object,
-            # so a stale one would put back an `output` or a `revision_count` from
-            # before.
             task = self._require(req.task_id)
             others = [
                 r
@@ -2355,12 +1662,6 @@ class Loop:
             ]
             released = (
                 bool(current_req and current_req.parked)
-                # Not the status alone: four escalation gates fire upstream of the
-                # park check and all four leave the task at NEEDS_HUMAN, so a
-                # `parked` flag standing against one of them passed a
-                # status-only test and blanked its diagnosis. The reason is what
-                # says *which* escalation is holding the task, and only the park
-                # writes this prefix (`_PARK_REASON_PREFIX`).
                 and task.status == TaskStatus.NEEDS_HUMAN
                 and task.escalation_reason.startswith(_PARK_REASON_PREFIX)
                 and not others
@@ -2379,17 +1680,8 @@ class Loop:
             )
             if decision["released"]:
                 task = decision["task"]
-                # The park is over, so the live flag goes with it and a later park
-                # is a fresh fact rather than a residue of this one.
                 self.store.tool_requests_clear_parked(task.id)
-                # `set_status(..., reason="")` does not clear a stale reason —
-                # only a truthy reason is assigned — so a released task would read
-                # "awaiting tool approval" forever. Same explicit blanking
-                # `human_redo` and `approve_plan` already do.
                 task.escalation_reason = ""
-                # Nothing else in the store clears `claimed_by`, and a `pending`
-                # task that still holds a lease is unclaimable *and* starves the
-                # claim loop behind it.
                 self.store.release_claim(task.id)
                 task.claimed_by = None  # see `resume`: the write below is predicated
                 self.store.set_status(task, TaskStatus.PENDING, reason="")
@@ -2431,56 +1723,13 @@ class Loop:
         """
         task = self._require(task_id)
         self.store.log_event(task_id, "human_redo", {"note": note})
-        # A fresh start clears any lingering pause/abort signal, otherwise the
-        # redo would stop again at its first iteration boundary.
         self.store.set_control(task_id, "run")
         task.output = ""
         task.revision_count = 0
         task.escalation_reason = ""
-        # Wipe the workspace too: a redo that reran over the previous attempt's
-        # files would not be a fresh start. C6: with a repo, the rollback is
-        # that wipe *and* keeps the round recoverable; without one - feature
-        # off, git missing, a workspace predating this slice - or with residue
-        # left behind, the fallback is today's `clear_workspace`, unchanged.
-        # `vcs.is_repo` is deliberately not called first: `rollback` re-runs
-        # the identical guard internally and says `not-a-workspace-repo`, so a
-        # pre-check would be a second, racier copy of it.
         repo_root = self._worktree_repo_root(task)
         result = self._vcs_rollback_to_base(task_id, repo_root)
         if repo_root is not None:
-            # Slice 9 P4, "Settled in interview" point 2: worktree mode's
-            # fresh start is *remove and recreate*
-            # (`vcs.remove_worktree` then `vcs.init_repo`), not reset-in-place
-            # — safe **only when the rollback above actually wrote the
-            # discarded ref** (or had nothing to discard). `vcs.rollback`
-            # writes `refs/agentloop/task-<id>/discarded/<sha>` at whatever
-            # the branch's prior tip was *before* anything moves, so the
-            # history this redo is about to remove the *branch name* from
-            # stays reachable from that ref (`git log --all`) — but only if
-            # that write is the one that actually happened. Round 4's
-            # remediation: this used to run unconditionally, so a rollback
-            # that failed *before* recording anything (a real git-level
-            # failure, e.g. the discarded ref's own path already occupied by
-            # an ordinary ref — no monkeypatch needed) still fell through to
-            # delete the branch, permanently orphaning the round's commits
-            # once an ordinary `git gc` ran. Gated on the same discriminator
-            # the scratch-mode branch below already uses correctly
-            # (`result.ok and result.reason != "residue"`): `ok=True` with a
-            # non-residue reason is the one shape that guarantees the
-            # discarded ref (or "nothing to discard") is real.
-            #
-            # This is what closes P2's documented gap: `init_repo`'s worktree
-            # branch always creates with `-b`, never `-B` (a branch that
-            # exists means a previous incarnation of this task, and
-            # force-resetting it would discard commits no human asked to
-            # discard) — so a *second* redo of the same task hit that refusal
-            # outright, because the branch `init_repo` made the first time was
-            # still there. The decision (see `vcs.remove_task_branch`'s
-            # docstring): delete the stale branch. `human_redo`'s whole
-            # contract is a fresh start with no carried-over context, and the
-            # discarded ref above is what makes deleting the *name* safe —
-            # the commits it pointed at do not become unreachable, only
-            # unnamed by a branch nothing may act on again after this call.
             if result.ok and result.reason != "residue":
                 ws = workspace_for(
                     self.config.workspace_root,
@@ -2498,9 +1747,6 @@ class Loop:
                     branch_prefix=self.config.vcs_branch_prefix,
                 )
                 if removed.ok or removed.reason == "no-workspace":
-                    # `no-workspace`: nothing to remove, e.g. a task redone
-                    # before its first round ever created a worktree —
-                    # proceed straight to (re)creating it.
                     vcs.remove_task_branch(
                         repo_root,
                         self.config,
@@ -2524,36 +1770,9 @@ class Loop:
                         self._vcs_degraded(task_id, "init", recreated)
                 elif removed.reason != "disabled":
                     self._vcs_degraded(task_id, "remove_worktree", removed)
-            # else: the rollback did not cleanly succeed — it either failed
-            # outright or left residue behind — so the discarded ref this
-            # branch's safety depends on may not be the one that was written.
-            # `_vcs_rollback_to_base` has already audited the gap
-            # (`vcs_unavailable` on failure, a degraded `vcs_rollback` on
-            # residue). Leave the worktree and its branch exactly as they
-            # are — do not delete a branch whose commits might be reachable
-            # nowhere else — and let a later run retry.
         elif not (result.ok and result.reason != "residue"):
-            # ...except when the rollback failed *after* recording the
-            # discarded tip (`sha` set on a failed result). `vcs.rollback`
-            # aborts rather than lose that history, while `clear_workspace`
-            # rmtrees `.git`, every round commit and that freshly written ref -
-            # so an unconditional fallback destroyed precisely what the callee
-            # had just refused to destroy, under a warning that reads as
-            # "nothing happened". The tree is left as it is and the gap is
-            # audited (`history_preserved` in the `vcs_unavailable` payload);
-            # the next run re-initialises what is there, which is idempotent.
-            #
-            # The discriminator is "was a recovery ref written", not "did the
-            # call succeed": `ok=True, reason="residue"` **with** a sha is the
-            # production shape, so `result.ok or not result.sha` let an ok
-            # result through to the wipe regardless of sha and destroyed the
-            # ref `_vcs_rollback_to_base` had logged one statement earlier.
             if not result.sha:
                 if not clear_workspace(self.config.workspace_root, task_id):
-                    # The fallback for every failed rollback cannot itself fail
-                    # silently: `rmtree` with an error handler installed
-                    # swallows per-file failures, so a redo that kept the
-                    # previous round would look exactly like one that did not.
                     warnings.warn(
                         f"Workspace for task {task_id} survived the redo wipe; "
                         f"the fresh start it promises is not what the next run "
@@ -2569,11 +1788,6 @@ class Loop:
             elif not _clear_worktree(
                 workspace_for(self.config.workspace_root, task_id)
             ):
-                # A ref exists, so the fresh start is kept by emptying the
-                # working tree rather than by deleting the history that ref
-                # names. Its own failure is audited for the same reason the
-                # wipe's is: a redo that kept the previous round looks exactly
-                # like one that did not.
                 warnings.warn(
                     f"Workspace for task {task_id} kept files the redo could "
                     f"not clear; the fresh start it promises is not what the "
@@ -2586,13 +1800,8 @@ class Loop:
                     "vcs_unavailable",
                     {"op": "clear_worktree", "reason": "residue", "stderr": ""},
                 )
-        # One transaction for the release, the flag clear and the status write —
-        # see `resume` for why the parked accessors' "no event of its own"
-        # contract depends on it.
         with self.store.transaction():
             if task.claimed_by and task.status in self._IN_FLIGHT:
-                # The residual in the docstring, made auditable: this redo is
-                # taking a lease from work that still looks live.
                 warnings.warn(
                     f"Redo of task {task_id} released a lease held by "
                     f"{task.claimed_by!r} while the task was {task.status.value}; "
@@ -2606,21 +1815,12 @@ class Loop:
                     "claim_taken_from_worker",
                     {"worker": task.claimed_by, "status": task.status.value},
                 )
-            # Hand the lease back with the task: nothing else in the store clears
-            # `claimed_by`, so a redo that only wrote PENDING left a row the
-            # claim's compare-and-swap could never match — which is what made
-            # README's promise that a redo recovers a stranded claim aspirational
-            # rather than true.
             self.store.release_claim(task_id)
             task.claimed_by = None  # see `resume`: the writes below are predicated
-            # A redo also ends any park without deciding the request, so the live
-            # "held on this row" flag must not survive into the fresh run.
             self.store.tool_requests_clear_parked(task_id)
             self.store.update_task(task)
             self.store.set_status(task, TaskStatus.PENDING, reason="")
         return task
-
-    # -- internals -----------------------------------------------------------
 
     def _runner_for(self, role: str) -> ModelRunner:
         """Which backend serves this role (slice 4).
@@ -2649,13 +1849,6 @@ class Loop:
         name = spec.runner
         if not name:
             return self.runner
-        # Check-then-act under a lock, not around it: `max_parallel_workers > 1`
-        # runs this from several threads at once, and the dict is sold as a
-        # cache *guaranteeing* one instance per name. What it actually
-        # guarantees without the lock is one instance per name eventually — fine
-        # for the two stateless backends that ship, wrong for anything holding a
-        # connection, and wrong today for a MockRunner injected through
-        # `runners={...}`, whose script is per instance.
         with self._runners_lock:
             if name not in self._runners:
                 try:
@@ -2715,13 +1908,6 @@ class Loop:
             try:
                 return fn()
             except RunnerConfigError as exc:
-                # A permanent, operator-fixable provider problem raised from
-                # inside the call rather than at resolution time: a missing key,
-                # a revoked one, a model the endpoint does not serve. Retrying
-                # it burns the clock to reach the same conclusion and an
-                # `infra_error` event points the human at the network. Escalates
-                # like any other config error, with no event of its own — the
-                # reason lands on the task row.
                 raise _ConfigError(f"{stage}: {exc}") from exc
             except Exception as exc:  # transient infra failure
                 attempts += 1

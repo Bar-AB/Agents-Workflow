@@ -12,17 +12,6 @@ from pathlib import Path
 
 from .models import AgentSpec
 
-# The tool-request grammar, taught verbatim to every role whose output is parsed
-# for it (worker, validator, planner — never the summarizer, whose output is
-# never parsed). One constant rather than three paragraphs: the marker form is
-# `toolpolicy._MARKER_RE`'s contract, and three hand-written copies of a grammar
-# drift into three grammars, two of which the parser rejects silently.
-#
-# Injected into the *system* prompt, so an agent that discovers mid-task that it
-# needs a capability knows the form without being told per task. Nothing here is
-# parsed from a system prompt — the parser only ever reads an agent's reply — so
-# the worked example below is safe to state literally, and a test parses it to
-# prove the taught grammar is the accepted one.
 TOOL_REQUEST_GRAMMAR = """Requesting a tool you were not given:
 - If you need a capability that is not in your tool list, ask for it on a line of
   its own, in exactly this form (one line per tool):
@@ -57,9 +46,6 @@ Rules:
 - Be complete but not padded; every token costs money.
 
 """
-    # Concatenated rather than interpolated: `PLANNER_SYSTEM` below contains the
-    # JSON braces an f-string would eat, and three prompts assembled two
-    # different ways is how one of them silently loses the block.
     + TOOL_REQUEST_GRAMMAR
 )
 
@@ -152,10 +138,6 @@ it. The exact shape:
 - `depends_on` lists refs from this same plan; omit or use [] for none.
 
 """
-    # The planner reads files to decompose a goal, so `file_read` is the ask it
-    # would plausibly make; it has no write tools by construction and must not be
-    # led to ask for one, which is why the grammar names what a request costs
-    # rather than encouraging one.
     + TOOL_REQUEST_GRAMMAR
 )
 
@@ -166,13 +148,6 @@ DEFAULT_AGENTS: dict[str, AgentSpec] = {
         system_prompt=WORKER_SYSTEM,
         tools=["file_io", "git", "search", "task_state"],
         context_budget_tokens=120_000,
-        # v2: told to follow a `## Project charter` block when one is present.
-        # v3: taught the `TOOL_REQUEST:` grammar. Load-bearing, not cosmetic —
-        # slice 5 parses the marker, gates the tools and parks the task on a
-        # blocking ask, but nothing told an agent the marker exists, so the only
-        # markers real traffic would ever carry are quoted ones. As with the v2
-        # charter change, this is the part of the slice that is *not* inert on a
-        # project using none of it: the system prompt changed for everyone.
         version="3",
     ),
     "validator": AgentSpec(
@@ -181,42 +156,18 @@ DEFAULT_AGENTS: dict[str, AgentSpec] = {
         system_prompt=VALIDATOR_SYSTEM,
         tools=["file_io", "search", "task_state"],
         context_budget_tokens=60_000,
-        # v2: charter violations count as defects, and the reply now carries a
-        # `FINDINGS:` section. The old prompt's "judge it strictly against the
-        # task's acceptance criteria" told it to disregard everything else,
-        # which would have made an injected charter inert.
-        # v3: taught the `TOOL_REQUEST:` grammar (see the worker). The validator
-        # is a request source too — `_MARKER_AGENT_KINDS` includes it — because a
-        # reviewer that cannot read the workspace cannot check what it is judging.
         version="3",
     ),
     "planner": AgentSpec(
         role="planner",
-        # Decomposition is the highest-leverage call in a run: every child task
-        # inherits its judgment about what the units of work are and what may
-        # run in parallel, and a bad split is only discovered attempts later.
-        # One planner run per goal, so the cost is negligible against the batch.
         model="claude-sonnet-5",
         system_prompt=PLANNER_SYSTEM,
-        # Read-only by construction (`file_read`, not `file_io`): a planner
-        # proposes work, it does not do the work. Writes belong to the workers
-        # whose output a validator actually reviews.
         tools=["file_read", "search", "task_state"],
         context_budget_tokens=120_000,
-        # v2: the acceptance criteria it writes must not contradict the charter.
-        # Injecting the charter without saying so would leave it decorative in
-        # the one role that decides what the validator later judges against.
-        # v3: taught the `TOOL_REQUEST:` grammar (see the worker).
         version="3",
     ),
     "summarizer": AgentSpec(
         role="summarizer",
-        # Mid-tier by default. The summary *replaces the raw transcript*, so a
-        # dropped detail (a specific test failure, a subtle validator note) makes
-        # the fresh worker regress or repeat a dead end — and a handoff only fires
-        # on long, budget-heavy tasks, so the cost delta vs. a cheap tier is
-        # negligible against the task total. Drop to a cheaper tier (e.g.
-        # claude-haiku-4-5) in agents.json for simple tasks.
         model="claude-sonnet-5",
         system_prompt=SUMMARIZER_SYSTEM,
         tools=[],  # reads and writes text only; no tools
@@ -238,7 +189,6 @@ class Registry:
     @classmethod
     def load(cls, path: str | Path | None = None) -> Registry:
         if path and Path(path).exists():
-            # utf-8-sig: agents.json is hand-edited, often on Windows.
             raw = json.loads(Path(path).read_text(encoding="utf-8-sig"))
             agents = {name: AgentSpec(**spec) for name, spec in raw.items()}
             return cls(agents)

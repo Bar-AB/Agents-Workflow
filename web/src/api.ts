@@ -148,12 +148,15 @@ export const api = {
       (r) => r.task,
     ),
 
-  charter: () => get<CharterView>('/api/charter'),
+  charter: (projectId?: number) =>
+    get<CharterView>(`/api/charter${qs({ project: projectId })}`),
 
   // Publishing a version, never editing one: the charter table is append-only.
   // An oversize or empty body is refused with a 400 rather than trimmed.
-  setCharter: (body: string, note = '') =>
-    post<CharterView>('/api/charter', { body, note }),
+  // project_id rides the body, not a query param -- POST /api/tasks already
+  // reads it that way, and an omitted one resolves to the default project.
+  setCharter: (body: string, note = '', projectId?: number) =>
+    post<CharterView>('/api/charter', { body, note, project_id: projectId }),
 
   // A decision on one request can change other rows (a release clears every
   // `parked` flag on the task), so the server returns the refreshed list —

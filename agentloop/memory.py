@@ -26,11 +26,6 @@ from __future__ import annotations
 from .retrieval import _MAX_QUERY_CHARS, RetrievalBackend
 from .store import Store
 
-# Cap injected context so memory can't crowd out the actual task. Pinned facts
-# get a separate, smaller ceiling *above* the main cap: they are the facts a
-# human declared must always be present, so they bypass the alphabetical
-# tail-off that drops ordinary facts past the cap — but are still bounded, so
-# pinning everything can't reintroduce the crowding the cap exists to prevent.
 _MAX_FACTS_IN_PROMPT = 20
 _MAX_PINNED_FACTS = 10
 _MAX_VALUE_CHARS = 400
@@ -45,10 +40,7 @@ class MemoryService:
     ):
         self.store = store
         self.promote_threshold = promote_threshold
-        # None = no relevance ranking; selection stays alphabetical.
         self.backend = backend
-
-    # -- reads ---------------------------------------------------------------
 
     def facts_for_prompt(
         self,
@@ -141,7 +133,6 @@ class MemoryService:
                 continue  # a backend can only ever return fewer, never other
             scores[int(mem_id)] = float(score)
             ordered.append(row)
-        # Whatever the backend did not rank, in candidate order, behind it.
         ordered.extend(r for r in rows if int(r["id"]) in by_id)
         return ordered[:top_k]
 
@@ -189,14 +180,8 @@ class MemoryService:
             tier, key, approved_only=True, task_id=task_id, project_id=project_id
         )
         if value is not None:
-            # Threaded, not left to default-resolve: `maybe_promote`'s own
-            # default would resolve to "the active project," which is not
-            # necessarily the project this read was just asked about — a
-            # project-scoped read must promote against ITS OWN project.
             self.maybe_promote(tier, key, project_id=project_id)
         return value
-
-    # -- writes --------------------------------------------------------------
 
     def remember(
         self,
@@ -213,8 +198,6 @@ class MemoryService:
         self.store.memory_write(
             tier, key, value, approved=approved, pinned=pinned, project_id=project_id
         )
-
-    # -- promotion -----------------------------------------------------------
 
     def maybe_promote(self, tier: str, key: str, project_id: int | None = None) -> bool:
         """Promote a hot project fact to loop memory. Returns True if promoted.

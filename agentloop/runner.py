@@ -65,13 +65,6 @@ try:  # optional extra: `pip install agentloop[claude]`
 except ImportError:  # core stays stdlib-only; MockRunner works without it
     anyio = None
     ResultMessage = None
-    # Rebound like its two siblings, and for a reason that is about the *tests*
-    # rather than the core: this name was the one the `except` forgot, so
-    # `from agentloop.runner import ClaudeAgentOptions` raised on the documented
-    # `pip install -e ".[dev]"` install, where `[claude]` is explicitly optional.
-    # An ImportError at module scope is a *collection* error, so it deleted
-    # every test in the importing module — including the ones that pin the
-    # working directory the loop hands the seam, which need no SDK at all.
     ClaudeAgentOptions = None
 
 
@@ -147,9 +140,6 @@ def extract_openai_usage(usage: dict) -> tuple[int, int, int, int]:
     prompt = _int_or_zero(usage.get("prompt_tokens"))
     completion = _int_or_zero(usage.get("completion_tokens"))
     if prompt == 0:
-        # Some providers report only the total. Ignoring it recorded 0 input
-        # against a multi-KB prompt, and input is the dominant cost on a
-        # validator call, so the budget cap measured almost nothing.
         total = _int_or_zero(usage.get("total_tokens"))
         prompt = max(0, total - completion)
     details = usage.get("prompt_tokens_details")
@@ -344,16 +334,6 @@ def never_zero_usage(
             f"{' and '.join(estimated)} tokens (~{tokens_in} in / "
             f"{tokens_out} out) so the budget cap still measures this attempt."
         )
-    # A field that was *present and unreadable* is a different thing from one
-    # that was absent, and the estimate above cannot see the difference for the
-    # two **cache** fields — nothing estimates those, so `_int_or_zero` coerced
-    # a garbage `cache_read_input_tokens` to 0 and the result was recorded as a
-    # measurement: `estimated` empty, `note` empty, `usage_estimated=False`, no
-    # `runner_warning`. Per the decision rules the token total includes cache
-    # reads and cost prices them at 0.10x, so on a cache-heavy run that is the
-    # dominant term of the budget cap. Reported here rather than estimated,
-    # because there is no honest estimate for a cache hit — but reported, so it
-    # can never pass as measured.
     if coerced:
         parts.append(
             f"usage field(s) {', '.join(coerced)} were present "
@@ -508,11 +488,6 @@ class MockRunner:
     def __init__(self, outputs: list | None = None):
         self.outputs = list(outputs or [])
         self.calls: list[dict] = []
-        # How many calls ran off the end of the script and got the improvised
-        # reply below. A caller measuring the loop needs this: "(mock output)"
-        # is an unparseable verdict, which escalates, which is the gold status
-        # of most escalation fixtures - so an overrun scores as a pass unless
-        # someone can see it happened.
         self.unscripted = 0
 
     def run(
@@ -523,9 +498,6 @@ class MockRunner:
         tools: list[str] | None = None,
         cwd: str | None = None,
     ) -> RunResult:
-        # `cwd` is *recorded* rather than acted on: this backend runs no tools,
-        # and a test asserting which directory a role was given must not need
-        # the SDK installed to do it.
         self.calls.append(
             {
                 "system": system_prompt,
@@ -552,16 +524,8 @@ class MockRunner:
         )
 
 
-# The registry names tools logically so it stays provider-neutral (spec §3);
-# translating to concrete vendor tool names is the seam's job, not the
-# registry's. An unknown logical name maps to nothing rather than being passed
-# through blind — an agent silently gaining an unintended tool is worse than
-# one missing a tool it asked for.
 LOGICAL_TOOL_MAP: dict[str, list[str]] = {
     "file_io": ["Read", "Write", "Edit"],
-    # Read without write, for roles that survey a codebase but must not change
-    # it (the planner proposes work; only workers produce output a validator
-    # reviews). `file_io` would hand those roles Write and Edit as well.
     "file_read": ["Read"],
     "search": ["Glob", "Grep"],
     "git": ["Bash"],
@@ -642,9 +606,6 @@ class ClaudeSDKRunner:
         `None` still means that default, and is correct only for a role with no
         workspace to name."""
         if ClaudeAgentOptions is None:
-            # Same message `run()` gives, one layer down: without the extra this
-            # is the first line that would fail, and it would fail as
-            # `TypeError: 'NoneType' object is not callable`.
             raise RuntimeError(
                 "ClaudeSDKRunner requires `pip install agentloop[claude]`"
             )
@@ -652,12 +613,6 @@ class ClaudeSDKRunner:
         return ClaudeAgentOptions(
             system_prompt=system_prompt,
             model=model,
-            # 25 was measured too low for a real worker round against a real
-            # workspace (write file(s), run tests, fix, re-run): the SDK cuts
-            # the turn off mid-task with `error_max_turns`, and the *next*
-            # attempt's resumed session then reports a confusing secondary
-            # "success" error on top of it. 80 is headroom, not a promise —
-            # a genuinely stuck agent still hits it and escalates safely.
             max_turns=80,
             allowed_tools=allowed,
             cwd=cwd,
@@ -675,22 +630,13 @@ class ClaudeSDKRunner:
         chunks: list[str] = []
         tool_calls: list[dict] = []
         tokens_in = tokens_out = cache_creation = cache_read = 0
-        # Whether a terminal message ever carried usage at all. Distinguishes
-        # "the provider reported nothing" from "the provider reported zeros",
-        # which is the difference between the two `reason` strings below and the
-        # only thing the operator can act on.
         saw_usage = False
         coerced: list[str] = []
         async for message in query(prompt=prompt, options=options):
             text = getattr(message, "result", None)
             if isinstance(text, str):
                 chunks.append(text)
-            # Tool uses accumulate across the stream (unlike usage, which is a
-            # running total on the terminal message): each block is one call.
             tool_calls.extend(extract_tool_calls(message))
-            # Usage comes from the terminal ResultMessage ONLY: its `usage` is
-            # already the whole-run total, so reading it from every message and
-            # summing (the old bug) double-counts. Assign, never accumulate.
             if _is_result_message(message):
                 usage = getattr(message, "usage", None)
                 if isinstance(usage, dict) and usage:
@@ -701,17 +647,6 @@ class ClaudeSDKRunner:
                     )
         output = "\n".join(chunks)
 
-        # The same never-zero guard the OpenAI backend has always had. Without
-        # it, an SDK that ships `usage` as a dataclass rather than a dict — or a
-        # stream carrying no terminal `ResultMessage` this code can match —
-        # returned four zeros with `usage_estimated=False` and no note, so
-        # `agents._invoke` logged no `runner_warning`, `attempts` recorded
-        # $0.00, `_budget_tripped` could never fire, `_maybe_handoff` could never
-        # fire, and the dashboard rendered the fabricated zero as a measurement.
-        # Note the irony this closes: `_is_result_message` falls back to a class
-        # name so "a minor SDK version change doesn't silently break usage
-        # capture", and the `isinstance(usage, dict)` below it reintroduced
-        # exactly that silent break.
         (tokens_in, tokens_out, cache_creation, cache_read), note = never_zero_usage(
             (tokens_in, tokens_out, cache_creation, cache_read),
             system_prompt,
@@ -741,12 +676,7 @@ class ClaudeSDKRunner:
 
 
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]", "0.0.0.0"}
-# How much of a provider's error body is worth keeping. Enough for a JSON
-# `{"error": {"message": ...}}`, bounded because it lands in an event payload.
 _MAX_ERROR_BODY_CHARS = 600
-# Codes worth another round trip: a timeout, a rate limit, and anything the
-# server blames on itself. Everything else in 4xx is the request or the
-# credentials, which the next identical request will not fix.
 _RETRYABLE_STATUS = {408, 409, 425, 429}
 
 
@@ -831,9 +761,6 @@ def _classify_http_error(exc: urllib.error.HTTPError, base_url: str) -> Exceptio
     return ProviderResponseError(message)
 
 
-# `stop` is a normal completion and `tool_calls` is one that ended to call a
-# tool. Everything else — notably `length` (truncated) and `content_filter` —
-# means the text in hand is not the answer the agent meant to give.
 _OK_FINISH_REASONS = {"stop", "tool_calls", "function_call"}
 
 
@@ -928,9 +855,6 @@ class OpenAICompatRunner:
         _check_base_url(self.base_url)
         self.api_key_env = api_key_env
         self.timeout_s = timeout_s
-        # Its own opener, not the module-level `urlopen`, so this backend owns
-        # its redirect policy (see `_NoRedirect`). One per instance, built once,
-        # and `_runner_for` guarantees one instance per pinned name.
         self._opener = urllib.request.build_opener(_NoRedirect())
 
     def run(
@@ -941,39 +865,12 @@ class OpenAICompatRunner:
         tools: list[str] | None = None,
         cwd: str | None = None,
     ) -> RunResult:
-        # `cwd` is accepted and ignored, and — unlike `tools` a few lines down
-        # — **silently**. The two look alike and are not. Dropping `tools` leaves
-        # a model that may emit calls nobody executes and then reason as though
-        # they had run, so that gap is worth a warning at the moment it opens.
-        # A chat-completions call has no filesystem at all: there is no tool to
-        # resolve a path against, so a working directory is *meaningless* here
-        # rather than dangerous, and ignoring it withholds nothing from anyone.
-        # A warning would then fire on every attempt of every task pinned to
-        # this backend and report nothing an operator can act on, which is how
-        # a real warning gets tuned out. The parameter exists only because the
-        # seam is one protocol.
-        #
-        # Checked before the request, so a missing key is a configuration error
-        # with a name in it rather than a provider 401. A `RunnerConfigError`
-        # and not a bare RuntimeError because `run()` is called *inside*
-        # `_with_retry`: as an ordinary exception this was retried with backoff
-        # and escalated as `infra_error`, which is the very outcome the check
-        # was written to avoid.
         if not os.environ.get(self.api_key_env):
             raise RunnerConfigError(
                 f"OpenAICompatRunner requires the {self.api_key_env} environment "
                 f"variable (the API key for {self.base_url})."
             )
         if tools:
-            # Degrade loudly, the way `sandbox_isolation='strict'` degrades to
-            # env-scrub when no container tier is wired: the run continues, but
-            # the capability gap is stated at the moment it opens rather than
-            # left to be inferred from a verdict that reviewed less than the
-            # operator thinks it did. `warnings.warn` and not `print`, because
-            # that precedent (executor.py) is a warning: stdout belongs to the
-            # CLI's structured output, and a printed line is invisible to `-W`,
-            # uncapturable by `pytest.warns`, and repeats on every attempt of
-            # every task instead of deduping.
             warnings.warn(
                 f"OpenAICompatRunner cannot execute tools; dropping "
                 f"{', '.join(tools)} for model {model!r}. A role pinned to this "
@@ -984,25 +881,14 @@ class OpenAICompatRunner:
             )
         payload = {
             "model": model,
-            # The system prompt stays a system message rather than being glued
-            # to the front of the user prompt: the registry's role prompts are
-            # written as instructions, and folding them into user text makes
-            # them look like content the agent may negotiate with.
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt},
             ],
         }
         data = self._post(payload)
-        # Content first, and it *may* raise: a reply with no usable completion
-        # is worth nothing, and returning `output=""` for it is worse than
-        # raising, because an empty worker output flows down the ordinary
-        # success path (`loop.py` special-cases only `ESCALATE:`).
         message, output = _extract_message(data, self.base_url, model)
 
-        # Usage second, and it may *not* raise: by this point the completion is
-        # in hand and already billed. Any schema surprise degrades to the
-        # estimate path instead of discarding it and re-paying via `_with_retry`.
         coerced: list[str] = []
         try:
             usage = data.get("usage") if isinstance(data, dict) else None
@@ -1036,17 +922,8 @@ class OpenAICompatRunner:
             tokens_out=tokens_out,
             cache_creation_tokens=cache_creation,
             cache_read_tokens=cache_read,
-            # The *serving* model, not the requested one: providers alias and
-            # substitute, and cost must be attributed to what actually ran. It
-            # is the dated snapshot id, which `config.pricing_key` normalizes at
-            # the pricing boundary — provenance is not discarded to make a
-            # lookup work.
             model=str(data.get("model") or model) if isinstance(data, dict) else model,
             tool_calls=extract_openai_tool_calls(message),
-            # Carried so `agents._invoke` can log a `runner_warning` event: a
-            # warning nobody sees in `agentloop events` is unrecorded, and the
-            # estimate then reaches `attempts` indistinguishable from a
-            # provider-measured number.
             usage_estimated=bool(note),
             notes=note,
         )

@@ -23,18 +23,6 @@ from .registry import Registry
 from .runner import ModelRunner
 from .store import Store
 
-# Bound as names, not as a module: `agents.py` binds every import this way, and
-# the byte-for-byte differential neuters this slice by patching
-# `agentloop.agents.tools_for` / `.parse_tool_requests`. Patching the
-# `toolpolicy` module object would be inert here, so the "neutered" run would
-# silently be the live run and the differential would compare a run to itself.
-#
-# `MAX_TOOL_REASON_CHARS` is imported rather than restated: it is one bound on
-# one field, and a second copy beside the parser that already truncates to it
-# would be two numbers that must agree with nothing making them. Public in
-# `toolpolicy` rather than imported under its underscore: a name another module
-# depends on is part of that module's interface whatever it is spelled, and
-# `from .x import _y` only hides the coupling from the reader of `x`.
 from .toolpolicy import (
     MAX_TOOL_REASON_CHARS,
     ToolClass,
@@ -43,68 +31,19 @@ from .toolpolicy import (
     tools_for,
 )
 
-# Decoration and/or whitespace: markdown emphasis, code ticks, spaces, newlines.
-# Interleaved rather than "decoration then whitespace", because `**VERDICT:**
-# approve` puts them in that order and `**VERDICT: approve**` in the other.
 _VERDICT_GAP = r"[\s*_`~]*"
-# The same, plus the separators a model puts *between* the three fields.
 _VERDICT_SEP = r"[\s*_`~,;|·–—-]*"
 
-# The decision-critical parser, deliberately tolerant of **decoration and
-# separators** and deliberately strict about **meaning**.
-#
-# The strict original accepted exactly one rendering, and an unparseable verdict
-# escalates at confidence 0 — below `severe_threshold`, so straight to
-# NEEDS_HUMAN with no revision round and a `reasoning` reading "Unparseable
-# validator output", which hides that the validator actually approved. Measured
-# against real formatting, five of six ordinary shapes did that: per-field
-# emphasis, comma and pipe separators, a bare `.95`, `n/a` for the value the
-# prompt spells `na`, and a percentage.
-#
-# `toolpolicy._MARKER_RE` already made this argument and won it — it tolerates a
-# markdown prefix, four reason separators, CRLF and every Unicode line
-# terminator, because LLM output is markdown. This parser drives an automatic
-# state transition and had none of that.
-#
-# What is NOT widened: the three verdict *kinds*, the requirement that all
-# three labelled fields be present, and — most importantly — the **range** of a
-# confidence. Prose that merely *sounds* like an approval still escalates at 0,
-# and nothing here guesses a verdict. The two error directions are not
-# symmetric — reading past a bold marker costs nothing, while failing to read a
-# real decision spends a human's attention and is invisible in the record.
-#
-# The tests values *are* widened, to the `passed`/`failed` word forms, and that
-# is a widening of spelling rather than of meaning: `passed` and `pass` are the
-# same answer. The three answers themselves (true / false / no result) are the
-# same three.
 _VERDICT_RE = re.compile(
     rf"{_VERDICT_GAP}VERDICT{_VERDICT_GAP}:{_VERDICT_GAP}"
     rf"(approve|revise|escalate){_VERDICT_SEP}"
     rf"CONFIDENCE{_VERDICT_GAP}:{_VERDICT_GAP}"
-    # A percentage is captured separately rather than folded into the number,
-    # because `0.95` and `95%` are the same confidence written two ways and only
-    # the `%` says which one was meant. A **bare** `95` is not disambiguated by
-    # anything, so `parse_verdict` refuses it rather than guessing — see the
-    # range check there, and note that an earlier version *clamped* instead,
-    # which mapped it to 1.0 and auto-approved at maximum confidence.
     rf"(\d*\.?\d+){_VERDICT_GAP}(%?){_VERDICT_SEP}"
     rf"TESTS{_VERDICT_GAP}:{_VERDICT_GAP}"
-    # `\b` so `TESTS: nap` is not read as `na`.
-    #
-    # `passed`/`failed` as well as `pass`/`fail`: both are at least as ordinary
-    # an LLM rendering as the shapes this pattern was widened for, and the `\b`
-    # above had silently narrowed them *out* — measured, `TESTS: passed` went
-    # from parsing (under the old pattern, which had no `\b`) to escalating.
-    # A slice whose stated purpose is surviving ordinary formatting must not
-    # lose a form on the way. The optional suffixes restore them and keep the
-    # `nap` protection, since `\b` still applies after the whole alternation.
     rf"(pass(?:ed)?|fail(?:ed|ing)?|n/a|na)\b",
     re.IGNORECASE,
 )
 
-# `n/a` is the same answer as `na`; the prompt asks for one and models write
-# both. `None` means "no executed result to speak of", which the loop then
-# resolves against `TestResult` rather than against this claim.
 _TESTS_VALUES = {
     "pass": True,
     "passed": True,
@@ -115,86 +54,31 @@ _TESTS_VALUES = {
     "n/a": None,
 }
 
-# How much of the free-text context (feedback, or the output under review) feeds
-# the memory retrieval query alongside the task definition.
 _MAX_QUERY_EXTRA_CHARS = 2000
 
-# How much of each completed dependency's output is handed to a dependent
-# worker. Bounded because a task can wait on several others and their combined
-# transcripts would otherwise be the largest thing in the prompt.
 _MAX_UPSTREAM_CHARS = 2000
 
-# How much of a tool's arguments the audit log keeps. The record answers "what
-# was this tool called with", not "what did it write".
 _MAX_TOOL_INPUT_CHARS = 2000
 _MAX_TOOL_NAME_CHARS = 200
-# A runner's own degradation note ("usage was estimated, here is why"). Wider
-# than a tool name: it is a sentence with numbers in it, and truncating it to a
-# name's width would cut off the part worth logging.
 _MAX_RUNNER_NOTE_CHARS = 1000
 
-# Largest reported token count treated as a number rather than as garbage. A
-# bound on the *magnitude*, where the others here bound a length: see
-# `_token_count` for why an unbounded `int` was a money bug rather than an
-# untidy number.
 _MAX_TOKEN_COUNT = 2**53
 
-# How much of a validator's findings section the verdict row keeps. Truncation
-# is acceptable here and deliberately *not* for the charter: the charter is an
-# input the agent must obey in full, so cutting it removes a rule, while
-# findings are a record of something that already happened, so cutting them
-# loses detail from an account — the same trade `_tool_input_repr` makes.
 _MAX_FINDINGS_CHARS = 4000
 
-# The validator's findings marker. Soft by design: line-anchored and
-# case-insensitive, matched only *after* the verdict line, and a miss simply
-# yields no findings. A grammar would need validation, and validation is an
-# exception path in something that must never fail an attempt.
 _FINDINGS_RE = re.compile(r"^[ \t]*FINDINGS:[ \t]*", re.IGNORECASE | re.MULTILINE)
-# A markdown *section heading* after the findings ends them, so a validator that
-# writes `## Reasoning` below its list does not fold the reasoning into the
-# evidence. Any heading level, matching what the docs promise.
-#
-# The blank line is load-bearing, not decoration. A bare `^#{1,6}\s` also matches
-# a `# TODO: ...` line quoted *inside* a finding — a code reviewer quoting a
-# comment is the common case here, not an exotic one — and every finding after it
-# would be dropped with no signal. Requiring the blank line that precedes a real
-# heading biases the remaining ambiguity toward keeping too much rather than too
-# little, which is the right direction: these findings are evidence, so
-# over-inclusion costs tidiness while under-inclusion destroys the record.
 _FINDINGS_END_RE = re.compile(r"\n[ \t]*\n[ \t]*#{1,6}\s")
 
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(.+?)```", re.DOTALL | re.IGNORECASE)
 
-# Which agents may author a tool request. An explicit allowlist, not
-# `kind != "summarizer"`: the summarizer must never be parsed, because its output
-# compresses a transcript that may quote a marker verbatim and parsing it would
-# manufacture a request out of a *quotation*. A negative test would hand marker
-# parsing to any role added later, silently, reintroducing exactly that bug. With
-# an allowlist the failure of omission is "a new role's genuine ask is ignored"
-# -> the tool is withheld -> the safe direction.
 _MARKER_AGENT_KINDS = ("worker", "validator", "planner")
 
-# Which ledger status each policy verdict lands on. A mapping rather than
-# branches, so a `ToolClass` added later fails at the lookup instead of falling
-# through to whichever branch happened to be last.
-#
-# "Fails at the lookup" is only an improvement because the lookup is now done
-# *outside* `_invoke`'s closing transaction. Inside it — where it originally sat —
-# "fails" meant rolling back an already-paid `finish_attempt` and having
-# `_with_retry` buy the completion again, so the missing-branch `KeyError` this
-# mapping exists to raise was a triple charge for a typo in an enum. The
-# discipline is one thing, not two: choose the failing shape *and* put it where
-# failing is cheap.
 _TOOL_CLASS_STATUS = {
     ToolClass.AUTO: ToolRequestStatus.AUTO.value,
     ToolClass.GATED: ToolRequestStatus.PENDING.value,
     ToolClass.UNKNOWN: ToolRequestStatus.REFUSED.value,
 }
 
-# Largest planner reply worth attempting to parse. A real plan is a few KB; far
-# past that the reply is runaway or hostile, and parsing it is the expensive
-# part, so the check belongs before `json.loads`, not after.
 _MAX_PLAN_REPLY_CHARS = 200_000
 
 
@@ -244,16 +128,8 @@ def _invoke(
     missing would have to invent a risk judgment, which is the silent degrade to
     a working default `retrieval.get_backend` refuses by raising.
     """
-    # The model call sits deliberately *between* two transactions, never inside
-    # one: the store lock must not be held across a network call. Each paired
-    # write (attempt row + its audit event) is atomic on its own.
     with store.transaction():
         attempt_id = store.start_attempt(task.id, kind, role, model, charter_version)
-        # Which facts memory put in front of *this* agent on *this* round. It
-        # goes in the opening transaction rather than the closing one because
-        # the retrieval already happened — it built the prompt below — so a
-        # failed model call must not lose the record of what was injected.
-        # `tool_call` is its mirror image: those only exist once the run is over.
         if retrieval is not None:
             store.log_event(
                 task.id,
@@ -276,28 +152,10 @@ def _invoke(
             },
         )
     result = runner.run(system, prompt, model, tools, cwd)
-    # The completion is now paid for, and every statement between here and the end
-    # of the closing transaction runs over that payment: a raise discards the
-    # tokens and cost the provider billed and `_with_retry` buys the same
-    # completion again. `notes` and a tool's *name* are coerced at this seam
-    # already, on the stated grounds that the `ModelRunner` protocol is a promise
-    # and not a guarantee — and `output`, the *shape* of `tool_calls` and the cost
-    # call's own arguments were trusted at the same seam, in the same transaction,
-    # for the same money. Each was three paid calls, zero attempt rows, `$0`
-    # measured spend and an `infra_error` pointing the human at the network. So
-    # every value the rest of this function reads off `result` is normalized here,
-    # once, above the transaction.
+    # The completion is billed the instant `run()` returns: nothing from here
+    # to the closing transaction below may raise, or a retry pays for it
+    # again. Every `result.*` field is coerced to a safe value before use.
     if not isinstance(result.output, str):
-        # A reply that is not text is not work. Coercing it with `str()` would
-        # hand a validator an object's repr to review as a work product; blanking
-        # it takes the existing empty-output rule to NEEDS_HUMAN, which is the
-        # fail-safe direction. **Assigned back onto `result`, not kept as a
-        # local**: `loop.run_task` reads `result.output.strip()` right after this
-        # returns, and that read is *outside* `_with_retry` — `run_task` has no
-        # `except Exception` of its own and neither does `_run_serial` — so a local
-        # would leave a deterministic `AttributeError` one frame up that aborts the
-        # whole batch instead of being retried. A different failure from the
-        # re-charge, and a worse one.
         result.notes = (
             f"{_runner_note_repr(result.notes)} / " if result.notes else ""
         ) + (
@@ -307,21 +165,6 @@ def _invoke(
         )
         result.output = ""
     else:
-        # `isinstance(str)` bounds the *type* and says nothing about whether the
-        # text can be written down. A lone surrogate (`'\ud83d'`, the high half
-        # of a truncated emoji) is a perfectly ordinary `str` that sqlite cannot
-        # store, so it killed `finish_attempt` itself — the first statement of
-        # the closing transaction, over the paid completion — and `_with_retry`
-        # bought the reply again. `json.loads` on a provider body containing one
-        # produces exactly this, which puts it inside slice 4's shipped
-        # `OpenAICompatRunner` rather than in theory.
-        #
-        # Repaired rather than blanked, unlike the non-`str` case above: that
-        # reply was not text at all, while this one is a real work product with
-        # one unwritable character in it, and blanking it would escalate a task
-        # whose worker did the work. The substitution is visible (the escape
-        # text, not a silent `?`) and audited through the same `runner_warning`
-        # event, so nothing is quietly altered.
         safe_output = _utf8_safe(result.output)
         if safe_output != result.output:
             result.notes = (
@@ -332,24 +175,11 @@ def _invoke(
                 "attempt could be recorded."
             )
             result.output = safe_output
-    # Audited, not swallowed: `result.notes` is what the `runner_warning` event
-    # below carries, so the degrade lands in `agentloop events`, the REST API and
-    # the SSE feed instead of only in the attempt row's blank output.
-    # The *serving* model, kept distinct from the requested `model` parameter: it
-    # is what the pricing table and the attempt row must both read (slice 4), and
-    # it crosses the seam, so it is coerced like any other reported field.
     served_model = _tool_name_repr(result.model)
     tokens_in = _token_count(result.tokens_in)
     tokens_out = _token_count(result.tokens_out)
     cache_creation = _token_count(result.cache_creation_tokens)
     cache_read = _token_count(result.cache_read_tokens)
-    # A clamped count is a **substitution**, and it says so in the audit log. The
-    # surrogate branch above already appends to `notes` for exactly this reason and
-    # this branch did not, which is this project's recurring "coercion at some
-    # sites and not others" shape: the ceiling landed in `attempts` and in
-    # `task_metrics` indistinguishable from a measurement, and the dashboard
-    # renders it as one. Appended to `notes` rather than given an event of its own,
-    # so it rides the `runner_warning` slice 4 added for precisely this class.
     clamped = [
         name
         for name, reported in (
@@ -372,36 +202,6 @@ def _invoke(
         served_model, tokens_in, tokens_out, cache_creation, cache_read
     )
     tool_calls = _tool_call_records(result.tool_calls)
-    # Parsed *before* the closing transaction opens, and deliberately: everything
-    # from here to the end of that block runs over an already-paid
-    # `finish_attempt`, so a raise inside it discards tokens and cost the provider
-    # has billed and `_with_retry` buys the completion again. `parse_tool_requests`
-    # is total on a `str` — which the coercion above is what guarantees, since a
-    # regex over a non-`str` raises — and touches no store, but running it out here
-    # means the regex, the bounds and the dedupe are not even in the transaction's
-    # blast radius.
-    #
-    # The classification and the status lookup are hoisted out here for the same
-    # reason, and it took a review to notice they were not: `classify` reads
-    # `config.tool_readonly_allowlist`, whose type nothing validated, and
-    # `_TOOL_CLASS_STATUS[cls]` is a deliberate `KeyError`. Both were raise-sources
-    # sitting *inside* the paid transaction, one statement below a comment
-    # explaining why raise-sources must be removed from it.
-    #
-    # **What hoisting buys is the rollback, not the re-charge** — an earlier
-    # version of this comment claimed "once instead of three times" and that is
-    # false, measured: `_invoke` runs inside `fn` under `_with_retry`, whose
-    # `except Exception` catches a raise from *anywhere* in this function, so both
-    # positions are re-paid `infra_max_retries + 1` times. Hoisted, the raise
-    # merely happens before any closing write, so there is nothing committed to
-    # roll back. (Not "and no `TransactionAborted` at an outer boundary" — that was
-    # the same overclaim one size smaller: the closing block *is* the outermost
-    # transaction here and nothing encloses it, so that exception was unreachable
-    # from either position and naming it made hoisting sound like it bought a
-    # protection it does not.) The consequence
-    # matters more than the correction: hoisting is *not* an alternative to
-    # removing a raise-source, which is why every value below is coerced and the
-    # config is validated at construction (`config._coerced`) as well.
     parsed = (
         parse_tool_requests(result.output)
         if config is not None and kind in _MARKER_AGENT_KINDS
@@ -422,9 +222,6 @@ def _invoke(
             cache_creation_tokens=cache_creation,
             cache_read_tokens=cache_read,
         )
-        # Provenance for what the agent actually did, not just what it said:
-        # one event per tool use, in the same transaction as the attempt it
-        # belongs to. Slice 5's approval policy layers on top of this record.
         for call in tool_calls:
             store.log_event(
                 task.id,
@@ -435,20 +232,9 @@ def _invoke(
                     "role": role,
                     "tool": _tool_name_repr(call.get("tool")),
                     "input": _tool_input_repr(call.get("input")),
-                    # Whether the tool *ran*, or was merely requested. The SDK
-                    # path executes what it reports, so it defaults to True; a
-                    # chat-completions backend has no execution loop and reports
-                    # False. Recording both as the same fact would let slice 5's
-                    # auto-approval policy read a request as an execution.
                     "executed": bool(call.get("executed", True)),
                 },
             )
-        # A runner that had to estimate its own usage, or degrade in any other
-        # way, says so *in the audit log* — the one place `agentloop events`,
-        # the REST API and the SSE feed all read. A `warnings.warn` alone is
-        # invisible there, and the estimated tokens land in `attempts` and in
-        # the `{kind}_output` event indistinguishable from measured ones, so the
-        # dashboard renders a fabricated cost as a real measurement.
         if result.usage_estimated or result.notes:
             store.log_event(
                 task.id,
@@ -459,31 +245,12 @@ def _invoke(
                     "role": role,
                     "model": served_model,
                     "usage_estimated": bool(result.usage_estimated),
-                    # Coerced for the same reason `tool` is, and it is not
-                    # optional: this event shares `log_event`'s one
-                    # `json.dumps`, so an unencodable note here would raise
-                    # inside the closing transaction and roll back the
-                    # already-paid `finish_attempt` above.
                     "note": _runner_note_repr(result.notes),
                 },
             )
-        # The capability asks this agent wrote in its own reply. No `try`/`except`
-        # anywhere in this loop, by design and not by omission: a swallowed
-        # failure of a *nested* transaction leaves `_txn_aborted` set, so the
-        # outer block rolls back the paid `finish_attempt` above and then raises
-        # `TransactionAborted` at the outermost boundary — turning a one-in-a-
-        # million telemetry hiccup into a guaranteed double charge. The
-        # raise-sources are removed instead: the parse is already done, every
-        # value below is a bounded plain `str`/`bool` before the call,
-        # `tool_request_add` resolves the UNIQUE collision by reading rather than
-        # by letting `INSERT` raise, and `tool_requests` declares no foreign keys.
         for p, cls, status in classified:
             store.tool_request_add(
                 task.id,
-                # Two distinct facts, never interchangeable: `role` is the
-                # registry role (`spec.role`), `kind` is the loop's own literal
-                # for which agent ran. A custom `task.worker_role` makes them
-                # differ, and `granted_tools` keys on the role.
                 role=role,
                 agent_kind=kind,
                 tool=_tool_name_repr(p.tool),
@@ -495,26 +262,6 @@ def _invoke(
                 why=(
                     "not a known logical tool name" if cls is ToolClass.UNKNOWN else ""
                 ),
-                # **A blocking ask is exempt from the per-task queue cap.** Over
-                # the cap a request is stored `refused`, and
-                # `pending_blocking_tool_requests` reads `pending` only — so a
-                # capped blocking ask could never park, turning "I cannot finish
-                # without this" into "continue without it and tell no human",
-                # which is the fail-safe inversion this project does not trade.
-                # What the exemption costs is bounded by construction rather than
-                # by trust: only a name in `LOGICAL_TOOL_MAP` and outside the
-                # read-only allowlist can become a *pending blocking* row (an
-                # unknown name is `refused`, a read-only one `auto`), so the
-                # ceiling is those few names times the roles on the task —
-                # single digits, whatever the agent emits.
-                #
-                # Rejected: escalating the refusal instead. `tool_request_decide`
-                # accepts only a `pending` row, so a `refused` row can never be
-                # decided; a task escalating on one would re-escalate every round
-                # with no human action able to clear it. A park nobody can lift is
-                # worse than a queue one row longer.
-                #
-                # `parked` is not passed at all: only the loop's park writes it.
                 max_per_task=None if p.blocking else config.max_tool_requests_per_task,
             )
         store.log_event(
@@ -523,10 +270,6 @@ def _invoke(
             {
                 "role": role,
                 "output": result.output,
-                # The coerced numbers, not the reported ones: this event shares
-                # `log_event`'s one `json.dumps`, so a token field of a type it
-                # cannot encode would raise here — inside the closing transaction,
-                # over the paid `finish_attempt` above.
                 "tokens_in": tokens_in,
                 "tokens_out": tokens_out,
                 "cache_creation_tokens": cache_creation,
@@ -691,8 +434,6 @@ def _plain_str(value, limit: int) -> str:
     try:
         text = str(value)
     except Exception:
-        # A `__str__` that raises would put us straight back in the transaction
-        # this function exists to protect.
         text = f"<unrepresentable {type(value).__name__}>"
     return _utf8_safe(text)[:limit]
 
@@ -714,9 +455,6 @@ def _tool_input_repr(value) -> str:
     try:
         text = json.dumps(value, sort_keys=True)
     except Exception:
-        # `repr` is a fallback, not a guarantee — a __repr__ that raises would
-        # put us straight back in the transaction this function exists to
-        # protect, so the last resort names the type and nothing else.
         try:
             text = repr(value)
         except Exception:
@@ -724,8 +462,15 @@ def _tool_input_repr(value) -> str:
     return text[:_MAX_TOOL_INPUT_CHARS]
 
 
-def _charter_block(store: Store) -> tuple[str, int | None]:
+def _charter_block(
+    store: Store, project_id: int | str | None = None
+) -> tuple[str, int | None]:
     """Project-wide rules every agent works under, and the version they are.
+
+    `project_id` is the calling task's own project (never left to
+    default-resolve inside a multi-project database) — the same reason
+    `_memory_block` threads it through, so a worker on one project never
+    sees another registered project's charter injected into its prompt.
 
     Returned with the version so the caller can record what this invocation
     actually ran under (`attempts.charter_version`), the same way `_memory_block`
@@ -743,7 +488,7 @@ def _charter_block(store: Store) -> tuple[str, int | None]:
     survives a context handoff, which a rule mentioned once in a transcript does
     not.
     """
-    active = store.charter_active()
+    active = store.charter_active(project_id)
     if active is None:
         return "", None
     version, body = active
@@ -911,7 +656,7 @@ def run_worker(
         f"## Goal\n{task.goal}\n\n"
         f"## Acceptance criteria\n{task.acceptance_criteria}\n"
     )
-    charter, charter_version = _charter_block(store)
+    charter, charter_version = _charter_block(store, task.project_id)
     prompt += charter
     memory_block, retrieval = _memory_block(
         memory, _retrieval_query(task, feedback), task.id, project_id=task.project_id
@@ -921,10 +666,6 @@ def run_worker(
     if workspace:
         prompt += _workspace_block(workspace, config)
     if handoff_summary is not None:
-        # Context-budget handoff (slice 1): the prior worker's context grew past
-        # its budget, so a fresh instance continues from a compacted summary in
-        # place of the raw transcript (previous output + feedback), which is
-        # exactly what would have overflowed.
         prompt += (
             f"\n## Handoff summary of prior work (context compacted)\n"
             f"{handoff_summary}\n"
@@ -953,9 +694,6 @@ def run_worker(
         retrieval,
         charter_version,
         config,
-        # The workspace is now the agent's actual working directory, not only
-        # a path named in the prompt above. The `## Workspace` block stays: it
-        # tells the worker *what* the directory is for, which a cwd cannot.
         cwd=workspace,
     )
     return result
@@ -982,8 +720,6 @@ def run_summarizer(
     try:
         spec = registry.get("summarizer")
     except KeyError:
-        # A hand-edited agents.json may predate the summarizer role; fall back
-        # to the worker's spec so a handoff degrades rather than crashing.
         spec = registry.get(task.worker_role)
     prompt = (
         f"# Task being handed off: {task.title}\n\n"
@@ -1054,10 +790,7 @@ def run_planner(
         f"## Acceptance criteria for the goal as a whole\n"
         f"{plan_task.acceptance_criteria}\n"
     )
-    # The planner is chartered because it authors the acceptance criteria the
-    # validator later judges against: criteria that contradict a house rule
-    # reproduce the conflict one level up, before any worker runs.
-    charter, charter_version = _charter_block(store)
+    charter, charter_version = _charter_block(store, plan_task.project_id)
     prompt += charter
     memory_block, retrieval = _memory_block(
         memory,
@@ -1097,11 +830,6 @@ def parse_plan(text: str, max_tasks: int) -> list[PlannedTask]:
     not repaired or partially applied — it escalates to a human, the same way an
     unparseable verdict escalates rather than being guessed at.
     """
-    # Bound the input before parsing it. `max_tasks` is a cap on the *parsed*
-    # plan, which is too late: a runaway or hostile reply costs the CPU and
-    # memory of parsing it first, and deep nesting raises RecursionError, which
-    # is not a JSONDecodeError and would escape as a traceback rather than an
-    # escalation. Model replies that are legitimately plans are far under this.
     if len(text) > _MAX_PLAN_REPLY_CHARS:
         raise PlanError(
             f"planner reply is {len(text)} chars, over the "
@@ -1116,8 +844,6 @@ def parse_plan(text: str, max_tasks: int) -> list[PlannedTask]:
     except ValueError as exc:  # JSONDecodeError is a ValueError
         raise PlanError(f"planner reply is not valid JSON: {exc}") from exc
 
-    # Accept the documented {"tasks": [...]} shape, and a bare array, which is
-    # the one deviation a model reliably makes and which is unambiguous anyway.
     if isinstance(data, dict):
         items = data.get("tasks")
     elif isinstance(data, list):
@@ -1144,8 +870,6 @@ def parse_plan(text: str, max_tasks: int) -> list[PlannedTask]:
             raise PlanError(f"task {ref!r} is missing: {', '.join(missing)}")
         criteria = str(item.get("acceptance_criteria") or "").strip()
         if not criteria:
-            # The validator judges strictly against acceptance criteria, so a
-            # task without any is a task no validator can ever approve.
             raise PlanError(f"task {ref!r} is missing: acceptance_criteria")
         try:
             risk = int(item.get("risk_level", 1))
@@ -1156,10 +880,6 @@ def parse_plan(text: str, max_tasks: int) -> list[PlannedTask]:
         deps = item.get("depends_on") or []
         if not isinstance(deps, list):
             raise PlanError(f"task {ref!r} has a non-list depends_on")
-        # De-duplicate: the edge table is keyed on (task, depends_on), so a
-        # repeated ref inserts one row. Counting it twice would make the
-        # `plan_created` event and the `task_dependency` events disagree with
-        # the graph they claim to describe.
         deps = list(dict.fromkeys(str(d).strip() for d in deps))
         planned.append(
             PlannedTask(
@@ -1243,10 +963,7 @@ def run_validator(
         f"## Acceptance criteria\n{task.acceptance_criteria}\n\n"
         f"## Worker output\n{worker_output}\n"
     )
-    # The validator is chartered too: one that does not know the house rules
-    # cannot catch a violation of them, and its verdict is the only route by
-    # which a charter violation reaches the loop at all.
-    charter, charter_version = _charter_block(store)
+    charter, charter_version = _charter_block(store, task.project_id)
     prompt += charter
     memory_block, retrieval = _memory_block(
         memory,
@@ -1302,8 +1019,6 @@ def _extract_findings(text: str) -> str:
             tail = tail[: end.start()]
         return tail.strip()[:_MAX_FINDINGS_CHARS]
     except Exception:
-        # Telemetry must never fail an attempt, and "no findings recorded" is a
-        # legitimate state the loop already handles.
         return ""
 
 
@@ -1328,27 +1043,9 @@ def parse_verdict(text: str) -> Verdict:
     raw_confidence = float(m.group(2))
     if m.group(3):  # written as a percentage
         raw_confidence /= 100.0
-    # **Rejected, not clamped**, and the difference is the whole gate.
-    #
-    # The widened pattern accepts any magnitude, and an earlier version clamped
-    # instead — which mapped every out-of-range number to `1.0`, the *top* of the
-    # scale. Measured: `VERDICT: approve CONFIDENCE: 95 TESTS: pass` parsed as
-    # APPROVE at 1.0, unconditionally clearing both `approve_threshold` (0.70)
-    # and `severe_threshold` (0.40), so a task went DONE with no human — and
-    # under the slice-3 graph that DONE releases every dependent. `CONFIDENCE:
-    # 55` rewrote a validator's revise-band judgement into certainty the same
-    # way. Before the widening, the strict pattern simply did not match those
-    # replies and they escalated at 0.
-    #
-    # So widening the *pattern* turned a fail-safe non-match into a fail-open
-    # maximum, on the one gate CLAUDE.md rules "never guess-approve". A bare
-    # `95` is genuinely ambiguous — it could be a percentage missing its sign,
-    # or a typo — and this parser does not guess: an out-of-range confidence is
-    # an unparseable verdict, which is exactly what it was before.
-    #
-    # A percentage that clears 100 is refused on the same rule, for the same
-    # reason. Nothing here clamps, because a clamp *substitutes the most
-    # permissive legal value* for a value the model did not write.
+    # Rejected, not clamped: clamping an out-of-range value (e.g. a stray
+    # "95" meant as a percentage) to 1.0 previously auto-approved at maximum
+    # confidence. Out of range is an unparseable verdict, same as before.
     if not 0.0 <= raw_confidence <= 1.0:
         return Verdict(
             kind=VerdictKind.ESCALATE,

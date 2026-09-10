@@ -5,7 +5,13 @@ import type { CharterView } from '../types'
 // The human write surface for project-wide rules. Agents have none: they only
 // ever read the charter out of a prompt, so this panel and the CLI are the only
 // two ways it can change.
-export function CharterPanel() {
+//
+// `projectId` is threaded from the same switcher every other panel reads —
+// the charter is per-project (`Store.charter_active` resolves an omitted one
+// to the *default* project, never "every project", so `null` here — the
+// switcher's "All projects" state — deliberately still shows one concrete
+// project's charter rather than an undefined blend of several).
+export function CharterPanel({ projectId }: { projectId: number | null }) {
   const [view, setView] = useState<CharterView | null>(null)
   const [draft, setDraft] = useState('')
   const [note, setNote] = useState('')
@@ -15,8 +21,9 @@ export function CharterPanel() {
 
   useEffect(() => {
     let cancelled = false
+    setView(null)
     api
-      .charter()
+      .charter(projectId ?? undefined)
       .then((v) => {
         if (cancelled) return
         setView(v)
@@ -26,13 +33,13 @@ export function CharterPanel() {
     return () => {
       cancelled = true
     }
-  }, [])
+  }, [projectId])
 
   const publish = async () => {
     setBusy(true)
     setError(null)
     try {
-      const next = await api.setCharter(draft, note)
+      const next = await api.setCharter(draft, note, projectId ?? undefined)
       setView(next)
       setDraft(next.active?.body ?? '')
       setNote('')

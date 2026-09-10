@@ -25,11 +25,19 @@ node_modules/
 # workflow JSON + event logs). Churns every workflow; not source.
 .cc10x/
 
-# Developer-facing working notes: delivery reports, goal prompts, design specs.
-# Process artifacts for whoever is driving the build, not part of the project
-# that runs. README.md is the product documentation.
+# Personal working notes: delivery reports, goal prompts, scratch specs.
+# Never part of the project that runs, never committed.
 temp/
-docs/
+docs/*
+# CLAUDE.md (tracked) points into docs/GUIDE.md, docs/CODE_NOTES.md,
+# docs/history/ and docs/plans/ for detail it doesn't carry inline — those
+# ship too, or CLAUDE.md's own pointers are dead links for anyone who clones
+# the repo fresh, and an agent working from that clone loses the reasoning
+# behind every function whose behavior looks simpler than it is.
+!docs/GUIDE.md
+!docs/CODE_NOTES.md
+!docs/history/
+!docs/plans/
 
 # Loop state & local config (not source)
 *.db

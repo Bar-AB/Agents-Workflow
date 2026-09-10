@@ -57,17 +57,9 @@ from .models import TestResult
 if TYPE_CHECKING:
     from .config import LoopConfig
 
-# Keep stored output small — the tail is for humans debugging a failure, and
-# the whole thing is also fed into a validator prompt where tokens cost money.
 _MAX_TAIL_CHARS = 4000
 
-# The only environment variables copied into the child. Everything else —
-# secrets included — is dropped. This is the allowlist the interpreter and a
-# typical test runner need to start and resolve paths on both platforms; a
-# project needing more passes them explicitly via LoopConfig.sandbox_env_allowlist.
-# Matched case-insensitively because Windows env keys vary in case.
 _BASE_ENV_ALLOWLIST: tuple[str, ...] = (
-    # POSIX + interpreter basics
     "PATH",
     "PYTHONPATH",
     "PYTHONHOME",
@@ -80,7 +72,6 @@ _BASE_ENV_ALLOWLIST: tuple[str, ...] = (
     "TMPDIR",
     "SHELL",
     "USER",
-    # Windows: the interpreter needs these to start and resolve temp/DLL paths.
     "SYSTEMROOT",
     "WINDIR",
     "COMSPEC",
@@ -100,22 +91,6 @@ _BASE_ENV_ALLOWLIST: tuple[str, ...] = (
     "PROGRAMFILES(X86)",
 )
 
-# Slice 9 P4, test 31. `_child_env` copies `_BASE_ENV_ALLOWLIST |
-# LoopConfig.sandbox_env_allowlist` with **no denylist** — an operator who
-# writes `"ANTHROPIC_API_KEY"` into the config knob hands it to arbitrary
-# generated code, silently. Tolerable while the sandbox barely ran (an empty
-# scratch workspace made most rounds report `status='na'`); not once worktree
-# mode runs the operator's real suite every round and a real suite has a real
-# reason to widen this knob (`DATABASE_URL`, a service token).
-#
-# A heuristic, documented as one: these are *name shapes*, not a registry of
-# real secrets, so it can both miss (`SOME_CUSTOM_CRED`) and over-match (an
-# app's own `FEATURE_TOKEN` flag that carries no secret). That is why the
-# response is a warning naming the variable, never a refusal — an operator may
-# have a genuine reason to pass a provider key into a test suite, and this
-# project's rule (CLAUDE.md: "a refusal it cannot justify becomes a knob
-# someone disables") is that silence is the only unacceptable outcome here,
-# not permissiveness.
 _CREDENTIAL_NAME_PATTERNS: tuple[str, ...] = (
     "*_API_KEY",
     "*_TOKEN",
@@ -140,47 +115,19 @@ def credential_like_names(allowlist: list[str]) -> list[str]:
     return matched
 
 
-# Coverage totals, as the two tools that report one actually print them.
-#
-# `re.MULTILINE` is named explicitly and is load-bearing: without it `^`/`$`
-# anchor to the whole captured output, so every real multi-line test log would
-# miss while a single-line corpus still passed — the corpus could not tell the
-# working parser from the broken one.
-#
-# The lookbehind in the first pattern keeps `Total coverage: 87.5%` from also
-# matching it as "5%": a second, disagreeing value would make the honest answer
-# `None` for a line that is not ambiguous at all.
-#
-# `.{0,200}?` rather than `.*?` bounds the backtracking on a pathologically long
-# TOTAL line. A coverage row is short; a longer one simply reports nothing,
-# which is the safe direction.
-#
-# The first pattern matches the *line*, not the value: every percentage on it
-# is then collected into the same ambiguity check as every other match. The
-# anchored-at-the-end version elected the **last** of two percentages on one
-# line ("TOTAL 100 10 90% 50%" measured 50.0), because the ambiguity rule works
-# across matches and could not see inside one — a wrong number, which is the
-# single thing this function contracts never to produce.
 _TOTAL_LINE_RE = re.compile(
     r"^[ \t]*TOTAL\b(?P<rest>.{0,200})$", re.MULTILINE | re.IGNORECASE
 )
-# The lookbehind excludes `-` as well as a digit or dot. Without the `-`,
-# "TOTAL 1 0 -5%" captures `5` and reports 5.0 — a *sign error*, which is a
-# wrong number rather than a missing one. No coverage tool emits a negative
-# total, so the input is implausible; the fix costs one character and the
-# failure it removes is the expensive direction, which is the trade this
-# function makes everywhere else too.
+# The `-` in the lookbehind matters: without it, "TOTAL 1 0 -5%" captures
+# "5" and reports 5.0 instead of nothing — a sign error, a wrong number
+# rather than a missing one, which parse_coverage must never produce.
 _PERCENT_RE = re.compile(r"(?<![\d.-])(\d{1,3}(?:\.\d+)?)\s*%")
 _NUMERIC_COLUMN_RE = re.compile(r"^\d+(?:\.\d+)?$")
-# Both real coverage.py shapes put at least two numeric columns (statements and
-# misses, or more under branch coverage) before the percentage. Requiring them
-# is what keeps `^TOTAL\s+` with IGNORECASE from reading an English sentence —
-# "TOTAL of 3 tests failed, 20%" measured 20.0, and the parsed corpus is
-# model-written test output, so prose beginning with the word is the common
-# input rather than an exotic one.
+# Below this many numeric columns before the %, a TOTAL-prefixed line is
+# ordinary prose, not a coverage row — "TOTAL of 3 tests failed, 20%"
+# measured 20.0 without this guard.
 _MIN_NUMERIC_COLUMNS = 2
 
-# a labelled total: "Total coverage: 87.5%"
 _LABELLED_TOTAL_RE = re.compile(
     r"^\s*total\s+coverage\s*[:=]\s*(\d{1,3}(?:\.\d+)?)\s*%",
     re.MULTILINE | re.IGNORECASE,
@@ -300,8 +247,6 @@ def _kill_tree(proc: subprocess.Popen) -> bool:
         proc.kill()
     except Exception:
         pass
-    # `returncode` is set only once the process has actually been reaped, so
-    # this is the observation rather than a hope about the two calls above.
     try:
         proc.wait(timeout=10)
     except Exception:
@@ -341,9 +286,6 @@ def _run_bounded(
     ourselves by killing the whole process tree. The reader is a daemon, so even
     an orphan that somehow survives the kill cannot keep the interpreter alive.
     """
-    # `stderr=STDOUT` so the two streams interleave in the order they were
-    # written, which is what a human reading a failure tail wants, and what
-    # `_summarize` and `parse_coverage` already assume of `combined`.
     popen_kwargs: dict = {
         "cwd": cwd,
         "stdout": subprocess.PIPE,
@@ -361,14 +303,8 @@ def _run_bounded(
 
     proc = subprocess.Popen(argv, **popen_kwargs)
 
-    # Only the tail is ever retained, so peak memory is bounded by this deque
-    # regardless of how much the child writes. Bytes, decoded once at the end:
-    # decoding per chunk can split a multi-byte character across a boundary.
     chunks: deque[bytes] = deque()
     held = 0
-    # Bytes, not characters: a bound in characters cannot be enforced before
-    # decoding. 4x `_MAX_TAIL_CHARS` is enough that even 4-byte codepoints
-    # cannot leave the tail short.
     cap = _MAX_TAIL_CHARS * 4
 
     def pump() -> None:
@@ -401,28 +337,15 @@ def _run_bounded(
         killed = _kill_tree(proc)
     waited = time.time() - started
 
-    # The pump ends when the pipe closes, which happens when the last holder of
-    # the inherited stdout handle exits — *not* when the direct child does. So a
-    # bounded join, and its result is read.
     reader.join(timeout=5)
     lingering = reader.is_alive()
 
     if lingering and not timed_out:
-        # The child exited normally within its timeout while a grandchild it
-        # spawned kept the pipe open. `_kill_tree` used to run only on the
-        # timeout branch, so this case leaked the grandchild (holding workspace
-        # files open on Windows, which is what `clear_workspace`'s rmtree needs
-        # released) and leaked one daemon thread per round — and `raw` below was
-        # whatever had arrived by that instant, returned as though it were the
-        # whole output. Kill it here too, then re-join.
         killed = _kill_tree(proc)
         reader.join(timeout=5)
         lingering = reader.is_alive()
 
     raw = b"".join(chunks)[-cap:]
-    # `degraded` is "" exactly when nothing degraded — the same convention
-    # `VcsResult.reason` uses, so a caller can render the honest sentence
-    # instead of one that assumes the happy path.
     degraded = ""
     if not killed:
         degraded = "could not confirm the process tree was killed"
@@ -440,7 +363,6 @@ def _run_bounded(
 class TestExecutor:
     """Runs a task's tests in its workspace and reports what actually happened."""
 
-    # Not a pytest test class, despite the name.
     __test__ = False
 
     def __init__(
@@ -452,26 +374,12 @@ class TestExecutor:
         isolation: str = "env",
     ):
         self.command = command
-        # Split here, at construction, and *not* inside `run()`. An unbalanced
-        # quote in `loopconfig.json` (`pytest -q "C:\\my tests`) makes
-        # `split_command` raise `ValueError: No closing quotation`, and `run()`
-        # is called from inside `_with_retry`, whose handler treats every
-        # exception as a transient infra failure — so a config typo became three
-        # identical retries, three `infra_error` events, and a `needs_human`
-        # reason pointing the operator at their network. Exactly the
-        # misclassification `RunnerConfigError` was introduced to prevent one
-        # module over. Raised from `__init__` it reaches `cli.main`'s handler and
-        # renders as `error: ...`, which is where a config mistake belongs.
         split_command(command)
         self.timeout_s = timeout_s
         self.enabled = enabled
         self.env_allowlist = list(env_allowlist or [])
         self.requested_isolation = isolation
         self.effective_isolation = isolation
-        # 'strict' asks for a container / no-network / read-only-fs tier. No
-        # such backend ships in the stdlib-only core yet, so honor the request
-        # when one is available and otherwise degrade to env-scrub — loudly, so
-        # the residual risk (see module docstring) is never assumed away.
         if isolation == "strict" and not _strict_isolation_available():
             self.effective_isolation = "env"
             warnings.warn(
@@ -525,16 +433,6 @@ class TestExecutor:
 
         duration = round(time.time() - started, 3)
 
-        # A degradation is stated in the `summary`, which `Store.add_test_run`
-        # persists and the REST API and dashboard both render — so it reaches a
-        # human the way every other recorded degradation in this project does,
-        # rather than living only in a warning nobody sees. It also warns, for
-        # the operator watching a terminal.
-        #
-        # It deliberately does **not** touch `status`. `status` feeds the tests
-        # gate, and no decision rule may start reading a durability signal; an
-        # unconfirmed kill is a statement about our cleanup, not about whether
-        # the tests passed.
         if degraded:
             warnings.warn(
                 f"test execution degraded ({degraded}); "
@@ -547,17 +445,6 @@ class TestExecutor:
         if timed_out:
             return TestResult(
                 status="error",
-                # The measured wait, not the requested one. `subprocess.run`'s
-                # handler reported `self.timeout_s` unconditionally, so a call
-                # that had actually blocked for an hour still said "120s" — a
-                # rendered string asserting more than its inputs prove.
-                #
-                # The kill is reported the same way: `_kill_tree` answers
-                # whether the child was actually reaped, and this sentence says
-                # what happened rather than what was attempted. `taskkill`
-                # answers "Access is denied" for an elevated or job-held child
-                # and `os.getpgid` raises `ProcessLookupError`; swallowing those
-                # is right, claiming success after them is not.
                 summary=(
                     f"Tests timed out after {self.timeout_s}s "
                     f"(gave up at {waited:.1f}s; "
@@ -572,9 +459,6 @@ class TestExecutor:
             summary=_summarize(combined, code) + note,
             stdout_tail=combined[-_MAX_TAIL_CHARS:],
             duration_s=duration,
-            # `None` when the output may be truncated: a coverage number parsed
-            # from a partial stream is a fabricated measurement, which is the
-            # one thing `parse_coverage` contracts never to produce.
             coverage_percent=None if degraded else parse_coverage(combined),
         )
 
@@ -589,29 +473,7 @@ class TestExecutor:
         allow = {n.upper() for n in _BASE_ENV_ALLOWLIST}
         allow |= {n.upper() for n in self.env_allowlist}
         env = {k: v for k, v in os.environ.items() if k.upper() in allow}
-        # Keep child output stable and unbuffered for readable tails.
         env["PYTHONUNBUFFERED"] = "1"
-        # The running interpreter's script directory is prepended to PATH, and
-        # this is a correctness fix rather than a convenience. The README offers
-        # `.venv\\Scripts\\agentloop.exe` as an equal alternative to activating
-        # the venv, and taken up, the venv's `Scripts` is not on `PATH` — so the
-        # default `test_command` of `pytest -q` could not resolve. Measured on a
-        # real run: `Test command not found: pytest`.
-        #
-        # That failure is quiet, though not in the way an earlier version of
-        # this comment claimed. `TestResult.passed` returns `False` for both
-        # `"fail"` and `"error"` (only `"na"` returns `None` and falls back to
-        # the validator's claim), so an unresolvable command does **not** become
-        # auto-approvable — it fails *every* round and burns `max_revisions` on
-        # a gap no worker can close, escalating with a reason about test
-        # failures that never ran. The correction matters because in this repo
-        # the comments are the spec: a future reader trusting the old wording
-        # would conclude that a timeout or a missing binary is auto-approvable.
-        #
-        # The interpreter running the loop is the one whose tools the default
-        # command means. Prepended, not appended, so a venv's `pytest` wins over
-        # a stale global one — the same interpreter/tool pairing the operator
-        # gets from activating.
         scripts_dir = str(Path(sys.executable).resolve().parent)
         existing = env.get("PATH", "")
         if scripts_dir and scripts_dir not in existing.split(os.pathsep):
@@ -777,9 +639,6 @@ def _on_rm_error(func, path, exc) -> None:
         pass
 
 
-# `onexc` replaced `onerror` in 3.12 (where `onerror` is deprecated); the
-# project floor is 3.10. Both callbacks are called with the same three
-# positional arguments, so one handler shape serves both.
 _RMTREE_KW = (
     {"onexc": _on_rm_error}
     if sys.version_info >= (3, 12)

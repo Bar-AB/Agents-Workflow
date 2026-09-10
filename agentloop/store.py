@@ -56,26 +56,10 @@ from .models import (
     Verdict,
 )
 
-# The logical -> concrete translation, carried on every tool-request event.
-# **Both `git` and `shell` map to `["Bash"]`**, so a human shown "git — commit the
-# fix" who approves it is actually granting unrestricted Bash, while the row, the
-# decision event and the dashboard all say `git`. The read-only allowlist excludes
-# both, so this is not an auto-approval bypass — it is the ledger's *label*
-# understating the grant, on the one screen where a human's decision is the whole
-# control. Fixed by making the ask self-describing rather than by narrowing the
-# map: two logical names sharing a concrete tool is a legitimate thing to express,
-# and rewriting it would change what every existing registry means.
 from .runner import resolve_tools, tools_sharing_capability
 
-# How many candidates a claim will try before giving up. Each retry means
-# another process won that row, so this only bounds a pathological live-lock;
-# in practice the loser's next look finds a different task or nothing.
 _CLAIM_ATTEMPTS = 100
 
-# Widest a coerced text field may be. Generous: this is a last-resort bound on a
-# value that was already supposed to be a bounded string, not the field's real
-# limit (`toolpolicy.MAX_TOOL_REASON_CHARS` is that, for the one field a caller
-# fills from model output).
 _MAX_COERCED_TEXT_CHARS = 4000
 
 
@@ -100,14 +84,10 @@ def _bounded_text(value, limit: int = _MAX_COERCED_TEXT_CHARS) -> str:
     if isinstance(value, str):
         return value[:limit]
     if value is None:
-        # Not "unknown": these are columns a human reads back as an identifier,
-        # and `None` is the literal thing the caller sent.
         return "None"[:limit]
     try:
         return str(value)[:limit]
     except Exception:
-        # A `__str__` that raises would put us straight back in the transaction
-        # this function exists to protect.
         return f"<unrepresentable {type(value).__name__}>"[:limit]
 
 
@@ -185,7 +165,8 @@ CREATE TABLE IF NOT EXISTS task_deps (
 -- force" is a pure function of the table and nothing can disagree with it.
 -- Declared before `attempts` so the FK target exists when the script runs.
 CREATE TABLE IF NOT EXISTS charter (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,   -- the version number
+    id INTEGER PRIMARY KEY AUTOINCREMENT,   -- the version number, global across projects
+    project_id INTEGER NOT NULL REFERENCES projects(id),
     body TEXT NOT NULL,
     note TEXT NOT NULL DEFAULT '',          -- why this edit was made
     created_at REAL NOT NULL
@@ -406,16 +387,8 @@ CREATE TABLE IF NOT EXISTS eval_runs (
 """
 
 
-# How much of a displaced memory value a merge event keeps. Enough to recognise
-# and recover what was overwritten; not a second copy of the store.
 _MAX_EVENT_VALUE_CHARS = 400
 
-# Largest charter a human may set. Refused *loudly at write time* rather than
-# trimmed at inject time: the charter is an input the agent must obey in full,
-# so a rule that silently falls off the end of a cap is worse than no rule.
-# ~4000 chars is roughly 1000 tokens, against a memory block that can already
-# reach ~8000. A module constant, like the other prompt-shape bounds, not a
-# LoopConfig field — LoopConfig holds decision thresholds and budget caps.
 _MAX_CHARTER_CHARS = 4000
 
 
@@ -438,20 +411,12 @@ class _LockedConnection:
     def __init__(self, conn: sqlite3.Connection):
         self._conn = conn
         self._lock = threading.RLock()
-        # >0 while a transaction() is open (reentrant). Inner commit() calls
-        # are deferred to the outermost transaction's single commit, so a
-        # state change and its audit event land together or not at all.
         self._txn_depth = 0
-        # Set when any transaction in the current nest fails. The rollback and
-        # the decision not to commit both belong to the *outermost* boundary:
-        # see `transaction`.
         self._txn_aborted = False
 
     def execute(self, sql: str, params: tuple = ()) -> _LockedCursor:
         with self._lock:
             cur = self._conn.execute(sql, params)
-            # Materialize under the lock: rows read later, off-lock, would
-            # race another thread's use of the same connection.
             rows = cur.fetchall() if cur.description else []
             return _LockedCursor(cur.lastrowid, rows, cur.rowcount)
 
@@ -477,8 +442,6 @@ class _LockedConnection:
 
     def commit(self) -> None:
         with self._lock:
-            # Inside a transaction, defer to the outermost boundary; otherwise
-            # commit eagerly (the store's per-operation default).
             if self._txn_depth == 0:
                 self._conn.commit()
 
@@ -516,15 +479,9 @@ class _LockedConnection:
                 if outermost:
                     self._txn_aborted = False
                     if aborted:
-                        # Rollback only discards uncommitted writes; it never
-                        # touches committed `events` rows, so the append-only
-                        # rule holds.
                         self._conn.rollback()
                     else:
                         self._conn.commit()
-            # Only reached when this block exited normally: an inner failure was
-            # caught by the code between here and there. The writes are gone, so
-            # say so rather than returning as if they landed.
             if outermost and aborted:
                 raise TransactionAborted(
                     "an inner transaction failed and its error was swallowed; "
@@ -543,9 +500,6 @@ class _LockedCursor:
         self, lastrowid: int | None, rows: list[sqlite3.Row], rowcount: int = -1
     ):
         self.lastrowid = lastrowid
-        # How many rows the statement actually changed — the signal a
-        # conditional UPDATE uses to tell "I won this race" from "someone else
-        # already did".
         self.rowcount = rowcount
         self._rows = rows
 
@@ -564,10 +518,6 @@ class Store:
         self._conn = _LockedConnection(raw)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
-        # Which tables predate this open, captured *before* the schema script
-        # creates the missing ones: a table that is new here was written by an
-        # older build of agentloop, and `_migrate` sometimes has to reconcile
-        # what that build left behind, not just add a column.
         existing = self._tables()
         self._conn.executescript(_SCHEMA)
         self._migrate(existing)
@@ -599,29 +549,15 @@ class Store:
             ("tasks", "control", "TEXT NOT NULL DEFAULT 'run'"),
             ("tasks", "claimed_by", "TEXT"),
             ("tasks", "kind", "TEXT NOT NULL DEFAULT 'task'"),
-            # No REFERENCES on the added column: SQLite's ALTER TABLE ADD COLUMN
-            # rejects a foreign key with a non-NULL default and cannot add one
-            # retroactively. The constraint is in _SCHEMA for fresh dbs; older
-            # dbs get the column, and plan_id is only ever written from a task
-            # id this store just inserted.
             ("tasks", "plan_id", "INTEGER"),
             ("tasks", "plan_approved", "INTEGER NOT NULL DEFAULT 0"),
-            # Same FK trap as plan_id: fresh dbs get `REFERENCES projects(id)`
-            # from _SCHEMA, older dbs get the bare nullable column, backfilled
-            # by `_ensure_default_project()` below to the bootstrap project.
             ("tasks", "project_id", "INTEGER"),
+            ("charter", "project_id", "INTEGER"),
             ("memory", "pinned", "INTEGER NOT NULL DEFAULT 0"),
             ("memory", "last_used_at", "REAL"),
-            # Same FK trap and same handling as `plan_id` above: fresh dbs get
-            # `REFERENCES charter(id)` from _SCHEMA, older dbs get the bare
-            # column. NULL means "no charter was in effect", which is exactly
-            # what every pre-charter attempt row correctly becomes.
             ("attempts", "charter_version", "INTEGER"),
             ("verdicts", "findings", "TEXT NOT NULL DEFAULT ''"),
             ("test_runs", "coverage_percent", "REAL"),
-            # Pre-existing rows are per-verdict calibration runs, because that
-            # is the only harness that existed when they were written -- so the
-            # default is not a placeholder, it is the correct value.
             ("eval_runs", "kind", "TEXT NOT NULL DEFAULT 'verdict'"),
         ]
         for table, column, decl in additions:
@@ -631,12 +567,10 @@ class Store:
             }
             if column not in cols:
                 self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
-        # Ordering is load-bearing: strictly after the additions loop (needs
-        # tasks.project_id to exist for the backfill UPDATE) and strictly
-        # before the legacy _reconcile_memory_hits() branch below. The legacy
-        # branch's _merge_into_loop() calls memory_write(), which this phase
-        # makes project_id-aware -- so on a pre-memory_hits db, memory's
-        # project_id column must exist before that branch runs, not after.
+        # Order is load-bearing: the default project must exist before the
+        # memory rebuild backfills project_id onto it, and the rebuild's new
+        # UNIQUE(project_id, tier, key) constraint must exist before the
+        # legacy hits reconciliation runs its own memory_write() calls.
         default_id = self._ensure_default_project()
         self._rebuild_memory_unique_constraint(default_id)
         if "memory" in existing and "memory_hits" not in existing:
@@ -644,7 +578,7 @@ class Store:
 
     def _ensure_default_project(self) -> int:
         """Bootstrap the one guaranteed 'Default' project and backfill every
-        task still missing a `project_id`.
+        task and charter row still missing a `project_id`.
 
         Three cases, not two -- collapsing the last two into one is exactly
         what caused this migration's own worst bug the first time it was
@@ -699,11 +633,19 @@ class Store:
                 "UPDATE tasks SET project_id=? WHERE project_id IS NULL",
                 (project_id,),
             )
-            if cur.rowcount > 0:
+            charter_cur = self._conn.execute(
+                "UPDATE charter SET project_id=? WHERE project_id IS NULL",
+                (project_id,),
+            )
+            if cur.rowcount > 0 or charter_cur.rowcount > 0:
                 self.log_event(
                     None,
                     "project_migration_backfill",
-                    {"project_id": project_id, "tasks_backfilled": cur.rowcount},
+                    {
+                        "project_id": project_id,
+                        "tasks_backfilled": cur.rowcount,
+                        "charter_rows_backfilled": charter_cur.rowcount,
+                    },
                 )
             return project_id
 
@@ -733,18 +675,13 @@ class Store:
             "AUTOINCREMENT" in existing_sql
         ):
             return
-        # PRAGMA foreign_keys change is ignored mid-transaction, so it must
-        # happen outside self.transaction().
+        # PRAGMA foreign_keys is ignored mid-transaction — must stay outside
+        # self.transaction(). old_seq must be read before DROP TABLE below:
+        # dropping the table deletes its sqlite_sequence row too, so reading
+        # old_seq any later (e.g. moved inside the transaction with the rest
+        # of the sqlite_sequence work) silently reads 0 and turns this
+        # migration's whole AUTOINCREMENT-preservation guarantee into a no-op.
         self._conn.execute("PRAGMA foreign_keys=OFF")
-        # Capture the OLD table's true historical high-water mark BEFORE
-        # `DROP TABLE memory` below deletes its `sqlite_sequence` row along
-        # with it. A naive id-preserving copy only carries forward
-        # `max(surviving ids)` -- if a row holding a higher id was deleted at
-        # any point before this migration runs (an ordinary event:
-        # `_merge_into_loop`'s collision-loser DELETE, or `memory_delete`),
-        # that higher id lived nowhere but `sqlite_sequence`, and skipping
-        # this capture reissues the deleted row's old id to the very next
-        # unspecified-id INSERT after migration.
         old_seq_row = self._conn.execute(
             "SELECT seq FROM sqlite_sequence WHERE name='memory'"
         ).fetchone()
@@ -770,13 +707,6 @@ class Store:
             )
             self._conn.execute("DROP TABLE memory")
             self._conn.execute("ALTER TABLE memory_new RENAME TO memory")
-            # SQLite's RENAME updates the sqlite_sequence row's `name` column
-            # in place, so a row for 'memory' now exists reflecting
-            # `max(surviving explicit ids)` -- verified empirically, not
-            # assumed (see the falsification test). Raise it to the true
-            # historical mark captured above; check-then-insert-or-update
-            # rather than an ON CONFLICT, since sqlite_sequence carries no
-            # guaranteed-usable unique index for that purpose.
             current_row = self._conn.execute(
                 "SELECT seq FROM sqlite_sequence WHERE name='memory'"
             ).fetchone()
@@ -858,8 +788,6 @@ class Store:
         append-only. See `_LockedConnection.transaction`."""
         return self._conn.transaction()
 
-    # -- projects --------------------------------------------------------------
-
     def resolve_project(self, project: int | str | None) -> int:
         """`None` -> the default project's id (never raises, bootstrap
         guarantees one exists); an `int` -> verified to exist, else
@@ -885,7 +813,6 @@ class Store:
         ).fetchone()
         if row is not None:
             return int(row["id"])
-        # Safety net; a no-op after __init__ under normal operation.
         return self._ensure_default_project()
 
     def create_project(
@@ -1045,13 +972,8 @@ class Store:
             )
             self.log_event(None, "project_archived", {"project_id": project_id})
 
-    # -- tasks ---------------------------------------------------------------
-
     def add_task(self, task: Task) -> int:
         now = time.time()
-        # Resolves None -> the default project transparently, so every
-        # existing call site in the codebase that never sets project_id
-        # keeps working unchanged.
         task.project_id = self.resolve_project(task.project_id)
         with self.transaction():
             cur = self._conn.execute(
@@ -1096,14 +1018,6 @@ class Store:
         ).fetchone()
         return self._row_to_task(row) if row else None
 
-    # Why a task may not be worked yet, as SQL. Two blockers, both *predicates*
-    # rather than statuses: a blocked task is ordinary `pending` that simply
-    # isn't claimable, so nothing has to be un-set when the blocker clears and a
-    # human can never mistake waiting work for finished work.
-    #
-    #   1. an unfinished dependency — every edge must point at a DONE task;
-    #   2. an unapproved plan — a planner generating tasks is task definition,
-    #      which humans stay in the loop for.
     _UNBLOCKED = (
         " AND t.kind='task'"
         " AND NOT EXISTS (SELECT 1 FROM task_deps d JOIN tasks dep"
@@ -1112,8 +1026,6 @@ class Store:
         " AND (t.plan_id IS NULL OR EXISTS (SELECT 1 FROM tasks p"
         "   WHERE p.id = t.plan_id AND p.plan_approved = 1))"
     )
-    # In-flight before untouched, then by id: a crashed run resumes what it was
-    # already doing before starting anything new.
     _ACTIONABLE_ORDER = " ORDER BY CASE t.status WHEN 'pending' THEN 1 ELSE 0 END, t.id"
 
     def next_pending_task(self) -> Task | None:
@@ -1189,7 +1101,6 @@ class Store:
                     task.claimed_by = worker_id
                     self.log_event(task.id, "task_claimed", {"worker": worker_id})
                     return task
-                # Lost the race to another process; fall through and look again.
         return None
 
     def release_claim(self, task_id: int) -> None:
@@ -1382,11 +1293,6 @@ class Store:
         if reason:
             task.escalation_reason = reason
         with self.transaction():  # row change + its event: one commit
-            # The event follows the row, never the intent: `update_task` is
-            # lease-predicated, so a worker whose lease a human took mid-round
-            # writes nothing here — and a `status:revising` in the log for a
-            # transition that never landed would be the audit trail describing the
-            # loop's belief rather than the task's history.
             if not self.update_task(task):
                 return False
             self.log_event(
@@ -1415,8 +1321,6 @@ class Store:
             project_id=row["project_id"],
         )
 
-    # -- task graph (spec: planner) -------------------------------------------
-
     def add_dependency(self, task_id: int, depends_on_id: int) -> None:
         """Record that `task_id` waits on `depends_on_id`.
 
@@ -1428,26 +1332,16 @@ class Store:
         """
         if task_id == depends_on_id:
             raise ValueError(f"Task {task_id} cannot depend on itself (cycle)")
-        # A store invariant, not a hope about the planner (mirrors the cycle
-        # refusal above): a dependency across projects makes no sense once
-        # tasks are project-scoped. Graceful no-op, not a crash, when either
-        # referenced task doesn't exist yet -- an unrelated error surfaces
-        # from the FK/insert path instead.
         t1, t2 = self.get_task(task_id), self.get_task(depends_on_id)
         if t1 is not None and t2 is not None and t1.project_id != t2.project_id:
             raise ValueError(
                 f"Dependency {task_id} -> {depends_on_id} would cross projects"
             )
         with self.transaction():
-            # The new edge closes a cycle iff `task_id` is already reachable
-            # from `depends_on_id` by following existing edges.
             if self._reaches(depends_on_id, task_id):
                 raise ValueError(
                     f"Dependency {task_id} -> {depends_on_id} would create a cycle"
                 )
-            # ON CONFLICT DO NOTHING rather than INSERT OR IGNORE: identical
-            # semantics, but it is the standard form Postgres also understands,
-            # and the store already uses this idiom in `memory_write`.
             self._conn.execute(
                 "INSERT INTO task_deps (task_id, depends_on_id, created_at)"
                 " VALUES (?,?,?) ON CONFLICT DO NOTHING",
@@ -1518,25 +1412,39 @@ class Store:
         ).fetchone()
         return bool(row["plan_approved"]) if row else False
 
-    # -- project charter -----------------------------------------------------
-
-    def charter_active(self) -> tuple[int, str] | None:
-        """The charter in effect as `(version, body)`, or None if there is none.
+    def charter_active(
+        self, project_id: int | str | None = None
+    ) -> tuple[int, str] | None:
+        """The charter in effect for this project, as `(version, body)`, or
+        None if there is none.
 
         "None" covers both never-set and explicitly cleared, deliberately: a
         cleared charter must be indistinguishable from one that never existed,
         so turning the charter off restores byte-for-byte the prompts the loop
         built before it was introduced.
+
+        Scoped to `project_id` (resolved via `resolve_project` — `None` means
+        the default project, never "every project"; a charter read always
+        targets exactly one project's active charter). `id` stays a single
+        counter shared across every project's charter rows — a project's
+        first charter can start at version 7 if other projects already used
+        1-6 — so "current version" is always `project_id`-qualified, never
+        read off `id` alone.
         """
+        project_id = self.resolve_project(project_id)
         row = self._conn.execute(
-            "SELECT id, body FROM charter ORDER BY id DESC LIMIT 1"
+            "SELECT id, body FROM charter WHERE project_id=? ORDER BY id DESC LIMIT 1",
+            (project_id,),
         ).fetchone()
         if row is None or not row["body"].strip():
             return None
         return int(row["id"]), row["body"]
 
-    def charter_set(self, body: str, note: str = "") -> int:
-        """Publish a new charter version. Returns the new version number.
+    def charter_set(
+        self, body: str, note: str = "", project_id: int | str | None = None
+    ) -> int:
+        """Publish a new charter version for this project. Returns the new
+        version number.
 
         Validation happens *before* anything is written, so a refusal leaves the
         previous version in force and puts nothing in the audit log. Both
@@ -1558,48 +1466,59 @@ class Store:
                 "refusing to set an empty charter; use `charter clear` to "
                 "remove the charter explicitly"
             )
-        return self._charter_insert(body, note, "charter_set")
+        return self._charter_insert(body, note, "charter_set", project_id)
 
-    def charter_clear(self, note: str = "") -> int:
-        """Turn the charter off by appending an empty version.
+    def charter_clear(self, note: str = "", project_id: int | str | None = None) -> int:
+        """Turn this project's charter off by appending an empty version.
 
         A new row rather than a DELETE: the table is the whole history, and a
         past attempt's `charter_version` has to stay readable. The clear itself
         is a version, so "when did the rules stop applying" is in the record.
         """
-        return self._charter_insert("", note, "charter_cleared")
+        return self._charter_insert("", note, "charter_cleared", project_id)
 
-    def _charter_insert(self, body: str, note: str, event: str) -> int:
+    def _charter_insert(
+        self, body: str, note: str, event: str, project_id: int | str | None
+    ) -> int:
+        project_id = self.resolve_project(project_id)
         with self.transaction():
             cur = self._conn.execute(
-                "INSERT INTO charter (body, note, created_at) VALUES (?,?,?)",
-                (body, note, time.time()),
+                "INSERT INTO charter (project_id, body, note, created_at)"
+                " VALUES (?,?,?,?)",
+                (project_id, body, note, time.time()),
             )
             version = cur.lastrowid
-            # The body is not duplicated into the payload: unlike a memory
-            # merge's displaced value, the charter row keeps it forever, and
-            # every event row is pushed to every open dashboard stream.
-            payload = {"version": version, "note": note}
+            payload = {"version": version, "note": note, "project_id": project_id}
             if event == "charter_set":
                 payload["n_chars"] = len(body)
             self.log_event(None, event, payload)
         return version
 
-    def charter_history(self) -> list[dict]:
-        """Every version, oldest first. There is no update or delete path."""
+    def charter_history(self, project_id: int | str | None = None) -> list[dict]:
+        """Every version for this project, oldest first. There is no update
+        or delete path."""
+        project_id = self.resolve_project(project_id)
         return [
             dict(r)
-            for r in self._conn.execute("SELECT * FROM charter ORDER BY id").fetchall()
+            for r in self._conn.execute(
+                "SELECT * FROM charter WHERE project_id=? ORDER BY id", (project_id,)
+            ).fetchall()
         ]
 
-    def charter_version(self, version: int) -> dict | None:
-        """The text a past attempt actually ran under, by version number."""
+    def charter_version(
+        self, version: int, project_id: int | str | None = None
+    ) -> dict | None:
+        """The text a past attempt actually ran under, by version number.
+
+        Scoped to `project_id` too, not just `id` — `id` alone would let a
+        caller in one project read another project's charter text by version
+        number, since the counter is shared across every project's rows.
+        """
+        project_id = self.resolve_project(project_id)
         row = self._conn.execute(
-            "SELECT * FROM charter WHERE id=?", (version,)
+            "SELECT * FROM charter WHERE id=? AND project_id=?", (version, project_id)
         ).fetchone()
         return dict(row) if row else None
-
-    # -- attempts / metrics --------------------------------------------------
 
     def start_attempt(
         self,
@@ -1699,10 +1618,6 @@ class Store:
             " WHERE task_id=? ORDER BY id",
             (task_id,),
         ).fetchall()
-        # Which charter version(s) this task's agents actually ran under, so
-        # "was this approved under the old rules" is answerable where the
-        # approve button is. NULLs (no charter in effect) are left out rather
-        # than rendered as a version nobody can look up.
         charter_versions = [
             int(r["charter_version"])
             for r in self._conn.execute(
@@ -1712,9 +1627,6 @@ class Store:
                 (task_id,),
             ).fetchall()
         ]
-        # What this task's agents asked for and what was decided. Selected here
-        # because this is the only task data the dashboard gets: a column stored
-        # and exposed nowhere is a queue nobody can clear, and looks implemented.
         tool_requests = self._conn.execute(
             "SELECT * FROM tool_requests WHERE task_id=? ORDER BY id", (task_id,)
         ).fetchall()
@@ -1727,8 +1639,6 @@ class Store:
             "charter_versions": charter_versions,
             "tool_requests": [dict(r) for r in tool_requests],
         }
-
-    # -- verdicts ------------------------------------------------------------
 
     def add_verdict(self, task_id: int, attempt_id: int | None, v: Verdict) -> int:
         with self.transaction():
@@ -1754,15 +1664,10 @@ class Store:
                     "kind": v.kind.value,
                     "confidence": v.confidence,
                     "tests_passed": v.tests_passed,
-                    # A flag, not the text: the verdict row is the record, and
-                    # every event is pushed to every connected dashboard, so a
-                    # 4000-char blob per round would bloat the SSE feed.
                     "has_findings": bool(v.findings),
                 },
             )
         return cur.lastrowid
-
-    # -- audit log -----------------------------------------------------------
 
     def log_event(self, task_id: int | None, kind: str, payload: dict) -> None:
         self._conn.write(
@@ -1800,8 +1705,6 @@ class Store:
             rows = self._conn.execute("SELECT * FROM events ORDER BY id").fetchall()
         return [dict(r) | {"payload": json.loads(r["payload"])} for r in rows]
 
-    # -- memory (spec §7) ----------------------------------------------------
-
     def memory_write(
         self,
         tier: str,
@@ -1811,18 +1714,13 @@ class Store:
         pinned: bool = False,
         project_id: int | None = None,
     ) -> None:
-        # Approval is approval *of a value*, so a rewrite that changes the value
-        # drops back to unapproved: otherwise an agent could rewrite an approved
-        # key and have arbitrary new content inherit the gate the whole memory
-        # design rests on. A rewrite with the same value keeps its approval —
-        # nothing was re-stated, so there is nothing to re-vet — and an explicit
-        # approved=True is approving the incoming content, so it still wins.
-        #
-        # Pinning is sticky regardless: it is a statement about the *key* ("always
-        # tell agents about this"), not about a particular value, and it never
-        # grants a read on its own. Lowering either flag is via the setters.
         project_id = self.resolve_project(project_id)
         with self.transaction():
+            # Approval is approval of a VALUE: a rewrite keeps `approved` only
+            # if the value is unchanged. Without the CASE, an agent could edit
+            # an already-vetted key and have new, unreviewed content inherit
+            # its approval. `pinned` stays sticky regardless (it's about the
+            # key, not any one value).
             self._conn.execute(
                 "INSERT INTO memory (project_id, tier, key, value, approved,"
                 " pinned, created_at) VALUES (?,?,?,?,?,?,?)"
@@ -1881,15 +1779,7 @@ class Store:
             touched = self._conn.execute(
                 f"UPDATE memory SET last_used_at=? WHERE id=?{gate}", (now, mem_id)
             )
-            # The gated UPDATE matching nothing means the row stopped being
-            # readable between the SELECT and here. Recording the hit anyway
-            # would put a row in `memory_hits` that `hit_count` never counted,
-            # and OR IGNORE means the same task can never make it up later — the
-            # evidence and the counter would disagree permanently.
             if task_id is not None and touched.rowcount == 1:
-                # OR IGNORE plus the rowcount check is the whole "distinct
-                # tasks" rule: the second prompt of the same task inserts
-                # nothing, so it bumps nothing.
                 inserted = self._conn.execute(
                     "INSERT OR IGNORE INTO memory_hits (memory_id, task_id, ts)"
                     " VALUES (?,?,?)",
@@ -2022,12 +1912,9 @@ class Store:
         key = project["key"]
         p_approved, l_approved = bool(project["approved"]), bool(loop["approved"])
         same_value = loop["value"] == project["value"]
-        # The migration protects vetted content; the live path prefers the fact
-        # that just got hot. See the docstring.
         keep_loop_value = origin == "migration" and l_approved and not p_approved
         value = loop["value"] if keep_loop_value else project["value"]
         displaced = project["value"] if keep_loop_value else loop["value"]
-        # Approval of the *surviving* value, not of a particular row.
         approved_for_value = (p_approved and value == project["value"]) or (
             l_approved and value == loop["value"]
         )
@@ -2040,9 +1927,6 @@ class Store:
                 value,
                 approved=survivor_approved,
                 pinned=bool(project["pinned"]),
-                # Explicit, never left to default-resolve: the merged pair's
-                # own project, not whatever project happens to be "active"
-                # when the merge runs.
                 project_id=project["project_id"],
             )
             self._conn.execute(
@@ -2057,10 +1941,6 @@ class Store:
                 " WHERE id=?",
                 (loop_id, loop_id),
             )
-            # `memory_promoted` is the record of a promotion, so the migration
-            # does not borrow it: these rows were promoted by the old build,
-            # long before this database was opened, and counting them as
-            # promotions would make the feed report a promotion per upgrade.
             self.log_event(
                 None,
                 (
@@ -2157,8 +2037,6 @@ class Store:
                 None, "memory_deleted", {"tier": row["tier"], "key": row["key"]}
             )
 
-    # -- executed test results (spec §5) -------------------------------------
-
     def add_test_run(
         self, task_id: int, attempt_id: int | None, result: TestResult
     ) -> int:
@@ -2198,8 +2076,6 @@ class Store:
                 "SELECT * FROM test_runs WHERE task_id=? ORDER BY id", (task_id,)
             ).fetchall()
         ]
-
-    # -- the workspace git config pin (slice 6) -------------------------------
 
     def set_vcs_pin(self, task_id: int, fingerprint: str) -> None:
         """Record the fingerprint of the `.git/config` `vcs.init_repo` just
@@ -2337,27 +2213,11 @@ class Store:
             )
         return fingerprint
 
-    # -- agent tool requests (roadmap slice 5) --------------------------------
-
-    # Which event kind records a fresh row, by the status it was created with. A
-    # mapping rather than branches because the three are one decision — "what
-    # happened to this ask" — and an unlisted status would otherwise log nothing
-    # at all, which is a row without its event.
     _TOOL_REQUEST_EVENTS = {
         ToolRequestStatus.AUTO.value: "tool_auto_approved",
         ToolRequestStatus.REFUSED.value: "tool_request_refused",
     }
 
-    # What the two enum-valued columns may hold. Checked in Python rather than as
-    # a DDL `CHECK`: this table is written inside `_invoke`'s closing transaction,
-    # which holds an already-paid `finish_attempt`, so a constraint violation
-    # there would discard tokens the provider billed and `_with_retry` would buy
-    # them again — the hazard ADR-4 and the deliberate absence of foreign keys
-    # both exist to avoid. An out-of-enum value is therefore *coerced*, never
-    # raised on: without either guard an `INSERT` succeeded and then
-    # `_row_to_tool_request` raised `ValueError` on every later read, so one bad
-    # write made the whole ledger — CLI, REST and dashboard — permanently
-    # unreadable while `granted_tools` silently skipped the row.
     _TOOL_REQUEST_STATUSES = frozenset(s.value for s in ToolRequestStatus)
     _TOOL_REQUEST_SOURCES = frozenset(s.value for s in ToolRequestSource)
 
@@ -2415,24 +2275,11 @@ class Store:
         `refused` is the fail-safe landing place because it grants nothing and
         parks nothing.
         """
-        # Every text column, coerced before it can reach a bind or a
-        # `json.dumps`. The three raise-sources this closes were measured, not
-        # imagined, and `_bounded_text` records which one each was; the callers
-        # coerce too (`agents._tool_name_repr` / `_plain_str`,
-        # `toolpolicy.tools_for`), but the promise this docstring makes is about
-        # *this* function, so it is kept here rather than delegated upward.
         role = _bounded_text(role)
         agent_kind = _bounded_text(agent_kind)
         tool = _bounded_text(tool)
         reason = _bounded_text(reason)
         why = _bounded_text(why)
-        # `status`/`source` are compared against a frozenset below, which raises
-        # `TypeError` on an unhashable value rather than reporting a miss; and the
-        # cap is compared with `>=`, which raises on a `str` — reachable, because
-        # `loopconfig.json` is loaded without type checking. Coerced up here, so
-        # the whole class is closed rather than the three inputs that were
-        # measured. This `except` is not ADR-4's prohibition: that one is about
-        # wrapping a *nested transaction*, and this touches no store at all.
         status = _bounded_text(status)
         source = _bounded_text(source)
         try:
@@ -2490,26 +2337,6 @@ class Store:
 
             over_cap = False
             if max_per_task is not None:
-                # `pending` only: literally the queue a human still has to clear.
-                # Every other status is *answered* — `auto` and `refused` by the
-                # machine, `approved` and `rejected` by a human — and counting an
-                # answered row as queue made the bound self-fulfilling. Once a task
-                # held `max_per_task` of them, *nothing* further could be recorded
-                # on it: an auto-approvable read-only request came back `refused`
-                # with no grant possible on that task again, and a `blocking` one
-                # was stored `status='refused'` where
-                # `pending_blocking_tool_requests` cannot see it, so "I cannot
-                # finish without this" became "continue without it and tell no
-                # human". Excluding only `refused` moved that dead end one status
-                # along rather than removing it: `UNIQUE(task_id, role, tool)` is
-                # per role, so three roles over seven logical names — plus a
-                # declared row per role per tool under `gate_declared_tools` —
-                # reach ten decided rows on one task.
-                #
-                # Nothing is opened by narrowing it. `auto` is bounded by the
-                # read-only allowlist, and `approved`/`rejected` each cost a human
-                # a decision, which is the only budget this cap was ever
-                # protecting.
                 held = self._conn.execute(
                     "SELECT COUNT(*) AS n FROM tool_requests WHERE task_id=?"
                     " AND status = ?",
@@ -2517,19 +2344,7 @@ class Store:
                 ).fetchone()
                 over_cap = int(held["n"]) >= max_per_task
             if over_cap:
-                # Refused *and audited*, never silently dropped: an agent emitting
-                # 500 markers must not hand a human 500 rows to clear, but a
-                # request that vanished without a trace is worse than one denied.
-                # The row is what makes it once — every repeat of the same tool
-                # now finds it and returns above, so the event fires a single time.
-                # Repeats *of one tool*, that is: distinct names each get their own
-                # row, which is what `config.max_tool_requests_per_task`'s comment
-                # states.
                 status = ToolRequestStatus.REFUSED.value
-                # The cap's reason wins and the caller's rides along, rather than
-                # the reverse: `tools_for` passes "not a known logical tool name"
-                # on the same call, and a row refused *for the cap* audited as a
-                # bad tool name is a wrong answer to "why was this withheld".
                 cap_why = f"over the per-task cap of {max_per_task} tool requests"
                 why = f"{cap_why}; {why}" if why else cap_why
 
@@ -2557,16 +2372,7 @@ class Store:
                 "agent_kind": agent_kind,
                 "role": role,
                 "tool": tool,
-                # What the name actually confers, beside the name itself.
                 "resolved": resolve_tools([tool]),
-                # And which *other* logical names a decision on this one settles,
-                # because the map is not injective and enforcement is over the
-                # concrete capability: denying `shell` also stops `git` working.
-                # Recorded on the request rather than only on the withholding
-                # event, since this is the text an approve prompt is built from and
-                # the consequence has to be legible *before* the click, not after.
-                # Pure (`tools_sharing_capability` reads one dict), which is what
-                # lets it sit in a payload inside a paid transaction.
                 "also_decides": tools_sharing_capability(tool),
                 "blocking": bool(blocking),
                 "source": source,
@@ -2681,10 +2487,6 @@ class Store:
                 ),
             )
             if cur.rowcount != 1:
-                # One extra read, inside the transaction, so "no such row" and
-                # "already decided" stay distinguishable: the CLI renders the
-                # first as a 404-ish `error:` and the REST layer maps `KeyError`
-                # to 404 and `ValueError` to 400.
                 current = self._conn.execute(
                     "SELECT status FROM tool_requests WHERE id=?", (request_id,)
                 ).fetchone()
@@ -2694,8 +2496,6 @@ class Store:
                     f"Tool request {request_id} is already {current['status']}; "
                     f"a decided request is final."
                 )
-            # Evaluated here and nowhere earlier: after the CAS above, before the
-            # event that reports it, inside this transaction.
             released_now = bool(released() if callable(released) else released)
             self.log_event(
                 row["task_id"],
@@ -2703,12 +2503,7 @@ class Store:
                 {
                     "request_id": request_id,
                     "tool": row["tool"],
-                    # The decision event carries it too: this is what an audit
-                    # reads to answer "what was this human actually granting".
                     "resolved": resolve_tools([row["tool"]]),
-                    # A rejection takes the concrete capability away, so it also
-                    # ends these — the decision event says so on its own, without a
-                    # reader having to find the request that preceded it.
                     "also_decides": tools_sharing_capability(row["tool"]),
                     "role": row["role"],
                     "approved": bool(approved),
@@ -2903,8 +2698,6 @@ class Store:
             decided_at=None if row["decided_at"] is None else float(row["decided_at"]),
         )
 
-    # -- validator eval harness ----------------------------------------------
-
     def add_eval_run(
         self,
         runner: str,
@@ -2953,8 +2746,6 @@ class Store:
             d["detail"] = json.loads(d["detail"])
             out.append(d)
         return out
-
-    # -- change feed for the Phase-2 dashboard --------------------------------
 
     def events_since(
         self, event_id: int, limit: int = 500, project_id: int | None = None
@@ -3023,17 +2814,6 @@ class Store:
                     " COALESCE(SUM(tokens_in),0) AS tokens_in,"
                     " COALESCE(SUM(tokens_out),0) AS tokens_out,"
                     " COALESCE(SUM(cost_usd),0.0) AS cost_usd"
-                    # Same population as the headline totals above, which filter on
-                    # `finished_at IS NOT NULL`. An attempt row exists from
-                    # `start_attempt` and is completed only by `finish_attempt`, so
-                    # every in-flight round — and every attempt whose
-                    # `finish_attempt` was rolled back — was counted here and not
-                    # there. `sum(by_model.attempts) > attempts` on any dashboard
-                    # opened during a live run, with no explanation available to the
-                    # reader, and costs and tokens agreed (the unfinished rows are
-                    # 0) so only the count diverged — which reads as a rounding
-                    # artefact rather than as two aggregates measuring two different
-                    # things.
                     " FROM attempts WHERE finished_at IS NOT NULL"
                     " GROUP BY model ORDER BY cost_usd DESC"
                 ).fetchall()
@@ -3041,8 +2821,6 @@ class Store:
             revisions = self._conn.execute(
                 "SELECT COALESCE(SUM(revision_count),0) AS r FROM tasks"
             ).fetchone()
-            # How many tool requests are waiting on a human, run-wide: the queue is
-            # only useful if it is visible without opening a task.
             waiting = self._conn.execute(
                 "SELECT COUNT(*) AS n FROM tool_requests WHERE status=?",
                 (ToolRequestStatus.PENDING.value,),

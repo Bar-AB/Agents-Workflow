@@ -189,7 +189,7 @@ export default function App() {
               onChanged={setToolRequests}
             />
           )}
-          {tab === 'charter' && <CharterPanel />}
+          {tab === 'charter' && <CharterPanel projectId={projectId} />}
           {tab === 'repo' && <RepoConfigPanel />}
 
           <AgentPanel agents={agents} tasks={tasks} />

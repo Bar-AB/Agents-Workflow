@@ -10,6 +10,10 @@ in. The full task lifecycle runs end-to-end with real, executed tests, and a
 React dashboard streams the loop's state live from the same SQLite store the
 loop writes to.
 
+New here? Start with **[docs/GUIDE.md](docs/GUIDE.md)** — a walkthrough of one
+task end to end, why the system is built the way it is, and how it compares
+to other agentic-coding setups. This README is the command/config reference.
+
 ## Layout
 
 ```

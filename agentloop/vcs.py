@@ -1,4 +1,4 @@
-"""Per-task workspace version control (roadmap slice 6, Part 1).
+"""Per-task workspace version control.
 
 Every task workspace is its own throwaway git repository, so `redo` and
 `reject` *recover* the discarded work instead of destroying it. There is no
@@ -164,14 +164,8 @@ from .config import LoopConfig
 
 BASE_REF = "refs/agentloop/base"
 APPROVED_REF = "refs/agentloop/approved"
-# The ref is named for the sha it saves, not for a counter: a counter is a
-# read-then-write two rollbacks on one workspace could collide on, and
-# `update-ref` overwrites without error — a silent loss of exactly the history
-# this ref exists to keep, reported as ok=True.
 DISCARDED_REF_PREFIX = "refs/agentloop/discarded"
 
-# Worktree mode's branch names. `<prefix><task id>`, derived and never stored,
-# so there is no schema migration and no second source of truth for it.
 DEFAULT_BRANCH_PREFIX = "agentloop/task-"
 
 
@@ -205,33 +199,17 @@ def discarded_ref_prefix(task_id: int | None = None) -> str:
     return DISCARDED_REF_PREFIX if task_id is None else f"{_task_ns(task_id)}/discarded"
 
 
-# Bounded before it can reach an event payload: telemetry must never fail an
-# attempt, and `log_event` has one `json.dumps` for every payload in the system.
 _MAX_STDERR_CHARS = 500
 
-# Identity per invocation. The child env is scrubbed and the global config is
-# neutralised, so git has no identity to find and would fail with "Author
-# identity unknown". Never `git config --global` — nothing outside the
-# workspace is ever written.
 _IDENTITY = (
     "-c",
     "user.name=agentloop",
     "-c",
     "user.email=agentloop@localhost",
 )
-# Neutralise the operator's own git config on the command line too, because
-# GIT_CONFIG_GLOBAL needs git >= 2.32 and this must hold below that floor.
 _CONFIG_PINS = ("-c", "commit.gpgsign=false", "-c", "core.hooksPath=")
 _INIT_PINS = ("-c", "init.templateDir=")  # git init only
 
-# The interpreter/OS basics git needs to start and resolve paths. Never
-# `os.environ` wholesale — that carries ANTHROPIC_API_KEY. Matched
-# case-insensitively because Windows env keys vary in case. HOME/USERPROFILE
-# are kept, not dropped: git wants them on both platforms, and the answer to a
-# hostile `~/.gitconfig` is to neutralise the config rather than to test an
-# environment production never has. `config.sandbox_env_allowlist` is
-# deliberately *not* admitted: that knob widens the test sandbox, and letting it
-# widen this env would re-admit exactly what the pins above remove.
 _GIT_ENV_ALLOWLIST: tuple[str, ...] = (
     "PATH",
     "SYSTEMROOT",
@@ -277,39 +255,10 @@ class VcsResult:
     stderr: str = ""
     reason: str = ""
     files_removed: int = 0
-    # Set by `init_repo`, and **only** when this call created the repository:
-    # the fingerprint of the `.git/config` git itself just wrote. The caller
-    # records it (`Store.set_vcs_pin`) and replays it on every later call. It
-    # is carried on failed results too — a repo whose base commit failed still
-    # has a config that needs pinning, and an unrecorded one is unpinnable
-    # forever after.
     pin: str = ""
-    # Workspace-relative directories holding a repository of their own, found
-    # before a rollback reset. A commit records them as bare gitlinks, so their
-    # contents are *not* in the discarded ref: this names the gap so no caller
-    # has to claim a recovery surface that does not hold them.
     nested_repos: tuple[str, ...] = ()
-    # Worktree mode only: ignored paths present before a rollback's reset. The
-    # round commit there stages with `add -A` and **not** `-f` (forcing them in
-    # would put `node_modules`/`.venv` — 441 MB on this repository — into the
-    # operator's task branch every round), so `clean -ffdqx` deletes these and
-    # no ref carries them. Same register as `nested_repos`: the gap is named
-    # per-rollback rather than left for the audit log to overclaim.
     ignored_unrecoverable: tuple[str, ...] = ()
-    # `working_tree_state` only: porcelain **entries** for the workspace —
-    # `"<XY> <path>"`, the two-character status code and the path together,
-    # bounded because they reach an event payload. The code is carried and not
-    # dropped because a caller diffing two snapshots is asking "what did this
-    # step write", and a path-only diff cannot see an *overwrite* of a path
-    # that was already dirty (`?? x` -> ` M x`, ` M x` -> `MM x`): same name,
-    # real write, invisible.
     changed_entries: tuple[str, ...] = ()
-    # Which of the bounded lists above hit their cap on this call, by field
-    # name. **Silence must never mean "nothing appeared".** Every list here is
-    # capped so telemetry cannot flood an event payload, and a cap that does
-    # not announce itself turns a detection into a quiet blind spot — over a
-    # real checkout more than `_MAX_REPORTED_PATHS` changed paths is ordinary,
-    # not exotic.
     truncated: tuple[str, ...] = ()
 
 
@@ -338,8 +287,6 @@ def _child_env() -> dict[str, str]:
     allow = {name.upper() for name in _GIT_ENV_ALLOWLIST}
     env = {k: v for k, v in os.environ.items() if k.upper() in allow}
     env["GIT_CONFIG_NOSYSTEM"] = "1"
-    # Measured: NOSYSTEM alone leaves ~/.gitconfig live. os.devnull rather than
-    # a nonexistent path because it is never agent-writable.
     env["GIT_CONFIG_GLOBAL"] = os.devnull
     env["GIT_TERMINAL_PROMPT"] = "0"
     return env
@@ -349,15 +296,10 @@ def _run(workspace: str | Path, argv: list[str], config: LoopConfig) -> _Run:
     """Spawn one git command. Converts every failure into a `reason`; the only
     thing it lets through is a `BaseException`."""
     if not argv or not argv[0]:
-        # An empty vcs_command is not a program: refuse without spawning.
         return _Run(-1, "", "", "git-missing")
     try:
         ws = Path(workspace)
         if not ws.is_dir():
-            # subprocess.run raises FileNotFoundError for a nonexistent cwd
-            # exactly as it does for a missing executable, so without this the
-            # two are conflated and a never-created workspace tells the
-            # operator to install a git they already have.
             return _Run(-1, "", "", "no-workspace")
     except Exception as exc:
         return _Run(-1, "", _clip(str(exc)), "no-workspace")
@@ -467,11 +409,6 @@ def _rev_parse_locations(ws: Path, config: LoopConfig) -> tuple[str, str, str] |
     return lines[0].strip(), lines[1].strip(), lines[2].strip()
 
 
-# `<admin>/gitdir` is a single line holding an absolute path. Bounding the read
-# is the same discipline as `_MAX_CONFIG_BYTES`: it caps the work on the hot
-# path and fails closed, and the regularity check is what makes the bound total
-# (a FIFO reports `st_size == 0`, so the size test alone would pass one and then
-# block forever with no timeout).
 _MAX_GITDIR_BYTES = 1 << 12
 
 
@@ -591,8 +528,6 @@ def _guard_worktree(
         return False
     common = repo_root / ".git"
     if not common.is_dir():
-        # A `repo_root` that is not an ordinary repository root cannot anchor
-        # anything. Refuse rather than guess at a bare or nested layout.
         return False
     located = _rev_parse_locations(ws, config)
     if located is None:
@@ -609,17 +544,10 @@ def _guard_worktree(
     if not _same_path(resolved_git_dir.parent, common / "worktrees"):
         return False
     back = _read_gitdir_backpointer(resolved_git_dir)
-    # Explicitly, not by relying on `_same_path("None", ...)` failing: an
-    # unreadable back-pointer is a guard that cannot answer, and a guard that
-    # cannot answer says no.
     if back is None or not _same_path(back, gitfile):
         return False
     if not _same_path(_resolved(ws, common_dir), common):
         return False
-    # A second spawn rather than a fourth output on `_rev_parse_locations`:
-    # that call is shared with the scratch branch, which runs it against an
-    # unborn HEAD immediately after `git init`, where asking about HEAD fails
-    # and would take the whole guard down with it.
     head = _run(
         ws, _git(config, "symbolic-ref", "--quiet", "HEAD", workspace=ws), config
     )
@@ -696,18 +624,6 @@ def _guard(
         toplevel, git_dir, common_dir = located
         if not _same_path(toplevel, ws):
             return False
-        # Identity with `<ws>/.git`, not containment in `workspace_root`.
-        # Containment pins a *region*; only identity pins the *location*, and
-        # `config_pin` fingerprints `<ws>/.git/config` while git reads `config`
-        # from the **common dir** — so a commondir aimed at a sibling directory
-        # *inside the workspace itself* satisfied containment, left the pinned
-        # file byte-identical, and owned the config git actually parses
-        # (measured: pin unchanged, guard True, commit ok=True, canary written
-        # outside the workspace). The more surprising half is the other
-        # direction: `workspace_root` is the parent of *every* task workspace,
-        # so containment also permitted `<ws>/.git` to resolve into a **sibling
-        # task's** repository — one task's `reset --hard` / `clean -ffdqx`
-        # aimed at another task's history, with every condition holding.
         return _same_path(_resolved(ws, git_dir), ws / ".git") and _same_path(
             _resolved(ws, common_dir), ws / ".git"
         )
@@ -715,14 +631,6 @@ def _guard(
         return False
 
 
-# A git-written `.git/config` is a few hundred bytes. Refusing to hash a large
-# one bounds the work this does in the hot path and fails closed, which is the
-# same answer a mismatch gets. The size bound alone is not that guarantee,
-# though: `stat()` on a FIFO reports `st_size == 0`, so a worker replacing
-# `.git/config` with one passes the bound and makes the read block forever —
-# with no timeout, unlike every git spawn here, and `commit` is called from
-# `run_task` outside `_with_retry`, so the task would hang and hold its claim.
-# The regularity check below is what makes the bound total.
 _MAX_CONFIG_BYTES = 1 << 16
 
 
@@ -814,18 +722,10 @@ def _refusal(
         ws = Path(workspace)
         if not ws.is_dir():
             return "no-workspace"
-        # The shape decides what `<ws>/.git` must be: a directory in scratch
-        # mode, a gitfile in worktree mode (probe 4). Neither branch accepts
-        # the other's shape — a worktree reaching the scratch checks would be
-        # measured against a `.git` that is not the config git parses.
         if repo_root is None:
             if not (ws / ".git").is_dir():
                 return "not-a-workspace-repo"
         elif task_id is None:
-            # Containment in worktree mode includes *which task owns this
-            # workspace* (the HEAD condition), so an absent id is not a
-            # defaultable argument -- it is a question the guard cannot
-            # answer, and a guard that cannot answer says no.
             return "no-task-id"
         elif not (ws / ".git").is_file():
             return "not-a-workspace-repo"
@@ -879,8 +779,6 @@ def _nested_repos(ws: Path, repo_root: Path | None = None) -> tuple[str, ...]:
             if common is not None and _is_submodule_gitdir(p, common):
                 continue
             found.append(str(p.parent.relative_to(ws)).replace(os.sep, "/"))
-        # A nested repo's own `.git` subtree can contain further `.git` paths;
-        # only the outermost is a distinct repository the caller can act on.
         outermost = [
             name
             for name in found
@@ -1017,8 +915,6 @@ def _is_dirty(workspace: Path, config: LoopConfig, *, ignored: bool = True) -> b
     return bool(run.out.strip())
 
 
-# Bounded: this list reaches an event payload, and telemetry must never fail an
-# attempt or flood one.
 _MAX_REPORTED_PATHS = 50
 
 
@@ -1044,8 +940,6 @@ def _porcelain(out: str, marker: str = "", *, with_code: bool = False):
         path = path.strip(chr(34))
         entries.append(f"{code} {path}" if with_code else path)
         if len(entries) >= _MAX_REPORTED_PATHS:
-            # The list is capped *and says so*: a silent cap made the caller's
-            # diff blind past the 50th entry with no signal at all.
             truncated = True
             break
     return tuple(entries), truncated
@@ -1143,9 +1037,6 @@ def _init_worktree(
         preexisting = False
 
     if preexisting:
-        # Verified before *any* git command runs here, including the
-        # `rev-parse` below — the point of the pin is that nothing spawns
-        # under a config this module did not watch being written.
         refusal = _refusal(ws, config, pin, repo_root, task_id, branch_prefix)
         if refusal:
             return VcsResult(ok=False, reason=refusal)
@@ -1157,10 +1048,6 @@ def _init_worktree(
         )
         if not found.reason and found.code == 0:
             return VcsResult(ok=True, sha=found.out.strip(), reason="already")
-        # A worktree that exists without its base ref falls through and
-        # *completes* its initialisation, exactly as the scratch branch does —
-        # otherwise `reason="already"` reports success while every later
-        # rollback fails, permanently and for that task only.
         head = _head(ws, config)
         if head.reason or head.code != 0:
             return _failed(head)
@@ -1172,19 +1059,10 @@ def _init_worktree(
 
     try:
         if not (repo_root / ".git").is_dir():
-            # Nothing to make a worktree of. `no-workspace` rather than
-            # `git-failed` for the same reason `_run` separates them: it names
-            # the missing directory instead of blaming a git that is installed.
             return VcsResult(ok=False, reason="no-workspace")
     except Exception:
         return VcsResult(ok=False, reason="no-workspace")
 
-    # `git worktree add` creates the directory itself and refuses a non-empty
-    # existing one, which is the fail-closed answer to a workspace holding
-    # something already.
-    # C3: nothing spawns before the baseline is settled. A caller replaying a
-    # recorded baseline is verified against the config as it is *now*; a caller
-    # with none is the first task on this repository and mints it.
     if pin:
         refusal = _pin_refusal(ws, pin, repo_root)
         if refusal:
@@ -1193,8 +1071,6 @@ def _init_worktree(
     else:
         minted = config_pin(ws, repo_root)
         if not minted:
-            # Nothing readable to fingerprint: refuse rather than proceed
-            # unpinned, the same answer a mismatch gets.
             return VcsResult(ok=False, reason="git-failed")
 
     added = _run(
@@ -1204,9 +1080,6 @@ def _init_worktree(
             "worktree",
             "add",
             os.path.abspath(str(ws)),
-            # `-b`, never `-B`: a branch that already exists means a previous
-            # incarnation of this task, and force-resetting it would discard
-            # commits no human asked to discard. It fails loudly instead.
             "-b",
             f"{branch_prefix}{task_id}",
             start_ref,
@@ -1299,9 +1172,6 @@ def init_repo(
         except Exception:
             preexisting = False
         if preexisting:
-            # Verified before *any* git command runs in it — including the
-            # `rev-parse` below, which would otherwise be the one subprocess
-            # this module runs under an unvetted config.
             refusal = _refusal(ws, config, pin)
             if refusal:
                 return VcsResult(ok=False, reason=refusal)
@@ -1325,22 +1195,6 @@ def init_repo(
                     return VcsResult(ok=False, reason="no-workspace")
             except Exception:
                 return VcsResult(ok=False, reason="no-workspace")
-            # `<ws>/.git` exists but is not a directory: a **gitfile**, one line
-            # of text reading `gitdir: <somewhere else>`, which any worker can
-            # write. `preexisting` tests `is_dir()`, so this fell into the
-            # create branch — and `git init` on a worktree whose `.git` points
-            # elsewhere *reinitialises the repository it points at*, rc=0.
-            # Measured against a victim repo: it ran, and the docstring above
-            # claiming init "cannot reach outside the workspace" was wrong.
-            #
-            # Real impact was small — the victim's `config` came back
-            # byte-identical, `config_pin` then returned "" and the flow failed
-            # closed — but "small because a later check happens to catch it" is
-            # not the same as contained, and `-c init.templateDir=` is the only
-            # thing keeping it from copying template files into someone else's
-            # repository. In the one module whose deliverable is precisely
-            # stated containment, a stated invariant that does not hold is the
-            # thing most likely to be built on later.
             try:
                 if (ws / ".git").exists():
                     return VcsResult(ok=False, reason="not-a-workspace-repo")
@@ -1351,14 +1205,10 @@ def init_repo(
                 return _failed(run)
             minted = config_pin(ws)
             if not minted:
-                # git reported success and left no readable config: refuse
-                # rather than continue unpinned.
                 return VcsResult(ok=False, reason="git-failed")
             if not _guard(ws, config):
                 return VcsResult(ok=False, reason="not-a-workspace-repo", pin=minted)
 
-        # Deliberately empty: base is the state a rollback returns to, so it
-        # must not carry whatever happened to be in the directory already.
         run = _run(
             ws,
             _git(
@@ -1427,46 +1277,17 @@ def commit(
         if refusal:
             return VcsResult(ok=False, reason=refusal)
 
-        # `-f` as well as `-A`: without it `add` honours a worker-written
-        # `.gitignore` while the rollback's `clean -ffdqx` deletes ignored
-        # files, so the discarded ref the audit log names was missing exactly
-        # the files that were destroyed. Measured: `build/artifact.bin` and
-        # `secrets.env` deleted, neither recoverable. Capture everything the
-        # rollback can delete; do not weaken the clean.
-        #
-        # **Worktree mode drops the `-f`, and pays for it in the result.** The
-        # branch is the operator's, so forcing ignored files in would commit
-        # `node_modules` and `.venv` — 441 MB on this repository — every round,
-        # forever, into history a human is meant to merge. What that costs is
-        # exactly the property `-f` buys above: ignored files are **not**
-        # recoverable after a worktree rollback. `rollback` puts them on
-        # `VcsResult.ignored_unrecoverable` per call.
-        #
-        # **That is not yet parity with `nested_repos`, and saying it was is
-        # the kind of overclaim this field exists to prevent** (M-g).
-        # `nested_repos` reaches an audit event, the REST API and the dashboard
-        # through `loop._vcs_rollback_to_base`'s payload;
-        # `ignored_unrecoverable` reaches none of them, so today it is a field
-        # a caller *may* read and nothing does. Wiring it needs a `loop.py`
-        # call-site change, which is P3's scope and not P2's, so the honest
-        # state is recorded here rather than repaired by a sentence.
         stage = ("add", "-A") if repo_root is not None else ("add", "-A", "-f")
         run = _run(ws, _git(config, *stage, workspace=ws), config)
         if run.reason or run.code != 0:
             return _failed(run)
 
-        # `message` is a single argv element after `-m`: it can never be read
-        # as a flag, whatever it contains.
         run = _run(
             ws,
             _git(
                 config,
                 "commit",
                 "--allow-empty",
-                # Measured: git refuses an empty `-m` outright ("Aborting
-                # commit due to empty commit message"). A caller may ignore
-                # this result, so a message it did not think about must not
-                # silently cost the round its commit.
                 "--allow-empty-message",
                 "-m",
                 message,
@@ -1562,9 +1383,6 @@ def rollback(
 
         before = _count_files(ws)
 
-        # Worktree mode: what the clean is about to delete unrecoverably,
-        # measured before anything moves. Empty in scratch mode, where `add -A
-        # -f` carries ignored files into the discarded ref.
         ignored = _ignored_paths(ws, config) if worktree else ()
 
         head = _head(ws, config)
@@ -1575,12 +1393,7 @@ def rollback(
             return _failed(target)
         head_sha, target_sha = head.out.strip(), target.out.strip()
 
-        # Named before anything moves, and reported whatever happens next: a
-        # nested repository is recorded as a bare gitlink, so the discarded ref
-        # does not carry its objects and `clean -ffdqx` removes them for good.
         nested = _nested_repos(ws, Path(repo_root) if worktree else None)
-        # Both bounded lists are diffed or rendered by a caller, so a cap that
-        # does not announce itself would read as "there were none".
         capped = tuple(
             name
             for name, values in (
@@ -1590,28 +1403,10 @@ def rollback(
             if len(values) >= _MAX_REPORTED_PATHS
         )
 
-        # The capture is **unconditional**, and that is the whole invariant:
-        # everything the clean deletes is reachable from a ref. Gated on
-        # `head_sha != target_sha` it was not — a worker that wrote files and
-        # then returned `ESCALATE:` (or an empty output) is returned to the
-        # caller *before* the round commit, so a reject of that ordinary shape
-        # had files on disk and zero commits, wrote no discarded ref, and let
-        # `clean -ffdqx` delete the working tree: measured `files_removed=1`
-        # with `sha=""` and `reason=""`, a destruction the audit called a clean
-        # rollback. `add -A -f` makes it likelier still, not less.
         if _is_dirty(ws, config, ignored=not worktree):
-            # Nested repositories are excluded by pathspec, because git
-            # refuses to index one that has no commit checked out ("unable to
-            # index file 'sub/'") and one failed path element would otherwise
-            # cost the *whole* workspace its capture. Their contents were
-            # already outside the recovery surface — a commit records them as
-            # a bare gitlink — and `nested_repos` is what names that gap.
             exclusions = (
                 ["--", ".", *[f":(exclude){name}" for name in nested]] if nested else []
             )
-            # `-f` in scratch mode only, for the reason `commit` documents:
-            # forcing ignored files into the operator's task branch is worse
-            # than losing them, and losing them is *named* rather than hidden.
             stage = ("add", "-A") if worktree else ("add", "-A", "-f")
             run = _run(ws, _git(config, *stage, *exclusions, workspace=ws), config)
             if run.reason or run.code != 0:
@@ -1660,14 +1455,7 @@ def rollback(
                 discarded_ref_prefix(task_id) if worktree else DISCARDED_REF_PREFIX,
             )
             if written.reason or written.code != 0:
-                # Losing the history is the failure this step exists to
-                # prevent, so nothing destructive runs.
                 return _failed(written)
-            # From here the tip is preserved under a ref. Every later failure
-            # carries the sha, because the caller's fallback is a wipe and
-            # wiping `.git` would destroy exactly the history this step just
-            # saved — `sha` on a failed result is how a caller tells "nothing
-            # was recorded" from "the ref is written but the tree is dirty".
             preserved = head_sha
 
         run = _run(ws, _git(config, "reset", "--hard", ref, workspace=ws), config)
@@ -1680,10 +1468,6 @@ def rollback(
                 truncated=capped,
             )
 
-        # The second `-f` removes untracked *nested* repositories: a worker
-        # that ran `git init` in its own workspace would otherwise leave files
-        # behind and silently break redo's "fresh start". It still never
-        # touches this repo's own `.git`, which is not working-tree content.
         run = _run(ws, _git(config, "clean", "-ffdqx", workspace=ws), config)
         if run.reason or run.code != 0:
             return _failed(
@@ -1696,30 +1480,14 @@ def rollback(
 
         after = _count_files(ws)
         removed = max(0, before - after)
-        # The pre-rollback tip, so a caller can record *where the discarded
-        # round went* without running a git command of its own (DD-12 is only
-        # useful if the audit trail names the ref). `""` when HEAD already
-        # resolved to the target and nothing was discarded.
         discarded = head_sha if head_sha != target_sha else ""
         reason = ""
         if worktree:
-            # A worktree's target commit *has* a tree — the operator's tracked
-            # files, which surviving is the entire point (see the docstring's
-            # "starting commit, never an empty one"). So residue cannot be a
-            # file count here; it is whatever the clean failed to remove, asked
-            # of git. Counting files would report every healthy worktree
-            # rollback as a degradation, and `_vcs_degraded` turns a reason
-            # into a warning and an event on every round.
             if _is_dirty(ws, config, ignored=True):
                 reason = "residue"
         elif after:
             reason = "residue"
         if removed and not discarded:
-            # A floor under the invariant above, and **not** a substitute for
-            # it: if files were destroyed and no ref names them, the result
-            # must not read as a clean rollback. `reason` is what makes
-            # `_vcs_degraded` fire, so the destruction is warned and audited
-            # rather than reported as success with an empty `discarded_sha`.
             reason = "unrecorded"
         return VcsResult(
             ok=True,

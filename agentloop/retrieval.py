@@ -1,4 +1,4 @@
-"""RetrievalBackend — the memory-relevance seam (roadmap slice 2).
+"""RetrievalBackend — the memory-relevance seam.
 
 `MemoryService.facts_for_prompt` used to select approved facts by tier and then
 alphabetical key. That ordering has nothing to do with the task at hand: past
@@ -33,14 +33,10 @@ import math
 import re
 from typing import Protocol
 
-# Vector width. Small enough that brute-force cosine over a few thousand facts
-# is free, wide enough that unrelated short facts rarely collide.
 _DIMS = 256
 
 _TOKEN_RE = re.compile(r"[a-z0-9_]+")
 
-# Only the words that carry no signal at all. Deliberately tiny: an aggressive
-# stopword list mostly discards vocabulary that would have matched.
 _STOPWORDS = frozenset(
     "a an and are as at be by for from how in is it of on or that the this to with".split()
 )
