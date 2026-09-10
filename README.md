@@ -19,7 +19,8 @@ agentloop/
   store.py     SQLite source of truth: tasks, task_deps (the task graph),
                attempts (metrics), verdicts, charter (append-only, versioned
                project rules), test_runs (incl. reported coverage),
-               events (immutable audit log), two-tier memory
+               events (immutable audit log), two-tier memory, projects
+               (the multi-project registry, slice 10)
   registry.py  agent registry: role, model, prompt, tools, budget, version
   runner.py    ModelRunner seam: ClaudeSDKRunner | OpenAICompatRunner | MockRunner
   agents.py    worker/validator/planner prompt building, verdict + plan parsing
@@ -36,9 +37,9 @@ agentloop/
   server.py    REST + SSE dashboard backend (stdlib only)
   cli.py       add / plan / approve-plan / run / status / approve / reject /
                redo / pause / resume / abort / events / serve / memory /
-               charter / eval
-web/           Vite + React + TypeScript dashboard
-tests/         878 tests on MockRunner + real subprocesses (no API keys needed)
+               charter / eval / project (add/rename/repoint/list/archive/use)
+web/           Vite + React + TypeScript dashboard, incl. the project switcher
+tests/         1091 tests on MockRunner + real subprocesses (no API keys needed)
 ```
 
 ## Quick start
@@ -80,6 +81,12 @@ agentloop tools approve <id>     # grant a requested tool (applies to the next i
 agentloop tools reject <id>      # deny it — and every name sharing its capability
 agentloop eval --runner mock     # validator calibration (mock, claude, or openai)
 agentloop eval --mode batch      # whole-loop fixtures: does the loop still decide right?
+
+# Multi-project (slice 10): one loop, one db, several registered repos
+agentloop project add "site-b" --repo-root C:\repos\site-b --workspace-mode worktree
+agentloop add "Fix the checkout bug" --project site-b --goal ... --criteria ...
+agentloop status --project site-b          # only site-b's tasks
+agentloop run                              # no --project: spans every registered project
 ```
 
 ### Dashboard (Phase 2)
@@ -947,8 +954,8 @@ its worktree, so a pruned task stays mergeable.
 
 | Knob | Default | Meaning |
 |---|---|---|
-| `workspace_mode` | `"scratch"` | `"scratch"` (default, proven no-op) or `"worktree"`. |
-| `repo_root` | `"."` | The repository a worktree-mode task checks out. Unread in scratch mode. |
+| `workspace_mode` | `"scratch"` | `"scratch"` (default, proven no-op) or `"worktree"`. **Slice 10:** seeds the bootstrap Default project's `workspace_mode` only — a second registered project sets its own via `agentloop project add/repoint --workspace-mode`, independent of this file. |
+| `repo_root` | `"."` | The repository a worktree-mode task checks out. Unread in scratch mode. **Slice 10:** seeds the bootstrap Default project's `repo_root` only — every other registered project has its own, set via `agentloop project add/repoint --repo-root`, and this file is never consulted for them. |
 | `worktree_root` | `"~/.agentloop/ws"` | Where worktree-mode workspaces are created. **Must be outside `repo_root`** — refused at config load otherwise (see residual 2). |
 | `vcs_base_ref` | `"HEAD"` | What each task's worktree branches from. `HEAD`, not `main`: a ticket usually branches from where you are standing. |
 | `vcs_branch_prefix` | `"agentloop/task-"` | Branch naming is derived (`f"{prefix}{task_id}"`), never stored — no schema migration for a value already reconstructible. |
@@ -1007,6 +1014,57 @@ name or a worktree result — every `vcs.*` call in `loop.py` is *call, log,
 discard*, exactly as slice 6, and an AST guard
 (`test_no_status_write_is_downstream_of_a_vcs_result`) enforces it rather than
 merely documenting it.
+
+## Multi-project dashboard (Slice 10)
+
+Everything above describes one loop pointed at one `repo_root`. That was
+fine for one codebase; it broke down the moment you had two, since
+switching meant editing `loopconfig.json` and restarting the process every
+time. Slice 10 adds a project **registry**: named rows, each mapping to its
+own `repo_root`/`workspace_mode`, all served by one running `agentloop
+serve` / one `agentloop.db`.
+
+```bash
+agentloop project add "site-b" --repo-root C:\repos\site-b --workspace-mode worktree
+agentloop project list                     # every registered project, * marks the default
+agentloop project use site-b                # make it the active default
+agentloop project repoint site-b --repo-root C:\repos\site-b-v2   # omit --workspace-mode to keep it
+agentloop project rename site-b "Site B"
+agentloop project archive site-b            # refused while it holds a non-terminal task
+```
+
+**A project is a name, not a raw path.** Pre-existing tasks and memory facts
+from before this slice all backfilled into one bootstrap **Default**
+project, so upgrading changes nothing about what you already had. Every
+project-aware command (`add`/`plan`/`status`/`events`, and `agentloop
+memory`) accepts `--project NAME_OR_ID` — a bare numeric id and a name both
+work — and resolves an omitted `--project` to the current default.
+**`agentloop run` is the one exception:** omitting `--project` there spans
+**every** registered project in one pass, matching the pre-slice-10,
+single-repository loop's behavior exactly; scope it to one project with
+`agentloop run --project site-b`.
+
+**Config stays global for this slice.** `agents.json`/`loopconfig.json`
+apply to every registered project the same way — there is no per-project
+registry or threshold override yet. The `repo_root`/`workspace_mode` knobs
+in `loopconfig.json` (table above) now mean specifically "what the
+bootstrap Default project seeds from," not "the repository," since that is
+no longer a singular thing once a second project exists.
+
+**The dashboard switcher is a real server-side scoped query**, not a
+client-side filter over one unscoped dataset — chosen deliberately, since a
+client-side filter would still rank and inject every registered project's
+approved memory facts into every prompt regardless of which one a worker
+was actually running against, at real per-call token cost and a real
+cross-project leak risk. The header dropdown drives `?project=` on every
+fetch and the SSE subscription; picking "All projects" shows every
+project's tasks and memory at once, exactly as an unscoped `agentloop run`
+does.
+
+**What does not change:** no decision rule reads a project id — the
+approve/revise/escalate thresholds, revision counting and the budget cap
+all read the same fields regardless of which project a task belongs to,
+same register as the provider seam and the tool gate above.
 
 ## Provider seam
 
@@ -1133,3 +1191,18 @@ problem. That's different from transient HTTP errors (408, 429, 5xx), which retr
       recoverable after a worktree rollback) and what stays unchanged (no
       decision rule reads a workspace mode, a branch name or a worktree
       result — enforced by the same AST guard slice 6 introduced).
+- [x] **Multi-project dashboard (slice 10)** — one running `agentloop serve` /
+      one `agentloop.db`, several registered projects, switchable from the CLI
+      (`--project`, `agentloop project add|rename|repoint|list|archive|use`)
+      and the dashboard (a header dropdown driving a real server-side
+      `?project=` query on every fetch and the SSE subscription, never a
+      client-side filter). Pre-existing tasks and memory backfill into one
+      bootstrap "Default" project; `agentloop run` alone still spans every
+      registered project. Config stays global across projects for this
+      slice. See "Multi-project dashboard" above for the commands, and
+      `docs/history/slice-10.md` for the full build write-up — seven
+      independently reviewed phases, each finding fixed with a falsified
+      regression test, including a `Store.archive_project` TOCTOU race
+      reproduced under real `ThreadingHTTPServer` concurrency and two React
+      stale-response races in the dashboard switcher. No decision rule
+      reads a project id.

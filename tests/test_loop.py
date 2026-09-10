@@ -1013,11 +1013,11 @@ def test_a_claim_failure_in_a_parallel_worker_is_never_reported_as_success(tmp_p
     real_claim = store.claim_next_task
     calls = {"n": 0}
 
-    def flaky(worker_id):
+    def flaky(worker_id, project_id=None):
         calls["n"] += 1
         if calls["n"] > 1:
             raise sqlite3.OperationalError("database is locked")
-        return real_claim(worker_id)
+        return real_claim(worker_id, project_id=project_id)
 
     store.claim_next_task = flaky
     with pytest.raises(sqlite3.OperationalError):
@@ -1114,7 +1114,7 @@ def test_every_failing_parallel_worker_is_recorded_not_just_the_first(tmp_path):
         add_task(store)
     loop, _ = make_loop(store, [APPROVE] * 20, max_parallel_workers=3)
 
-    def always_locked(worker_id):
+    def always_locked(worker_id, project_id=None):
         raise sqlite3.OperationalError("database is locked")
 
     store.claim_next_task = always_locked

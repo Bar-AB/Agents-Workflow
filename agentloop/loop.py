@@ -407,30 +407,98 @@ class Loop:
             except Exception:
                 pass
 
+        # Bootstrap-project reconciliation (slice 10 Phase 3): make "one
+        # 'Default' project is created from today's loopconfig.json
+        # repo_root/workspace_mode" true for an operator upgrading a
+        # pre-slice-9 **worktree-mode** install. Gated on
+        # `config.workspace_mode == "worktree"` specifically, not merely
+        # "differs from the placeholder" -- a scratch-mode config's
+        # repo_root/worktree_root are proven inert everywhere else (scratch
+        # mode is a proven no-op), so a scratch-mode Loop construction with
+        # those knobs incidentally filled in (a real differential-test shape,
+        # not hypothetical) must never mutate the shared Default project row
+        # out from under a *different* Loop instance sharing the same store
+        # that actually is running worktree mode. A no-op for the common
+        # case (scratch mode, repo_root=".", matching the placeholder).
+        # Only the write (`repoint_project`) is guarded, matching the two
+        # sibling blocks above: a genuine failure reading `list_projects()`
+        # or evaluating the condition (a store bug, a future refactor) is a
+        # real defect that should surface normally rather than be absorbed
+        # with zero signal — this block's own "degraded but visible" promise
+        # would otherwise be broken by the one layer that swallows silently.
+        projects = self.store.list_projects()
+        if (
+            len(projects) == 1
+            and projects[0]["name"] == "Default"
+            and projects[0]["repo_root"] == "."
+            and projects[0]["workspace_mode"] == "scratch"
+            and config.workspace_mode == "worktree"
+        ):
+            default_id = projects[0]["id"]
+            # Load-bearing: LoopConfig.repo_root is not required to be
+            # absolute (default is the literal relative "."), and slice
+            # 9's own _worktree_repo_root exists precisely because a
+            # relative repo_root is a real, supported worktree-mode
+            # configuration -- resolve to absolute BEFORE validating or
+            # storing it, the same lexical os.path.abspath convention
+            # _worktree_repo_root already uses at use time.
+            resolved_repo_root = os.path.abspath(config.repo_root)
+            try:
+                self.store.repoint_project(
+                    default_id, resolved_repo_root, config.workspace_mode
+                )
+            except Exception as exc:
+                # Bootstrapping the project record must never break loop
+                # construction, but unlike a bare except: pass, a
+                # genuine reconciliation failure (e.g. the configured
+                # directory no longer exists) is degraded-but-visible.
+                try:
+                    self.store.log_event(
+                        None,
+                        "config_warning",
+                        {
+                            "resolved_repo_root": resolved_repo_root,
+                            "workspace_mode": config.workspace_mode,
+                            "error": str(exc),
+                            "message": (
+                                "Failed to reconcile the Default project's "
+                                "repo_root/workspace_mode with loopconfig.json."
+                            ),
+                        },
+                    )
+                except Exception:
+                    pass
+
     # -- public API ----------------------------------------------------------
 
-    def run(self, max_tasks: int | None = None) -> int:
+    def run(self, max_tasks: int | None = None, project_id: int | None = None) -> int:
         """Process claimable tasks. Returns tasks processed.
         Safe to call after a crash/restart: state lives in the store.
 
         Sequential by default (`max_parallel_workers=1`). Above 1, that many
         threads each claim independently; the store's atomic claim is what makes
         that safe, and its blocked-task predicate is what keeps dependency order
-        without the loop tracking a graph in memory."""
+        without the loop tracking a graph in memory.
+
+        `project_id=None` (default, slice 10) spans every registered project
+        in one pass — the same filter every thread shares in the parallel
+        case, no per-project scheduling."""
         n = max(1, int(self.config.max_parallel_workers))
         # Checked for both paths: shrinking the pool *to* one worker is the most
         # likely way to strand a claim, so the sequential path needs this most.
         self._warn_stranded_claims(self._worker_ids(n))
         if n == 1:
-            return self._run_serial(self.worker_id, max_tasks)
-        return self._run_parallel(n, max_tasks)
+            return self._run_serial(self.worker_id, max_tasks, project_id)
+        return self._run_parallel(n, max_tasks, project_id)
 
-    def _run_serial(self, worker_id: str, max_tasks: int | None) -> int:
+    def _run_serial(
+        self, worker_id: str, max_tasks: int | None, project_id: int | None = None
+    ) -> int:
         processed = 0
         while max_tasks is None or processed < max_tasks:
             # Atomic claim (not a bare SELECT): a task is handed to exactly one
             # worker, so two workers never grab the same row.
-            task = self.store.claim_next_task(worker_id)
+            task = self.store.claim_next_task(worker_id, project_id=project_id)
             if task is None:
                 break
             self.run_task(task)
@@ -446,7 +514,9 @@ class Loop:
         """
         return [self.worker_id] + [f"{self.worker_id}-{i}" for i in range(1, n)]
 
-    def _run_parallel(self, n: int, max_tasks: int | None) -> int:
+    def _run_parallel(
+        self, n: int, max_tasks: int | None, project_id: int | None = None
+    ) -> int:
         """Run up to `n` tasks concurrently.
 
         No graph is held in memory and no scheduler decides what is ready: each
@@ -507,7 +577,7 @@ class Loop:
                         return
                     # Counted at claim time, not completion: two threads that
                     # both finish under the cap must not both claim past it.
-                    task = self.store.claim_next_task(worker_id)
+                    task = self.store.claim_next_task(worker_id, project_id=project_id)
                     if task is None:
                         if state["busy"] == 0:
                             cond.notify_all()
@@ -620,6 +690,7 @@ class Loop:
         acceptance_criteria: str,
         title: str = "",
         risk_level: int = 1,
+        project_id: int | str | None = None,
     ) -> Task:
         """Decompose a goal into a task graph. Returns the plan row.
 
@@ -650,6 +721,7 @@ class Loop:
             acceptance_criteria=acceptance_criteria,
             risk_level=risk_level,
             kind="plan",
+            project_id=self.store.resolve_project(project_id),
         )
         self.store.add_task(plan_task)
 
@@ -685,8 +757,10 @@ class Loop:
         # Slice 9 P4: the operator's repository, read-only (the planner
         # declares `file_read`, not `file_io`, so surveying a codebase it may
         # not modify is what the role is for) — `None` in scratch mode, where
-        # a plan row has no task workspace to point it at.
-        repo_root = self._worktree_repo_root()
+        # a plan row has no task workspace to point it at. `plan_task` is
+        # passed (slice 10 Phase 3) so a multi-project db resolves the
+        # plan's own project rather than the loop's global config.
+        repo_root = self._worktree_repo_root(plan_task)
         try:
             # HIGH-3 (slice 9 remediation): every worker/validator call site is
             # preceded by `_require_workspace`, which refuses with a clean
@@ -771,6 +845,7 @@ class Loop:
                         risk_level=node.risk_level,
                         kind="task",
                         plan_id=plan_task.id,
+                        project_id=plan_task.project_id,
                     )
                     ids[node.ref] = self.store.add_task(child)
                 edges = 0
@@ -901,7 +976,7 @@ class Loop:
             },
         )
 
-    def _worktree_repo_root(self) -> Path | None:
+    def _worktree_repo_root(self, task: Task | None = None) -> Path | None:
         """`None` in scratch mode; the absolute `repo_root` in worktree mode.
 
         Slice 9 P4. The single place `run_task` and its helpers ask "which
@@ -912,7 +987,79 @@ class Loop:
         lexically, matching `vcs._git`'s own `-C` handling and
         `Store._repo_key` — not `Path.resolve()`, which would follow a
         junction and quietly answer a question about a different repository
-        than the one `config.repo_root` names."""
+        than the one `config.repo_root` names.
+
+        Slice 10 Phase 3: optional `task`. When given and `task.project_id`
+        resolves to a real project row whose `(repo_root, workspace_mode)`
+        has moved off the bootstrap placeholder `(".", "scratch")`, reads
+        THAT project's own `workspace_mode`/`repo_root` instead of the
+        loop's global config — `None` if the row's `workspace_mode !=
+        "worktree"`. When `task` is `None` (the plan-row call site, before
+        any task workspace exists), the project lookup fails, or the
+        project's row is STILL at the placeholder, falls back to
+        `self.config.workspace_mode`/`self.config.repo_root` exactly as
+        before this phase — the byte-for-byte fallback that keeps a bare
+        `Loop(store, runner, registry, config)` with no extra `projects`
+        row set up behaving identically to before this slice.
+
+        Deliberately a placeholder check, not "is this the Default
+        project": `Loop.__init__`'s reconciliation step tries to keep the
+        Default project's row in sync with `self.config`, but it is a
+        best-effort, never-fatal bootstrap — when it fails (e.g. a
+        configured `repo_root` that does not exist), the row stays at the
+        placeholder, and reading it there would silently reinterpret a real
+        worktree-mode misconfiguration as scratch mode instead of letting it
+        fail loudly the way it did before this slice (`_require_workspace`
+        et al.). But once ANY project's row — including the Default
+        project's, via a future `agentloop project repoint` (Phase 4) — has
+        genuinely moved off the placeholder, that row is real operator
+        intent and must take effect immediately; unconditionally preferring
+        `self.config` for the Default project forever would make such a
+        repoint silently inert until a config file was also hand-edited and
+        the process restarted.
+
+        The lookup is guarded: pre-Phase-3 this was a pure, in-memory
+        function reading only `self.config`, and it is called from 5 sites
+        in `run_task`/`plan`/`human_approve`/`human_reject`/`human_redo`,
+        none of which wrap it in a retry/escalation path the way the
+        adjacent `registry.get(role)` lookup in `run_task` does. A
+        transient store error here (e.g. `database is locked` under two
+        concurrent `agentloop` processes, the exact scenario this project's
+        own claim-CAS design already treats as real) must degrade to the
+        same config-based fallback the docstring already promises for "the
+        project lookup fails" — silently returning `None`/config rather than
+        crashing `run_task` uncaught and stranding the just-claimed task
+        `in_progress` with its lease held and no escalation reason (the
+        same 'wedged whole batch' shape CLAUDE.md documents for a missing
+        registry role). Logged, not swallowed silently, so the degradation
+        is visible."""
+        if task is not None and task.project_id is not None:
+            try:
+                project = self.store.get_project(task.project_id)
+            except Exception as exc:
+                project = None
+                try:
+                    self.store.log_event(
+                        task.id,
+                        "config_warning",
+                        {
+                            "project_id": task.project_id,
+                            "error": str(exc),
+                            "message": (
+                                "Failed to read this task's project row; "
+                                "falling back to the loop's own config for "
+                                "repo_root/workspace_mode resolution."
+                            ),
+                        },
+                    )
+                except Exception:
+                    pass
+            if project is not None and (
+                project["repo_root"] != "." or project["workspace_mode"] != "scratch"
+            ):
+                if project["workspace_mode"] != "worktree":
+                    return None
+                return Path(os.path.abspath(project["repo_root"]))
         if self.config.workspace_mode != "worktree":
             return None
         return Path(os.path.abspath(self.config.repo_root))
@@ -1363,8 +1510,9 @@ class Loop:
         round_n = 0
         # Slice 9 P4: computed once per `run_task` invocation, exactly like
         # `vcs_ready`/`round_n` above — a restart simply re-derives it, which
-        # is idempotent (it is a pure function of `self.config`).
-        repo_root = self._worktree_repo_root()
+        # is idempotent (it is a pure function of `self.config`, or, since
+        # slice 10 Phase 3, of `task`'s own project).
+        repo_root = self._worktree_repo_root(task)
         while True:
             # Human control is read fresh from the store at each iteration
             # boundary, so a pause/abort set from another process (CLI or
@@ -2079,7 +2227,7 @@ class Loop:
         # `create=False` (the default) is load-bearing: approving a task whose
         # workspace never existed must not conjure one — the guard then refuses.
         if landed:
-            repo_root = self._worktree_repo_root()
+            repo_root = self._worktree_repo_root(fresh)
             self._vcs_mark_approved(
                 fresh,
                 workspace_for(
@@ -2119,7 +2267,7 @@ class Loop:
         # logs `degraded` on the event and a `vcs_unavailable` row - so what
         # survived on disk is visible rather than hidden behind an ok result.
         if landed:
-            self._vcs_rollback_to_base(task_id, self._worktree_repo_root())
+            self._vcs_rollback_to_base(task_id, self._worktree_repo_root(task))
         return self._require(task_id)
 
     def approve_tool_request(self, request_id: int, note: str = "") -> Task:
@@ -2297,7 +2445,7 @@ class Loop:
         # `vcs.is_repo` is deliberately not called first: `rollback` re-runs
         # the identical guard internally and says `not-a-workspace-repo`, so a
         # pre-check would be a second, racier copy of it.
-        repo_root = self._worktree_repo_root()
+        repo_root = self._worktree_repo_root(task)
         result = self._vcs_rollback_to_base(task_id, repo_root)
         if repo_root is not None:
             # Slice 9 P4, "Settled in interview" point 2: worktree mode's

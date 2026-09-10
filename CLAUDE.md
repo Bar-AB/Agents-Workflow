@@ -216,7 +216,11 @@ instead of claimed away.
   id extends at a `-` boundary (so `gpt-5-mini-…` prices as `gpt-5-mini`, not
   `gpt-5`). It normalizes at the *pricing* boundary only — `RunResult.model`
   keeps the serving snapshot, because which snapshot ran is provenance.
-- `models.py` — Task (incl. `kind` 'task'|'plan' and `plan_id`), TaskStatus,
+- `models.py` — Task (incl. `kind` 'task'|'plan', `plan_id`, and `project_id`
+  (slice 10): `int | None`, resolved to a concrete project by
+  `Store.add_task` before the row is ever written — the field on the
+  in-memory dataclass may be `None`, but a row read back from the store
+  never is), TaskStatus,
   Verdict (incl. `findings`: what the validator checked, a *copy* of a slice of
   `reasoning` and never a piece removed from it), VerdictKind, AgentSpec (incl.
   `runner`: which backend serves this role, `None` = the loop's default —
@@ -255,7 +259,8 @@ instead of claimed away.
   tool, for one task, by one role; `UNIQUE(task_id, role, tool)` and deliberately
   no foreign keys — an FK would raise inside a paid transaction; an `auto`/`approved`
   row *is* the grant — no separate grant table, so a permission never exists without
-  the request that justifies it). Schema is plain SQL so Postgres migration isn't a
+  the request that justifies it), and projects (slice 10 — see the dedicated
+  paragraph below `task_deps`). Schema is plain SQL so Postgres migration isn't a
   rewrite; `_migrate()` adds later columns to existing dbs (a whole new table needs
   no entry — `CREATE TABLE IF NOT EXISTS` covers it). `release_claim` — written
   only by `set_status` when returning to `pending` — clears the `claimed_by` lease,
@@ -349,6 +354,48 @@ instead of claimed away.
   edge that would close a cycle (incl. self-edges) — a store-level invariant,
   not a hope about the planner. Also `dependencies`/`dependents`/`plan_tasks`/
   `set_plan_approved`/`is_plan_approved`.
+  `projects` (slice 10) is the multi-project registry: `id`, `name`
+  (`UNIQUE`), `repo_root`, `workspace_mode`, `is_default`, `archived`,
+  timestamps — plain `INTEGER` for `is_default`/`archived`, so every reader
+  (`server.py`'s JSON responses included) sees `0`/`1`, never a coerced
+  boolean. `_ensure_default_project()` is a three-way branch run at
+  `Store.__init__`: a project already marked default wins outright; an
+  empty table bootstraps one via `INSERT OR IGNORE` (race-safe against two
+  `agentloop` processes opening a brand-new db at once); a table with rows
+  but none marked default repairs by promoting the lowest-id row rather
+  than minting a second bootstrap project and orphaning the real one.
+  `resolve_project(project: int | str | None) -> int` is the one seam every
+  later caller — CLI, server, memory, loop — goes through: `None` is the
+  default project's id (never raises), an `int` must exist or raises
+  `KeyError`, a `str` is looked up by name or raises the same. Also
+  `create_project`/`get_project`/`get_project_by_name`/`list_projects`/
+  `rename_project`/`repoint_project`/`set_default_project`/
+  `archive_project` (refuses the default project or any project holding a
+  non-terminal task, the whole check-and-write **inside one
+  `transaction()`** after a hunter reproduced a real gap between a separate
+  check and write under live `ThreadingHTTPServer` concurrency — a task
+  created in that gap was invisible to the refusal). `list_tasks`/
+  `claim_next_task`/`events`/`events_since`/`run_metrics`/`memory_list` all
+  gain an optional `project_id` filter where **`None` means unfiltered —
+  every project**, matching the pre-slice-10, single-repository loop's
+  behavior exactly when nothing is scoped; `events`/`events_since` use a
+  `LEFT JOIN` against `tasks`, not an `INNER JOIN`, so a task-less global
+  event (`project_created`, `charter_set`, `memory_promoted`,
+  `config_warning`) always passes a project filter rather than being
+  silently dropped by it. `add_dependency` refuses an edge across two
+  different projects' tasks — a planner graph has no shared lifecycle to
+  reconcile the ordering against. The `memory` table itself gained a
+  `project_id` column and moved its uniqueness from `UNIQUE(tier, key)` to
+  `UNIQUE(project_id, tier, key)` — the **one** deliberate exception to
+  "`_migrate()` only ever adds a column," since SQLite cannot `ALTER` a
+  `UNIQUE` constraint in place. `_rebuild_memory_unique_constraint` recreates
+  the table under the new constraint id-preserving (an existing
+  `memory_hits` row or `retrieval` event payload still resolves to the same
+  fact afterward) and `AUTOINCREMENT`-preserving (reads the old table's
+  `sqlite_sequence` value before dropping it and carries it forward, so an
+  id freed by a pre-rebuild delete can never be reused by a later insert —
+  the original version of this rebuild missed exactly that half and was a
+  hunter CRITICAL finding). Full narrative: `docs/history/slice-10.md`.
 - `registry.py` — agent registry: role, model, system prompt, tools, context
   budget, version, and (slice 4) the `runner` a role is pinned to. Defaults in
   code (`worker`, `validator`, `summarizer`
@@ -511,6 +558,11 @@ instead of claimed away.
   raw previous-output+feedback block when a handoff has fired.
   Validator first line: `VERDICT: <kind> CONFIDENCE: <0-1> TESTS: <pass|fail|na>`.
   Injects approved memory facts and real test results into prompts.
+  `_memory_block(memory, query="", task_id=None, project_id=None)` (slice 10)
+  passes `project_id` through to `MemoryService.facts_for_prompt`; its three
+  call sites (`run_worker`/`run_planner`/`run_validator`) pass the task's or
+  plan-task's own `project_id`, so a worker never sees another registered
+  project's facts injected into its prompt.
   `_charter_block(store)` returns `(block, version)` and `("", None)` when there
   is no charter — the same "empty means absent" convention `_memory_block` uses,
   which is what makes the byte-for-byte guarantee hold structurally rather than
@@ -563,6 +615,14 @@ instead of claimed away.
   gained a read-only-retry handler: `rmtree(ignore_errors=True)` cannot delete
   the read-only objects git writes, so before slice 6 fixed it the redo fallback
   left the workspace standing with the previous round still in it.
+  `workspace_for`'s worktree-mode dispatch (slice 10) reads
+  `config is not None and repo_root is not None`, not
+  `config.workspace_mode == "worktree" and repo_root is not None` as it did
+  before this slice — the old condition read the **process-global**
+  `LoopConfig`'s mode rather than the calling task's own resolved project,
+  a reviewer CRITICAL that could land a worktree-mode project's checkouts
+  inside the orchestrator's own repository. Now mode-agnostic, matching
+  `vcs.init_repo`'s contract, which was already correct.
 - `vcs.py` — **per-task workspace version control (slice 6).** One throwaway git
   repo per `.agentloop/ws/task-{id}/`, no remote and no shared timeline, so
   `redo`/`reject` recover the discarded round instead of destroying it.
@@ -686,6 +746,16 @@ instead of claimed away.
   attached to the attempt it fed, so `agents._invoke` logs it. With no query (or
   `backend=None`) provenance is None: exactly the pre-slice-2 alphabetical
   selection, and nothing logged.
+  `facts_for_prompt`/`read`/`remember`/`maybe_promote`/`_find`/
+  `_record_reads` all gained `project_id` (slice 10) — **a different
+  "project" than the tier name above**, the registered-repo kind from
+  `store.projects`, resolved once via `Store.resolve_project` at the top of
+  `facts_for_prompt`/`maybe_promote` so a worker's prompt is only ever
+  injected with its own project's facts. `maybe_promote` originally never
+  resolved it at all — a hunter CRITICAL, since under `Store.memory_list`'s
+  own "`None` means every project" convention that made a fact's promotion
+  candidacy get decided against every registered project's facts, not just
+  its own.
 - `retrieval.py` — **RetrievalBackend protocol: the memory-relevance seam**
   (slice 2), same shape as `ModelRunner`. `embed()` is a stdlib hashed
   bag-of-words vector (blake2b, *not* builtin `hash` — that is salted per
@@ -794,10 +864,43 @@ instead of claimed away.
   gap audited (`history_preserved`), since `clear_workspace` would rmtree exactly
   the ref `vcs.rollback` had just refused to lose, under a warning reading
   "nothing happened".
+  `_worktree_repo_root(self, task: Task | None = None)` (slice 10) reads the
+  given task's own project row for its `repo_root`/`workspace_mode` unless
+  that project is still sitting at the bootstrap placeholder
+  (`repo_root="."`, `workspace_mode="scratch"`), in which case it defers to
+  the process's own `LoopConfig` — narrowed to that exact condition after a
+  broader "always defer for the Default project" version was found to make
+  a later `project repoint` on Default permanently inert. `Loop.__init__`
+  reconciles the bootstrap Default project against the process's own
+  `LoopConfig` on startup, gated specifically on
+  `config.workspace_mode == "worktree"` so an ordinary scratch-mode config
+  with unused worktree knobs filled in never mutates the shared Default
+  row. `plan()`/`run()`/`_run_serial`/`_run_parallel` all gain an optional
+  `project_id` — `run(project_id=None)` spans every registered project in
+  one pass (the sequential-loop-unchanged default); a concrete id scopes
+  the claim to one project only.
 - `server.py` — REST + SSE dashboard backend, stdlib `http.server` only. The
   append-only `events` table *is* the change feed: SSE is a `WHERE id > cursor`
   query, so reconnects resume losslessly via `Last-Event-ID` and the dashboard
   never mirrors state into a second store.
+  Slice 10 adds `GET/POST /api/projects` and
+  `POST /api/projects/{id}/{rename|repoint|archive|use}`, plus `?project=`
+  scoping on `GET /api/tasks`, `/api/metrics`, `/api/memory`,
+  `/api/tool_requests` and `/api/stream` (deliberately **not**
+  `/api/events`, which nothing in `web/` calls — the live feed comes from
+  `/api/stream`). `_parse_project_query` is the shared parser: absent
+  `?project=` is `None` (unfiltered), a malformed value is a `400`, and a
+  well-formed id naming no real project is a `404` — not a `200` with an
+  empty list, which used to be indistinguishable from "this real project
+  just has nothing yet." `_tool_requests_list` cross-checks `?project=` and
+  `?task_id=` against each other when both are given, answering empty on a
+  mismatch rather than silently honoring `task_id` alone and leaking the
+  other project's row through the `project` filter that was supposed to
+  gate it. `_project_action` (the shared handler behind
+  `rename`/`repoint`/`archive`/`use`) fails closed on an unrecognized verb
+  rather than falling through to a fake 200 success — unreachable through
+  real HTTP today only because `do_POST`'s own routing guard already
+  restricts the verb, so this is defense in depth, not a live gap.
 - `cli.py` — argparse CLI, structured plain output. `charter show|set|clear|
   history` is the human write surface for the project charter; a `ValueError`
   from `charter_set` renders through `main`'s handler as `error: ...`, which is
@@ -807,6 +910,25 @@ instead of claimed away.
   an agents.json decision and are applied on top of it. `eval` additionally
   takes `--mode verdict|batch` (slice 6); `--mode batch` with a non-mock
   `--runner` is refused with a non-zero exit rather than quietly downgraded.
+  Slice 10 adds `--project` to `add`/`plan`/`run`/`status`/`events` and
+  `agentloop memory list|approve|reject|add|pin|unpin`, plus a new
+  `agentloop project add|rename|repoint|list|archive|use` subcommand.
+  `--project` is deliberately **not** resolved on `run` when omitted
+  (`Loop.run(project_id=None)` spans every registered project, and
+  resolving a bare `agentloop run` to just the default would make that
+  unreachable from the CLI); every other project-aware command resolves an
+  omission to the default. `_project_ref(raw)` tries `int(raw)` before
+  falling back to the raw string, applied at every `--project`/positional
+  project-name call site — without it, argparse hands `Store.resolve_project`
+  a plain `str` even for a numeric id, so `--project 3` always took the
+  name-lookup branch and raised `unknown project '3'` even when project 3
+  existed. `_memory_cmd`'s `list` and `add` resolve an omitted `--project`
+  **differently** on purpose: `Store.memory_list`'s own `None` means "every
+  project," `Store.resolve_project(None)` means "the default project," and
+  the two would otherwise collide — `list` passes the raw, unresolved `None`
+  through so a bare `agentloop memory list` still shows every registered
+  project's facts, and `add` (a write, which must land in exactly one
+  project) resolves it as before.
 - `web/` — Vite + React + TypeScript dashboard. `types.ts` mirrors the server's
   JSON shapes; keep them in sync when changing an endpoint. `test_runs` reaches
   the API wholesale (`server.py` returns the rows), so `coverage_percent` needed
@@ -817,6 +939,26 @@ instead of claimed away.
   `discarded_ref`, `degraded` and `unrecoverable_nested_repos` are **absent, not
   null**, when they do not apply, so each is tested before it is rendered and the
   nested-repo line names the gap rather than implying a recovery surface.
+  Slice 10 adds `ProjectSwitcher.tsx` (a header dropdown driving `?project=`
+  on every fetch and the SSE subscription — never a client-side filter) and
+  a `Project` interface with `is_default`/`archived` typed `number`, not
+  `boolean` — confirmed empirically that the server sends SQLite's raw
+  `0`/`1`, the same reason `MemoryFact.approved`/`.pinned` are typed that
+  way. `useLiveLoop(projectId)` guards every fetch with a "latest ref"
+  check before its `setState` calls — without it, a slower response from a
+  project the user has since switched away from can resolve after the new
+  project's own response and silently overwrite it, a genuine race two
+  independent review passes found and a third confirmed fixed.
+  `ProjectSwitcher`'s choice persists to `localStorage` with a **three-state
+  encoding** (unset / explicit `"all"` / a specific id) — collapsing
+  "nothing chosen yet" and "explicitly chose All projects" onto one
+  sentinel (a missing key) would make choosing "All projects" not survive a
+  reload, since the next load would read the same missing key and
+  re-resolve the default project. `App.tsx`'s own default-project
+  resolution (from `/api/config`) is guarded by a `userChoseProject` ref,
+  checked inside that fetch's own `.then` — without it, a project chosen
+  manually while that fetch was still in flight could be silently reverted
+  the moment it landed.
 
 ## Decision rules (do not change without updating tests + README)
 - approve + confidence ≥ approve_threshold (0.70) + tests not failing → DONE,
@@ -1151,6 +1293,20 @@ instead of claimed away.
   differs — and on a pre-slice-6 workspace with no `.git`, not even that: the
   guard refuses, reject leaves the tree untouched and redo falls back to the
   wipe, which is the pre-slice-6 behaviour precisely.
+- **Slice 10 adds no decision rule**, same register as slice 6's own
+  negative: no threshold, revision count or budget check reads a project id
+  anywhere in `loop.py`. `project_id=None` is byte-for-byte the
+  pre-slice-10 behaviour everywhere it is read as a *filter* —
+  `list_tasks`, `claim_next_task`, `events`, `events_since`, `run_metrics`
+  and `memory_list` all treat an absent project as "every project," which
+  is what the single-repository loop already did before this slice existed.
+  The one place `None` resolves to something concrete rather than staying
+  unfiltered is a *write*: `Store.resolve_project(None)` lands an omitted
+  `--project` on the default project, matching what every pre-slice-10 call
+  site already did implicitly (none of them ever set `project_id`, so they
+  always wrote to whatever the store now calls "Default"). Nothing about
+  *when* a task moves between statuses, *whether* a memory fact is
+  approved, or *how much* budget a task has spent reads a project anywhere.
 
 ## Conventions
 - Python ≥ 3.10, stdlib-only core (no runtime deps); claude-agent-sdk and
@@ -1219,532 +1375,47 @@ instead of claimed away.
    `temp/demo-slice7.db`). No agent in this project can verify rendered `web/`
    output; that is a structural gap, not a temporary one.
 8. ~~Hardening and finalization pass before first real use.~~ **Done (Slice 8)**
-   — see below.
+   — full write-up in `docs/history/slice-8.md`.
 9. ~~Run agentloop against an existing repository, on its own branch, with its
-   real test suite.~~ **Done (Slice 9)** — see below. `workspace_mode:
-   "worktree"` gives each task a real `git worktree` checkout of `repo_root`
-   instead of an empty scratch directory; scratch mode (the default) is a
-   **proven** no-op, in the same register as `vcs_enabled=False`.
+   real test suite.~~ **Done (Slice 9)** — full write-up in
+   `docs/history/slice-9.md`. `workspace_mode: "worktree"` gives each task a
+   real `git worktree` checkout of `repo_root` instead of an empty scratch
+   directory; scratch mode (the default) is a **proven** no-op, in the same
+   register as `vcs_enabled=False`.
+10. ~~Multi-project dashboard: one running `agentloop serve` / one
+    `agentloop.db`, several projects, switchable from the UI and the CLI.~~
+    **Done (Slice 10)** — full write-up in `docs/history/slice-10.md`.
+    Design: `docs/plans/2026-09-08-multi-project-dashboard-design.md`. Plan:
+    `docs/plans/2026-09-08-multi-project-dashboard-plan.md` (8 phases,
+    confidence 88/100 after 3 revision passes). Built phase-by-phase with a
+    fresh code-reviewer + failure-hunter pair per phase (never
+    self-certified) and a falsified regression test for every finding — see
+    the write-up for the full list, including a TOCTOU race in
+    `Store.archive_project` reproduced under real `ThreadingHTTPServer`
+    concurrency and two React stale-response races in the Phase 7 switcher.
+    **No decision rule changed** — same register as slices 4-9's own
+    inertness claims; `project_id=None` is byte-for-byte the pre-slice-10
+    "every project"/"the default project" behavior everywhere it already
+    was. The **one** deliberate departure from "`_migrate()` only ever adds"
+    is Phase 2's `memory` table rebuild (`UNIQUE(tier, key)` →
+    `UNIQUE(project_id, tier, key)`, which SQLite cannot `ALTER` in place),
+    done id-preserving and `AUTOINCREMENT`-preserving so no existing
+    `memory_hits`/`retrieval`-event reference breaks. Phase 7's `human_verify`
+    checkpoint (no agent in this project can see rendered `web/` output) was
+    reviewed by the operator against a seeded three-project demo
+    (`temp/seed_slice10_demo.py` + `temp/slice10-ui-checklist.md`) and
+    confirmed correct.
 
-## Slice 8: hardening and finalization
+## Slice 8 and Slice 9: hardening pass + existing-repository workspaces
 
-A full adversarial review of every module (four independent reviewers) before
-the project was used against a live provider for the first time, plus every
-finding it produced. The framing that matters: **the repo's own database held 0
-tasks and 0 attempts**, so nothing here had ever been driven end to end by a
-real model — and three of the criticals sat on exactly that path, invisible to
-740 passing mock-based tests. 878 tests now; every fix landed with a regression
-test that was watched failing first, and the two guards worth doubting were
-falsified by neutering the mechanism and confirming the test went red.
-
-**Three criticals.**
-- **`server.py` accepted cross-origin mutations.** An unauthenticated mutation
-  API on a documented default port with no `Origin` and no `Host` check. A
-  browser *simple request* (`Content-Type: text/plain`, no preflight, permitted
-  cross-origin) reached every POST route: measured, `POST /api/charter` from
-  `Origin: http://evil.example` returned 200 and replaced the charter body —
-  which `agents._charter_block` injects verbatim into every worker, validator
-  and planner prompt, making it remote prompt injection into an agent holding
-  `file_io`, `git` and Bash. `POST /api/tasks` returned 201; `Host:
-  attacker.example.com` returned 200 with full task bodies, so DNS rebinding was
-  enough to read goals, worker output and `test_command`. Both conditions are
-  now checked before routing, on GET as well as POST, and they are two
-  conditions because they stop two different attacks: `Origin` catches the
-  browser that knows it is elsewhere, `Host` catches rebinding, where the
-  browser believes the attacker's name *is* this server and so sends no foreign
-  `Origin` at all. An **absent** `Origin` is accepted — only a browser sets one,
-  and a browser cannot omit it cross-origin, so requiring it would break curl
-  and the CLI in order to stop nothing. An IP-literal `Host` is accepted because
-  rebinding needs a *name* to re-resolve, which keeps `--host 0.0.0.0` working.
-  Deliberately not a token: an attacker already executing code on this machine
-  is out of scope here exactly as they are for `executor.py`'s env scrub.
-- **The default runner had neither money guard its sibling shipped with.**
-  Every totality and never-zero guard was written for slice 4's
-  `OpenAICompatRunner` and never back-fitted to `ClaudeSDKRunner`. So
-  `extract_usage` used a bare `int()` and raised on a wrong *type* (`'n/a'`, a
-  nested dict, NaN) — **after** the stream completed and the completion was
-  billed. `agents._invoke` reaches `finish_attempt` only on a clean return, so
-  the tokens and cost were discarded and `loop._with_retry`'s bare
-  `except Exception` bought the same completion again, up to
-  `infra_max_retries + 1` times, reported as an `infra_error` pointing the
-  operator at their network. `extract_tool_calls` had the same shape on
-  `message.content`. And with no never-zero guard, four silent zeros reached
-  `attempts` as a measured $0.00 with `usage_estimated=False` and no
-  `runner_warning` — so `_budget_tripped` could never fire, `_maybe_handoff`
-  could never fire, and the dashboard rendered the fabricated number as spend.
-  Both extractors are now total, and the never-zero block is **one shared
-  helper** (`runner.never_zero_usage`) rather than a second copy, because a
-  second copy is what drifted the first time. Found independently by two
-  reviewers, which is this project's strongest signal.
-- **`vcs` was inert on every default install.** `_run` sets `cwd=<ws>` and
-  `_git` also appended `-C <ws>`, so git changed into the workspace and then
-  resolved the same *relative* path again from inside itself. The shipped
-  `workspace_root` is relative (`.agentloop/ws`), so every side-effecting call
-  returned `git-failed` and the whole of slice 6 — round commits, the approved
-  ref, recoverable reject and redo — never ran, announced only as one
-  `RuntimeWarning` per task saying the task "ran without durability". **Every
-  one of ~2900 lines of vcs tests used an absolute `tmp_path`**, which is why a
-  green suite proved nothing here. Fixed with `os.path.abspath` on the `-C`
-  value — lexical, deliberately not `Path.resolve()`, which would follow a
-  junction at `<ws>` and quietly take over the one decision `_guard` exists to
-  make. The regression test drives the full lifecycle from a relative root and
-  is paired with a relative-vs-absolute differential.
-
-**The rest, in the order they will bite an operator.**
-- **`agents._VERDICT_RE` rejected ordinary LLM markdown.** Five of six realistic
-  formats — per-field emphasis, comma or pipe separators, a bare `.95`, `n/a`
-  for `na`, a percentage — parsed as `ESCALATE` at confidence 0, which is below
-  `severe_threshold` and so goes straight to NEEDS_HUMAN with no revision round,
-  recording "Unparseable validator output" over a verdict that had actually
-  approved. `toolpolicy._MARKER_RE` had already won this argument (LLM output is
-  markdown); the parser driving an automatic state transition had none of that
-  hardening. **Decoration and separators widened, semantics untouched**: the
-  three verdict kinds, the three tests values and the requirement that all three
-  labelled fields be present are unchanged, prose that merely sounds like an
-  approval still escalates at 0, and nine "not a verdict" controls pin that.
-- **An undecided tool request revoked a capability the role already held.**
-  `effective_tools` exempted a pending row by *logical name* while
-  `subtract_withheld` works over the *concrete* footprint, and
-  `LOGICAL_TOOL_MAP` is not injective. Measured with the shipped worker spec: a
-  pending, **optional** `shell` — nobody's decision, never shown to a human —
-  cost the role its declared `git`, because both resolve to `Bash`. The trigger
-  is the shipped system prompt's own worked example (`TOOL_REQUEST: shell
-  (blocking)`). The exemption is now decided in the same currency as the
-  subtraction. Only the *pending* side widened: a **rejected** row still
-  subtracts unconditionally, which is the fail-closed half and what stops an
-  agent revoking its own baseline by asking for it. Five existing tests encoded
-  the name-level approximation and were rewritten rather than the fix being bent
-  to them — CLAUDE.md's rule says "a capability the role already holds", and the
-  later E3/G1 remediation block says the same; those five predate it and were
-  never reconciled. Each rewrite is annotated with that reasoning, and each now
-  asserts a *more* honest answer than it did (the CLI went from promising
-  "approving grants Bash" to stating "approving changes nothing — this role
-  already has Bash").
-- **The sandbox's two stated bounds were not bounds.** `capture_output=True`
-  materialised the whole stream and truncated afterwards — measured, 331 MB in
-  4 s (662 MB peak), extrapolating to ~9.8 GB at the default timeout, to keep
-  4000 characters; three lines of generated test code could OOM-kill the loop
-  and take a paid completion with it. And `subprocess.run`'s timeout kills only
-  the direct child, then blocks in `communicate()` until every inherited pipe
-  handle closes: a grandchild holding stdout defeated a 3 s timeout for 20.3 s,
-  and one that never exits blocked forever, inside `_with_retry`, holding the
-  claim. `_run_bounded` now reads into a bounded ring buffer in a daemon thread
-  and kills the whole **process tree** (`taskkill /F /T` on Windows, a POSIX process group elsewhere).
-  The timeout summary reports the *measured* wait as well as the requested one.
-- **A missing registry role wedged the whole batch.** `Registry.load` replaces
-  the defaults wholesale with no merge and no missing-role check, so a
-  hand-edited `agents.json` can leave `worker` undefined; `registry.get` then
-  raised a bare `KeyError` from `_maybe_handoff`, matching neither handler and
-  escaping `run_task`. Measured: the batch aborted, task 1 sat `in_progress`
-  holding its lease with an empty `escalation_reason`, everything behind it
-  never ran, and the next `agentloop run` died identically — permanent
-  starvation with one stderr line as the only signal. A missing `validator`
-  failed differently and no better: three paid retries and an `infra_error`, the
-  misdiagnosis CLAUDE.md explicitly names. Both roles are now resolved up front
-  exactly as `plan()` resolves `planner`.
-- **A claim failure in a parallel worker was swallowed and reported as
-  success.** `_run_parallel.drain`'s guard covered `run_task` but not
-  `claim_next_task`, which opens a write transaction and so raises
-  `OperationalError: database is locked` whenever two `agentloop run` processes
-  share a database. Measured at `max_parallel_workers=3`: `run()` returned 1 and
-  raised nothing while two threads died and two tasks were silently dropped. The
-  sequential path propagates, so the two modes disagreed about what a failed
-  batch even looks like. The whole drain body is now guarded.
-- **`resume` left the pause message on the row forever.** `set_status(...,
-  reason="")` assigns only a *truthy* reason, and `pause` stamps "Paused by
-  human; resume to continue." onto every task it touches — measured still
-  reading it on a `done` task. Four sibling release-to-PENDING paths already
-  blanked it explicitly; `resume` was the fifth and the only one missing the
-  line, and it is the one CLAUDE.md names as the *neutral* exit from a
-  tool-request park.
-- **`max_tokens_per_task` escalated a successful first task.** Measured on a
-  real `--runner claude` run of the README's own quick-start task: the validator
-  returned `approve` at 0.85 and the task escalated with "Budget cap exceeded
-  (tokens=556515, cost=$0.49)" — the *token* cap tripping at under a tenth of
-  the cost cap. Raised to 3M. The **rule is deliberately unchanged**: cache
-  reads still count toward the token total and are still priced at 0.10x on the
-  cost side. This was a badly chosen default, not a wrong rule, and changing
-  what the number counts would have rewritten CLAUDE.md, the README table and
-  the tests to fix a constant.
-- Smaller, all measured: `/api/stream` answered 500 for a malformed cursor where
-  `/api/events` answered 400, on the endpoint where `Last-Event-ID` is
-  client-supplied on every reconnect; an unknown `/api/*` GET returned 200 and
-  the dashboard HTML; static containment was a string *prefix* test rather than
-  `is_relative_to`, so a `dist`-prefixed sibling passed; `TaskDetail` used
-  `events.length` as its refetch trigger and that array is capped, so after 300
-  events the detail pane froze forever, showing a stale status directly above
-  the Approve button; `.card:hover`/`.card.selected` set the `border-color`
-  shorthand at higher specificity than the status map, so the *selected* card
-  lost its status colour; a malformed `test_command` raised `ValueError` into
-  `_with_retry` and became three `infra_error` retries (now refused at
-  construction, where `cli.main` renders it as `error: …`); the child `PATH`
-  omitted the running interpreter's script directory, so the default `pytest -q`
-  could not resolve when `agentloop` was invoked by path as the README offers,
-  so the command failed every round and burned `max_revisions` on a gap no
-  worker could close (see the round-2 note below: an earlier version of this
-  sentence claimed `status="error"` falls back to the validator's `TESTS:`
-  claim, which `TestResult.passed` disproves); `run_metrics`'s `by_model` rollup counted unfinished
-  attempts while the headline totals filtered them, so the two never reconciled;
-  `config.load` reported an unknown key (a typo'd budget cap) with `print`,
-  which is strictly weaker than the `warnings.warn` this project already calls
-  insufficient; six `run_task` escalation exits returned the in-hand `Task`
-  rather than re-reading, the pattern `human_approve` documents as wrong;
-  `git init` could reinitialise another repository through a gitfile at
-  `<ws>/.git`, contradicting its own docstring's containment claim; `serve
-  --runner` was an inert flag that read as "the dashboard will drive real work";
-  and CLI output raised `UnicodeEncodeError` when redirected on Windows, which
-  `main`'s `(KeyError, ValueError)` handler swallowed into `error: charmap`.
-
-**A second review round, and what it caught in the first round's own fixes.**
-The fixes above were themselves put through two independent reviewers, and that
-round found three defects *introduced by the repairs* — which is the argument for
-the round, not against it.
-- **The widened verdict parser had turned a fail-safe non-match into a
-  fail-open maximum.** The pattern accepts any magnitude, and the first version
-  *clamped* out-of-range values instead of rejecting them — so `CONFIDENCE: 95`
-  (a percentage with the sign dropped) became `1.0`, the top of the scale,
-  clearing both thresholds and marking a task DONE with no human. `CONFIDENCE:
-  40` rewrote a validator's severe-threshold judgement into certainty the same
-  way. A clamp is not a rejection: it substitutes the **most permissive legal
-  value** for one the model never wrote. Out-of-range is now an unparseable
-  verdict, exactly as it was before the widening. The test that let this
-  through asserted `v.confidence <= 1.0`, which cannot fail for a clamped
-  value — a hollow assertion is worse than none, because it reads as coverage.
-  Its replacement asserts against the **decision thresholds** and was watched
-  going red on all five inputs with the clamp restored.
-- **The same-origin guard accepted `Origin: null`.** Measured on the first
-  version: a cross-origin `POST /api/charter` carrying `null` returned 200 and
-  replaced the charter — the very attack the guard was written to close. A
-  browser sends the literal `null` for an *opaque* origin (a sandboxed iframe,
-  and any redirect chain that crossed origins, which a 307 survives with method
-  and body intact), so it is a real cross-origin request that declines to name
-  itself, not an absent one. An absent `Host` passed for the same reason and is
-  closed with it.
-- **The tool-capability exemption was a subset test where it needed to be an
-  intersection.** `LOGICAL_TOOL_MAP` has *partial* overlaps as well as exact
-  collisions: `file_io` -> `[Read, Write, Edit]`, `file_read` -> `[Read]`, and
-  the shipped **planner** declares `file_read`. So an undecided, optional
-  `TOOL_REQUEST: file_io` still stripped the planner's `Read` — the same
-  self-revocation, one collision pair over from the `git`/`shell` case that had
-  been measured. A capability held through a human's **grant** was not exempt
-  either, so with `gate_declared_tools=True` a pending ask could revoke what a
-  human had just approved. The reviewer also proved the tool-policy suite could
-  not see any of this: with the exemption removed entirely, all 215 tests still
-  passed. It now fails in *both* directions — too permissive and too strict —
-  and that was verified by neutering each way.
-
-Three more from the same round, each a place where a degradation existed and
-nothing recorded it — the project's own standing rule is that a warning nobody
-sees in `agentloop events` is unrecorded. A garbage **cache**-token field was
-coerced to 0 and written as a *measurement*: nothing estimates the cache fields,
-so `estimated` stayed empty, `note` stayed empty, `usage_estimated` stayed False
-and no `runner_warning` fired — and per the decision rules the token total
-includes cache reads, so on a cache-heavy run that is the dominant term of the
-budget cap. `coerced_usage_fields` now reports it (and note the failure mode
-worth remembering: the reporter was written, and then *not called* — dead code
-that reads as a fix, which is why its test was written to fail against exactly
-that state). A typo'd `loopconfig.json` key now logs a `config_warning` event
-from `Loop.__init__`, the first place in that path with a store. And
-`_run_parallel` recorded only `errors[0]`, discarding every other worker's
-exception on the one path whose whole purpose is that a dying worker must not be
-silent; each is now logged as `worker_failed` before the first is raised.
-
-Two smaller ones from the same round, both places the code and its own prose had
-drifted apart: the `` added to stop `TESTS: nap` reading as `na` had silently
-narrowed `TESTS: passed` / `failed` out of the grammar, on a slice whose stated
-purpose is surviving ordinary formatting; and the executor comment justifying the
-`PATH` fix claimed `status="error"` falls back to the validator's `TESTS:` claim,
-when `TestResult.passed` returns `False` for it — the honest consequence is that
-an unresolvable command fails every round and burns `max_revisions`. The
-documented "Windows job kill" is `taskkill /F /T`, which walks the live
-parent-PID chain and therefore misses a reparented orphan; that residual is now
-named rather than claimed away.
-
-**A third round, from the integration verifier**, which ran 18 scenarios against
-the finished tree — reproducing the pre-fix `vcs` failure, driving the
-cross-origin attacks over raw sockets against a real server, and neutering all
-three round-2 mechanisms to confirm the suite goes red in each direction. 16
-passed; the two that failed were both honesty gaps rather than exposure, and
-both are the same shape as everything else this slice found.
-- **The cache-field reporter was wired into both backends and could only see
-  one of them.** `coerced_usage_fields` scanned top-level keys ending in
-  `tokens`. Anthropic reports its cache counts there; **OpenAI nests them**
-  under `prompt_tokens_details.cached_tokens`, and `prompt_tokens_details` does
-  not end in `tokens` — so on that backend a garbage cached count was invisible
-  while `extract_openai_usage` coerced it to 0 and recorded that as measured.
-  The docs said the reporter covered both, and a reporter present on a path but
-  structurally unable to read that path's data shape *reads as coverage*. It now
-  descends one level and names the field as `parent.child`. Note the direction,
-  because it decides the severity: with `cached` at 0, `tokens_in = prompt -
-  cached` becomes the **full** prompt at the full rate, so this over-billed and
-  tripped the cap early rather than under-measuring.
-- **A correction reached the code and not the prose.** The executor comment
-  wrongly claiming `status="error"` falls back to the validator's `TESTS:` claim
-  was fixed in round 2 — but the same sentence survived in `README.md` and in
-  CLAUDE.md's own round-1 list, so this document contradicted its own
-  correction. `TestResult.passed` returns `False` for `"error"` as well as
-  `"fail"`; only `"na"` falls back. The real consequence, and the one an
-  operator needs, is that an unresolvable test command fails *every* round and
-  burns `max_revisions`.
-
-The verifier's own caveat is worth keeping: all of this remains mock-driven.
-The framing at the top of this section — 0 tasks, 0 attempts, three criticals on
-the one path 740 tests could not see — applies to the verification too. The
-nested-cache gap is precisely that class of bug: a data shape nobody had a live
-sample of. Watch the first few real runs' `attempts` rows and `runner_warning`
-events.
-
-**What was checked and found sound**, because a review naming no confirmed
-property is not a review: all 43 `store.py` write sites are transactionally
-paired and the `events` table is genuinely append-only (verified by AST walk);
-the claim is a real compare-and-swap; every decision rule in the section above
-is enforced where it is documented; the tests gate reads executed truth; the
-OpenAI auth path (call-time key, no redirect, https-or-loopback) and its
-permanent-vs-transient classification are correct; prompt assembly matches the
-spec and an absent charter is byte-identical; `_invoke`'s coercion barrier is
-above the closing transaction; `parse_coverage`, `parse_tool_requests` and
-`_extract_findings` are total. **No refactor was recommended**: `loop.py` and
-`store.py` were both judged deep modules earning their size, and splitting them
-would scatter the transaction, CAS and lease discipline across four callers.
-
-**No decision rule changed.** The thresholds, revision counting, the budget-cap
-rule, the tests gate, the tool-gate direction and the provider rule all read the
-same fields they did before. What changed is that several of them can now
-actually be reached: a verdict that parses, a token count that is measured, a
-budget cap that is not tripped by its own default, and a durability layer that
-runs at all.
-
-## Slice 9: existing-repository workspaces
-
-`executor.workspace_for` did `mkdir` and returned; nothing ever put the
-operator's code in a task's workspace, and `ClaudeSDKRunner.build_options`
-never passed `cwd` even though the SDK accepts it — so the worker's prompt
-said "write under the workspace" while its actual working directory was the
-orchestrator's own repository. Measured consequence: the tests gate silently
-disabled itself, because an empty workspace makes `executor._has_any_file`
-return False, the result is `status='na'`, and `na` is the one value that
-falls back to the validator's unverified `TESTS:` claim — the single gate
-that reads executed truth stopped reading anything. Three phases (P1-P3) built
-the pieces with `loop.py` either untouched or touched only for the
-scratch-mode-reachable half (P1's `cwd` fix, P2's H3 detection scaffold); this
-phase (P4) is what turns worktree mode on by threading `repo_root` through
-every `vcs.*` call site `loop.py` already had.
-
-**Approach: one git worktree per task**, created on its own branch from the
-configured base ref, sharing the object store — chosen over a clone because it
-does not copy history and the result is already a branch of the operator's
-repository, no export step. `workspace_mode: "scratch"` (default) is
-unchanged and is a **proven** no-op in the register of `vcs_enabled=False`: a
-whole-state differential
-(`test_scratch_mode_is_identical_whether_or_not_worktree_knobs_are_set`,
-[NEUTER]) runs the identical scripted task with every worktree knob
-(`repo_root`/`worktree_root`/`vcs_base_ref`/`vcs_branch_prefix`) filled in with
-real, reachable values against a run with none of them set, and diffs the
-whole observable state — plus a control proving the same knobs, with
-`workspace_mode` flipped to `'worktree'`, genuinely touch the operator repo
-(a branch is created), so the equality above is a real differential and not
-two runs that both ignored everything.
-
-**Four measured probes shaped the design** (`vcs.py`'s own docstrings carry
-the detail; this is the summary). Worktrees of one repository share **one ref
-namespace** — an update to the base ref written inside one worktree is
-immediately visible from every sibling and the main repo — so refs are now
-per-task functions (`vcs.base_ref(task_id)`, `vcs.approved_ref(task_id)`,
-`vcs.discarded_ref_prefix(task_id)`), constants only when `task_id` is `None`
-(scratch mode). The local config setting command run from inside a worktree
-writes the **main** repository's config, not a config under the worktree at
-all — so the config pin fingerprints `<repo_root>/.git/config`, and because
-every task of one repository shares that one file, P2's remediation made it a
-**repository-level baseline** (`Store.vcs_repo_pin`/`vcs_repo_pins`, keyed by
-`repo_root`) rather than a per-task mint: a per-task pin let an ordinary
-later task's `init_repo` re-bless a config an earlier task had poisoned,
-measured as arbitrary command execution outside every workspace under
-`allow_test_exec=False`. A worktree's `.git` is a regular **file** (a
-`gitdir:` pointer), not a directory, which defeats every one of the
-scratch-mode guard's conditions outright — `_guard` therefore grows a second,
-worktree-shaped branch (`_guard_worktree`) rather than a patch to the first,
-identity-anchored on `repo_root` (operator config, never agent-writable): HEAD
-must resolve to the derived task branch (a worker's own `git` tool can
-otherwise move the operator's real branch, unguarded by anything the first
-four conditions check), and the worktree's admin directory is verified by
-git's own back-pointer rather than by containment in a shared parent
-(containment there repeated slice 6's own prior escape one directory up — a
-sibling task's worktree already existing was enough to let task 2 hijack task
-1's real branch). A workspace **outside** the repository needs no exclusion
-mechanism at all (the main repo's status stayed clean with a worktree
-elsewhere on disk, measured), which is the *smaller* half of why worktrees
-live outside `repo_root`; the larger half is residual 2 below.
-
-**Base is the worktree's starting commit, never an empty one** — the single
-most dangerous difference from scratch mode, where base is deliberately empty
-because a rollback must not resurrect whatever a throwaway directory happened
-to hold. Here the same choice would delete the operator's entire checkout on
-the task branch, so `rollback` returning to the starting commit *is* the
-recovery contract rather than a detail of it. `commit` drops the
-force-add flag in worktree mode: force-adding ignored files is what makes a
-scratch rollback fully recoverable, but here it would commit `node_modules`/
-`.venv` into the task branch every round — the cost is real and named per
-rollback (`ignored_unrecoverable`), never hidden. `remove_worktree` removes
-the checkout **then** prunes the admin entry, never a bare `rmtree`, because
-deleting the directory alone leaves the admin entry under
-`<repo_root>/.git/worktrees/<name>` registered, and a listing keeps reporting
-a workspace that is gone.
-
-**P4: threading `repo_root` through `loop.py`.** `Loop._worktree_repo_root()`
-computes the mode once per call (`None` in scratch mode, the absolute
-`repo_root` in worktree mode — `os.path.abspath`, lexically, matching
-`vcs._git`'s own `-C` handling, not `Path.resolve()`, which would follow a
-junction and answer a question about a different repository than the one
-`config.repo_root` names) and every one of `run_task`'s existing `vcs.*` call
-sites reads the same answer rather than re-deriving it, so scratch mode
-staying a **proven** no-op does not depend on getting the same derivation
-right in six different places. `Loop._worktree_pin(task_id, repo_root)`
-chooses the matching pin table (`Store.vcs_repo_pin` in worktree mode,
-`Store.vcs_pin` in scratch mode) the same way. The AST guard's own inventory
-grew from 6 to 12 `vcs.*` call expressions in this phase, across 10 distinct
-names — a third `working_tree_state` was **not** added for residual 2's
-snapshot (see below); a second `init_repo` (`human_redo`'s worktree fresh
-start), `remove_worktree`/`remove_task_branch` (also `human_redo`), and
-`base_ref`/`discarded_ref_prefix` (`_vcs_rollback_to_base` now selects the
-per-task ref names instead of reading the scratch-mode module constants
-directly) account for the rest, and the control that asserts the count is
-changed in the same commit as the count itself, per this project's own
-standing rule. **No new decision rule**: every one of these calls stays
-*call, log, discard*, and the AST guard
-(`test_no_status_write_is_downstream_of_a_vcs_result`) still walks `loop.py`
-and fails if a `VcsResult` ever reaches a status write — extended with two
-more planted violations in the new call shapes (a `repo_root=`/`task_id=`
-call assigned to a tainted name, and the same shape reaching a status write
-through `_vcs_rollback_to_base`) to prove the walker catches the worktree
-shape and not only the scratch one it was built against.
-
-**`run_planner` gets `cwd=repo_root`** (read-only: the planner declares
-`file_read`, not `file_io`) in worktree mode and `None` in scratch mode — a
-plan row has no task workspace to point it at, which is why this seam was left
-open rather than filled in P1 alongside the worker/validator.
-
-**A worktree survives `DONE`.** The loop never removes one on success — settled
-in interview, and the opposite of `_clear_worktree`'s pre-existing,
-unrelated-by-coincidence name (that helper is the *scratch*-mode redo residue
-fallback, predating this slice, and still only ever called on a `.git`
-*directory*). Removal happens only on `human_redo` and the explicit
-`agentloop workspace prune`. **`human_redo`'s worktree-mode fresh start is
-"remove and recreate"** the checkout, not reset-in-place:
-`_vcs_rollback_to_base` still runs first and, in the shape that actually
-happened, writes the per-task discarded ref at whatever the branch's prior
-tip was (or records nothing when there was nothing to discard) —
-recreation only follows *after* that history is safely reachable. **Not
-unconditionally** (round-4 remediation, found independently by two
-mutually-blind reviewers via two different attacks — one monkeypatching the
-ref write, one a real git ref-namespace collision needing no monkeypatch at
-all): the remove-and-recreate step is gated on
-`result.ok and result.reason != "residue"`, the same discriminator the
-scratch-mode fallback already used correctly a few lines below it. A
-rollback that fails outright, or a genuine git-level failure such as the
-discarded ref's own path being pre-occupied by an ordinary ref, returns
-`ok=False` with **nothing** written — the earlier unconditional version
-still deleted the branch in that case, permanently orphaning the round's
-commits the moment an ordinary `git gc` ran, since `git show <sha>`
-resolving an orphan proves nothing about survivability. When the gate is not
-met, the worktree and its branch are left exactly as they are — the
-`vcs_unavailable`/degraded `vcs_rollback` event `_vcs_rollback_to_base`
-already logs is the record — and a later run retries. This closes the gap
-P2 explicitly deferred:
-`init_repo`'s worktree branch always creates without allowing an overwrite of
-an existing branch of the same name (a branch that already exists means a
-previous incarnation of the task, and force-resetting it would discard
-commits no human asked to discard), so a *second* redo of the same task hit
-that refusal outright — measured, the worktree-add step failing because the
-derived branch name already existed, and falsified by neutering the fix
-(removing the branch-delete call reproduces exactly that failure text). The
-decision, per the reasoning the plan asked for verified rather than assumed:
-**delete the stale branch first**. `human_redo`'s whole contract is a fresh
-start with no carried-over context, and by the time the branch is deleted its
-commits are already reachable from the discarded ref the rollback wrote one
-step earlier (reachability, never the single-commit inspection command the
-project's history already warns is insufficient — the same rule slice 6
-established, since an orphaned commit still resolves under a direct lookup) —
-so deleting the branch *name* costs nothing recoverable, only the name the
-next worktree-add needs to reuse. New `vcs.remove_task_branch` (pinned like
-every other repo-level mutation) is the one function this phase added to
-`vcs.py` beyond threading existing ones.
-
-**Residual 2, measured both ways rather than assumed** (tests 27-29). The
-executor sandbox's already-documented `..`/absolute-path escape gets a far
-worse target under worktree mode — the operator's real checkout instead of a
-throwaway directory — and putting `worktree_root` outside `repo_root`
-(enforced at config load, `LoopConfig.__post_init__`) only *reduces* it:
-relative traversal from the workspace now has to climb out of an
-agentloop-owned directory first (measured: the identical relative traversal
-that reaches the operator's real repo when `worktree_root` sits inside it
-lands inside `worktree_root` instead when it sits outside), but an
-**absolute** path reaches the repository regardless — a test written to PASS
-*because the write succeeds*, with a comment saying so, so a later isolation
-slice closing this is a visible flip rather than a silent one. Detection is
-the second, independent leg: a status snapshot of `repo_root` itself (not the
-task workspace) is taken before and after each test command runs, and a
-difference is logged as `worktree_out_of_branch_write` with
-`prevented: False` — the same H3 posture `_vcs_detect_validator_writes`
-already established, reused rather than duplicated. This needed a **new**
-narrow entry point, `vcs.repo_status(repo_root, config, pin)`, rather than
-calling `vcs.working_tree_state(repo_root, ...)` directly: measured, both of
-`_guard`'s existing shapes refuse `repo_root` with `not-a-workspace-repo` —
-the scratch branch requires the resolved workspace to sit inside
-`config.workspace_root`, which the operator's own repository is not, and the
-worktree branch requires the workspace's own git pointer to be a file, which
-`repo_root`'s is not (it is the ordinary directory every worktree's pointer
-points back to). `repo_status` is pinned like its siblings (it still spawns
-git under `<repo_root>/.git/config`) but skips `_guard` entirely, because
-`repo_root` is the one path in this whole module that is operator config read
-directly, never a workspace an agent's own tools resolve into.
-
-**`sandbox_env_allowlist` can re-admit a credential-shaped variable with no
-denylist** (test 31) — true since slice 8 shipped the allowlist, tolerable
-while the sandbox barely ran; not once worktree mode runs the operator's real
-suite every round and a real suite has a real reason to widen the knob
-(`DATABASE_URL`, a service token). `executor.credential_like_names` matches a
-small, explicitly-documented-as-a-heuristic pattern set (`*_API_KEY`,
-`*_TOKEN`, `*_SECRET`, `*_PASSWORD`, `AWS_*`) and `Loop.__init__` logs a
-`config_warning` event naming any match, on the same channel the unknown-key
-warning already uses — **a warning, not a refusal**: an operator may
-genuinely need a provider key in a real test suite, and this project's rule
-(stated once already, for the tool gate) is that an unjustifiable refusal
-becomes a knob someone disables. The matched variable is still actually
-admitted to the child process — the warning does not become a silent removal.
-
-**`agentloop status <id>` prints the task's workspace path** — the operator
-half of the trade residual 4 names (a worktree living outside `repo_root` is
-no longer somewhere an operator finds by looking beside their project
-directory), the other half being `agentloop workspace prune`, already built
-in P3.
-
-**Residuals restated from the plan, not solved:**
-
-1. A worker can write the operator's *real* local git config from inside the
-   worktree. The pin detects this before the next side-effecting call and
-   refuses (`config-changed`); detection is not prevention, and `agentloop
-   workspace rebless` (P3) is the human-only recovery for a *legitimate* edit,
-   never an automatic one.
-2. The executor sandbox's escape is reduced, not closed — see above.
-3. Ignored files are not recoverable after a worktree rollback (the dropped
-   force-add), named per-rollback (`ignored_unrecoverable`).
-4. Workspaces are no longer visible beside the repository they work on —
-   mitigated, not removed, by `agentloop status` and `agentloop workspace
-   prune`.
-5. Merge conflicts between two tasks' branches are the operator's problem;
-   the planner's DAG expresses ordering, not file-level disjointness.
-
-**What was verified rather than assumed**, per the [RED-FIRST]/[NEUTER]
-discipline this whole slice was built under: the workspace-starts-with-
-tracked-files claim (test 15) was watched failing against the pre-P4 tree —
-a genuine behavioral RED (a missing tracked file), not a collection error —
-before `run_task`'s call sites were wired; the branch-collision fix was
-falsified by removing the branch-delete call and reproducing the exact
-worktree-add failure text; the out-of-branch detection event was falsified by
-removing its one call site and confirming the assertion goes red with zero
-events recorded; and the AST guard's own extension was pinned by two new
-planted violations rather than trusted to generalize from the scratch-mode
-ones. **No decision rule changed** — the thresholds, revision counting, the
-budget cap, the tests gate and the tool gate all read the same fields they
-did before slice 8; what changed is that the loop can now be pointed at a
-real repository at all.
+Both were full adversarial-review passes (multiple independent reviewers,
+every finding reproduced with a real measured attack before being trusted,
+findings closed and re-verified in follow-up rounds). The narrative
+write-ups — what broke, how each was found, how each was fixed — moved to
+`docs/history/slice-8.md` and `docs/history/slice-9.md` (2026-09-08, to keep
+this file's every-session read cost down; content unchanged, just relocated).
+Read them before touching `server.py`'s origin/host checks, `runner.py`'s
+usage-parsing money paths, `vcs.py`'s guard, or anything the "What was
+checked and found sound" / "No decision rule changed" closing notes in each
+cover — those notes are the load-bearing summary if you don't have time for
+the full incident log.

@@ -44,9 +44,49 @@ from .store import Store
 from .toolpolicy import declared_tools, decision_effect
 
 
+def _project_ref(raw: str | None) -> int | str | None:
+    """Every `--project`/positional project argument on this CLI is typed
+    `str` by argparse (none of them declare `type=int`, because the same
+    flag also has to accept a name) -- so `Store.resolve_project`'s `int`
+    branch, which is what makes a numeric id resolve, was unreachable from
+    the CLI: `resolve_project("3")` took the name-lookup branch and raised
+    `unknown project '3'` even when project 3 exists. Every CLI call site
+    funnels its raw project text through this first. A project name that is
+    itself all digits becomes untypeable through this CLI after this fix --
+    the same trade-off `resolve_project` already made by using
+    `isinstance(project, int)` as its own dispatch."""
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return raw
+
+
 def _memory_cmd(store: Store, args) -> int:
+    """`--project` is resolved here, once, only for the two sub-commands
+    that need it to scope a QUERY or a WRITE (`list`/`add`) -- a bad
+    name/id raises `KeyError`, caught by `main`'s existing handler.
+    `approve`/`reject`/`pin`/`unpin` operate on a `memory_id` that already
+    identifies its own project row; `--project` is accepted on those four
+    for symmetry/discoverability but never consulted.
+
+    `list` and `add` resolve an omitted `--project` DIFFERENTLY, on
+    purpose: `Store.memory_list`'s own docstring names this the one place
+    `project_id=None` ("every project", matching `list_tasks`'s unfiltered
+    convention) and `resolve_project(None)` ("the default project") would
+    otherwise collide -- `list` must pass the raw, unresolved `None`
+    through so an unflagged `agentloop memory list` still shows every
+    registered project's facts, exactly as it did before this slice. `add`
+    is the opposite: a write must land in exactly one concrete project, so
+    resolving an omitted `--project` to the default there is correct."""
     if args.mem_cmd == "list":
-        rows = store.memory_list()
+        project_id = (
+            None
+            if args.project is None
+            else store.resolve_project(_project_ref(args.project))
+        )
+        rows = store.memory_list(project_id=project_id)
         if not rows:
             print("(no memory yet)")
         for r in rows:
@@ -62,8 +102,14 @@ def _memory_cmd(store: Store, args) -> int:
         store.memory_delete(args.memory_id)
         print(f"Memory {args.memory_id} deleted.")
     elif args.mem_cmd == "add":
+        project_id = store.resolve_project(_project_ref(args.project))
         store.memory_write(
-            args.tier, args.key, args.value, approved=args.approved, pinned=args.pinned
+            args.tier,
+            args.key,
+            args.value,
+            approved=args.approved,
+            pinned=args.pinned,
+            project_id=project_id,
         )
         state = "approved" if args.approved else "pending approval"
         pin = ", pinned" if args.pinned else ""
@@ -590,6 +636,7 @@ def main(argv: list[str] | None = None) -> int:
     a.add_argument("--goal", required=True)
     a.add_argument("--criteria", required=True)
     a.add_argument("--risk", type=int, default=1, choices=[0, 1, 2])
+    a.add_argument("--project", default=None, help="Project name or id")
 
     pl = sub.add_parser("plan", help="Decompose a goal into a task graph")
     pl.add_argument("goal")
@@ -597,6 +644,7 @@ def main(argv: list[str] | None = None) -> int:
     pl.add_argument("--title", default="")
     pl.add_argument("--risk", type=int, default=1, choices=[0, 1, 2])
     pl.add_argument("--runner", default="claude", choices=["claude", "openai", "mock"])
+    pl.add_argument("--project", default=None, help="Project name or id")
 
     ap = sub.add_parser("approve-plan", help="Sign a plan off; its tasks may run")
     ap.add_argument("task_id", type=int)
@@ -605,9 +653,15 @@ def main(argv: list[str] | None = None) -> int:
     r = sub.add_parser("run", help="Run the loop over pending tasks")
     r.add_argument("--runner", default="claude", choices=["claude", "openai", "mock"])
     r.add_argument("--max-tasks", type=int, default=None)
+    r.add_argument(
+        "--project",
+        default=None,
+        help="Project name or id (omit to span every registered project)",
+    )
 
     s = sub.add_parser("status", help="Show tasks (or one task's metrics)")
     s.add_argument("task_id", nargs="?", type=int)
+    s.add_argument("--project", default=None, help="Project name or id")
 
     for name in ("approve", "reject", "redo"):
         c = sub.add_parser(name, help=f"Human decision: {name} a task")
@@ -619,8 +673,9 @@ def main(argv: list[str] | None = None) -> int:
         c.add_argument("task_id", type=int)
         c.add_argument("--note", default="")
 
-    e = sub.add_parser("events", help="Audit trail for a task")
-    e.add_argument("task_id", type=int)
+    e = sub.add_parser("events", help="Audit trail for a task (or a whole project)")
+    e.add_argument("task_id", nargs="?", type=int)
+    e.add_argument("--project", default=None, help="Project name or id")
 
     sv = sub.add_parser("serve", help="Run the live dashboard (Phase 2)")
     sv.add_argument("--host", default=None)
@@ -643,10 +698,15 @@ def main(argv: list[str] | None = None) -> int:
 
     m = sub.add_parser("memory", help="Inspect and gate the memory store")
     msub = m.add_subparsers(dest="mem_cmd", required=True)
-    msub.add_parser("list", help="Show all facts, both tiers")
+    mlist = msub.add_parser("list", help="Show all facts, both tiers")
+    mlist.add_argument("--project", default=None, help="Project name or id")
     for name in ("approve", "reject", "pin", "unpin"):
         mc = msub.add_parser(name, help=f"{name} a memory fact")
         mc.add_argument("memory_id", type=int)
+        # A memory_id already identifies its own project row -- --project is
+        # not needed to resolve it, but the flag stays available here for
+        # symmetry/discoverability with list/add, unused by these four.
+        mc.add_argument("--project", default=None, help="Project name or id")
     ma = msub.add_parser("add", help="Add a fact directly")
     ma.add_argument("key")
     ma.add_argument("value")
@@ -657,6 +717,7 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Pin: always injected, ahead of the cap (still needs approval to be read)",
     )
+    ma.add_argument("--project", default=None, help="Project name or id")
 
     tl = sub.add_parser("tools", help="The agent-requested tool queue")
     tlsub = tl.add_subparsers(dest="tools_cmd", required=True)
@@ -701,6 +762,42 @@ def main(argv: list[str] | None = None) -> int:
     )
     wsrebless.add_argument("--note", default="", help="Why, for the audit trail")
 
+    prj = sub.add_parser("project", help="Manage registered projects")
+    prjsub = prj.add_subparsers(dest="project_cmd", required=True)
+    prjadd = prjsub.add_parser("add", help="Register a new project")
+    prjadd.add_argument("name")
+    prjadd.add_argument("--repo-root", required=True)
+    prjadd.add_argument(
+        "--workspace-mode", default="scratch", choices=["scratch", "worktree"]
+    )
+    prjadd.add_argument(
+        "--default", action="store_true", help="Make this the active default"
+    )
+    prjrename = prjsub.add_parser("rename", help="Rename a project")
+    prjrename.add_argument("old_name")
+    prjrename.add_argument("new_name")
+    prjrepoint = prjsub.add_parser(
+        "repoint", help="Change a project's repo_root/workspace_mode"
+    )
+    prjrepoint.add_argument("name")
+    prjrepoint.add_argument("--repo-root", required=True)
+    prjrepoint.add_argument(
+        "--workspace-mode",
+        default=None,
+        choices=["scratch", "worktree"],
+        help="Omit to keep the project's current workspace_mode unchanged",
+    )
+    prjlist = prjsub.add_parser("list", help="Every registered project")
+    prjlist.add_argument(
+        "--archived", action="store_true", help="Include archived projects too"
+    )
+    prjarchive = prjsub.add_parser(
+        "archive", help="Archive a project (no active tasks)"
+    )
+    prjarchive.add_argument("name")
+    prjuse = prjsub.add_parser("use", help="Set the active default project")
+    prjuse.add_argument("name")
+
     ev = sub.add_parser("eval", help="Evaluation harness (calibration / batch)")
     ev.add_argument("--runner", default="mock", choices=["claude", "openai", "mock"])
     ev.add_argument(
@@ -731,6 +828,28 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     try:
+        # Resolved once, right after `_build()` succeeds, before dispatch — a
+        # bad name/id raises KeyError, already caught by this same handler
+        # below and rendered as `error: unknown project '<name>'`.
+        #
+        # `run` is deliberately NOT resolved when `--project` is omitted:
+        # `Loop.run(project_id=None)` (Phase 3) spans every registered
+        # project in one pass, and resolving a bare `agentloop run` to just
+        # the default would make that capability unreachable from the CLI.
+        # Every other project-aware command (`add`/`plan`/`status`/`events`)
+        # DOES resolve when omitted — a task must belong to exactly one
+        # concrete project, and `status`/`events` with no `--project` show
+        # "the active default project", matching today's single-project
+        # output byte-for-byte, never "every project" unfiltered.
+        if args.cmd == "run":
+            raw = getattr(args, "project", None)
+            args.project_id = (
+                store.resolve_project(_project_ref(raw)) if raw is not None else None
+            )
+        elif args.cmd in ("add", "plan", "status", "events"):
+            args.project_id = store.resolve_project(
+                _project_ref(getattr(args, "project", None))
+            )
         return _dispatch(args, store, loop)
     except (KeyError, ValueError) as exc:
         # Bad id (no such task/memory row), or an id used with the wrong command
@@ -754,12 +873,15 @@ def _dispatch(args, store: Store, loop: Loop) -> int:
             goal=args.goal,
             acceptance_criteria=args.criteria,
             risk_level=args.risk,
+            project_id=args.project_id,
         )
         tid = store.add_task(task)
         print(f"Task {tid} defined: {args.title}")
 
     elif args.cmd == "plan":
-        plan = loop.plan(args.goal, args.criteria, args.title, args.risk)
+        plan = loop.plan(
+            args.goal, args.criteria, args.title, args.risk, project_id=args.project_id
+        )
         children = store.plan_tasks(plan.id)
         if not children:
             # Every plan failure ends here: no tasks exist, and the reason the
@@ -785,9 +907,9 @@ def _dispatch(args, store: Store, loop: Loop) -> int:
         print(f"Plan {plan.id} approved — {n} task(s) released to the loop.")
 
     elif args.cmd == "run":
-        n = loop.run(max_tasks=args.max_tasks)
+        n = loop.run(max_tasks=args.max_tasks, project_id=args.project_id)
         print(f"Processed {n} task(s).")
-        for t in store.list_tasks():
+        for t in store.list_tasks(project_id=args.project_id):
             tag = "PLAN " if t.kind == "plan" else "     "
             print(
                 f"  [{t.id}] {tag}{t.status.value:12s} {t.title}"
@@ -833,11 +955,11 @@ def _dispatch(args, store: Store, loop: Loop) -> int:
                 # from config + task id whether or not anything has created it
                 # yet, and a task that never ran still has a workspace it
                 # *would* use.
-                repo_root = (
-                    os.path.abspath(loop.config.repo_root)
-                    if loop.config.workspace_mode == "worktree"
-                    else None
-                )
+                # Resolved from the task's OWN project (Phase 3's
+                # per-task _worktree_repo_root), not loop.config directly —
+                # a task in a different project than whatever this process's
+                # loopconfig.json names must show ITS OWN workspace path.
+                repo_root = loop._worktree_repo_root(t)
                 ws = workspace_for(
                     loop.config.workspace_root,
                     t.id,
@@ -851,7 +973,7 @@ def _dispatch(args, store: Store, loop: Loop) -> int:
             if t.output:
                 print(f"\n--- output ---\n{t.output}")
         else:
-            for t in store.list_tasks():
+            for t in store.list_tasks(project_id=args.project_id):
                 tag = "PLAN " if t.kind == "plan" else "     "
                 print(
                     f"[{t.id}] {tag}{t.status.value:12s} rev={t.revision_count}"
@@ -872,7 +994,8 @@ def _dispatch(args, store: Store, loop: Loop) -> int:
         print(f"Task {t.id} -> {t.status.value} (control={t.control})")
 
     elif args.cmd == "events":
-        for ev in store.events(args.task_id):
+        events = store.events(args.task_id, project_id=args.project_id)
+        for ev in events:
             print(f"{ev['ts']:.0f} {ev['kind']:20s} {json.dumps(ev['payload'])[:120]}")
 
     elif args.cmd == "serve":
@@ -902,6 +1025,62 @@ def _dispatch(args, store: Store, loop: Loop) -> int:
 
     elif args.cmd == "workspace":
         return _workspace_cmd(store, loop.config, args)
+
+    elif args.cmd == "project":
+        return _project_cmd(store, args)
+    return 0
+
+
+def _project_cmd(store: Store, args) -> int:
+    """`agentloop project add|rename|repoint|list|archive|use`. Raises
+    KeyError/ValueError for a bad name/id, an unknown project, a duplicate
+    name, or an invalid repo_root/workspace_mode — `main`'s existing
+    `except (KeyError, ValueError)` handler renders these as a clean
+    `error: ...` line, no new exception-handling code needed here."""
+    if args.project_cmd == "add":
+        pid = store.create_project(
+            args.name, args.repo_root, workspace_mode=args.workspace_mode
+        )
+        if args.default:
+            store.set_default_project(pid)
+        print(f"Project {pid} registered: {args.name}")
+
+    elif args.project_cmd == "rename":
+        pid = store.resolve_project(_project_ref(args.old_name))
+        store.rename_project(pid, args.new_name)
+        print(f"Project {pid} renamed: {args.old_name} -> {args.new_name}")
+
+    elif args.project_cmd == "repoint":
+        pid = store.resolve_project(_project_ref(args.name))
+        # --workspace-mode omitted means "keep the current one" -- never a
+        # silent reset to scratch, which would discard a worktree-mode
+        # project's durability guarantees (round commits, recoverable
+        # reject/redo; scratch mode is a proven no-op for that whole layer)
+        # the moment an operator repoints only its repo_root.
+        workspace_mode = args.workspace_mode
+        if workspace_mode is None:
+            workspace_mode = store.get_project(pid)["workspace_mode"]
+        store.repoint_project(pid, args.repo_root, workspace_mode)
+        print(f"Project {pid} repointed: {args.repo_root} ({workspace_mode})")
+
+    elif args.project_cmd == "list":
+        for p in store.list_projects(include_archived=args.archived):
+            default_marker = "*" if p["is_default"] else " "
+            archived_marker = " [archived]" if p["archived"] else ""
+            print(
+                f"{default_marker}[{p['id']}] {p['name']:20s} {p['repo_root']}"
+                f"  ({p['workspace_mode']}){archived_marker}"
+            )
+
+    elif args.project_cmd == "archive":
+        pid = store.resolve_project(_project_ref(args.name))
+        store.archive_project(pid)
+        print(f"Project {pid} archived: {args.name}")
+
+    elif args.project_cmd == "use":
+        pid = store.resolve_project(_project_ref(args.name))
+        store.set_default_project(pid)
+        print(f"Project {pid} is now the active default: {args.name}")
     return 0
 
 

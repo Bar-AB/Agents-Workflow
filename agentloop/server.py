@@ -293,8 +293,20 @@ class _Handler(BaseHTTPRequestHandler):
         path, query = url.path, parse_qs(url.query)
         try:
             if path == "/api/tasks":
+                project_id = self._parse_project_query(query)
+                if project_id is False:
+                    return
                 self._send_json(
-                    {"tasks": [self._task_json(t) for t in self.store.list_tasks()]}
+                    {
+                        "tasks": [
+                            self._task_json(t)
+                            for t in self.store.list_tasks(project_id=project_id)
+                        ]
+                    }
+                )
+            elif path == "/api/projects":
+                self._send_json(
+                    {"projects": self.store.list_projects(include_archived=True)}
                 )
             elif path.startswith("/api/tasks/"):
                 self._task_detail(path)
@@ -327,13 +339,21 @@ class _Handler(BaseHTTPRequestHandler):
                     }
                 )
             elif path == "/api/memory":
-                self._send_json({"memory": self.store.memory_list()})
+                project_id = self._parse_project_query(query)
+                if project_id is False:
+                    return
+                self._send_json(
+                    {"memory": self.store.memory_list(project_id=project_id)}
+                )
             elif path == "/api/tool_requests":
                 self._tool_requests_list(query)
             elif path == "/api/charter":
                 self._send_json(self._charter_json())
             elif path == "/api/metrics":
-                self._send_json(self.store.run_metrics())
+                project_id = self._parse_project_query(query)
+                if project_id is False:
+                    return
+                self._send_json(self.store.run_metrics(project_id=project_id))
             elif path == "/api/config":
                 cfg = self.server.config
                 self._send_json(
@@ -356,6 +376,8 @@ class _Handler(BaseHTTPRequestHandler):
                         # has since written to disk (that needs a restart).
                         "repo_root": cfg.repo_root,
                         "workspace_mode": cfg.workspace_mode,
+                        # Slice 10: which project to select on first load.
+                        "default_project_id": self.store.default_project_id(),
                     }
                 )
             elif path == "/api/stream":
@@ -411,6 +433,17 @@ class _Handler(BaseHTTPRequestHandler):
                 else:
                     task = getattr(loop, parts[3])(int(parts[2]))
                 self._send_json({"task": self._task_json(task)})
+            # /api/projects — register a new project.
+            elif parts == ["api", "projects"]:
+                self._create_project(body)
+            # /api/projects/{id}/{rename|repoint|archive|use}
+            elif (
+                len(parts) == 4
+                and parts[0] == "api"
+                and parts[1] == "projects"
+                and parts[3] in ("rename", "repoint", "archive", "use")
+            ):
+                self._project_action(int(parts[2]), parts[3], body)
             # /api/charter — the human write surface; agents have none.
             elif parts == ["api", "charter"]:
                 self._set_charter(body)
@@ -482,12 +515,17 @@ class _Handler(BaseHTTPRequestHandler):
         if risk not in (0, 1, 2):
             self._error(400, "risk_level must be 0, 1 or 2")
             return
+        # `store.add_task` already resolves a bare `None` to the default
+        # project internally (Phase 1) -- an unknown id/name in the body
+        # raises `KeyError`, already mapped to a clean 404 by `do_POST`'s
+        # existing handler, so nothing extra is validated here.
         task = Task(
             id=None,
             title=title,
             goal=goal,
             acceptance_criteria=criteria,
             risk_level=risk,
+            project_id=body.get("project_id"),
         )
         self.store.add_task(task)
         self._send_json({"task": self._task_json(task)}, status=201)
@@ -586,6 +624,35 @@ class _Handler(BaseHTTPRequestHandler):
             ]
         }
 
+    def _parse_project_query(self, query: dict) -> int | None | bool:
+        """`?project=` on a GET endpoint: absent -> `None` (unfiltered), a
+        valid, EXISTING int -> that int, unparseable -> a 400, a
+        well-formed id naming no project -> a 404. Both error cases send
+        their own response and return `False` as a sentinel meaning "the
+        caller must return immediately, the response is already sent"
+        (matching the `int()`/`_error(400, ...)` pattern `_tool_requests_list`
+        already uses for `task_id`).
+
+        The 404 half matters because every caller of this (`/api/tasks`,
+        `/api/memory`, `/api/metrics`, `/api/tool_requests`, `/api/stream`)
+        feeds the id straight into a `project_id=` filter that answers
+        "nothing matched" for both "this project has nothing yet" and "this
+        project does not exist" -- a typo'd `?project=` in a bookmarked
+        dashboard URL rendered as a real, empty project rather than the
+        broken link it actually was."""
+        raw = (query.get("project") or [None])[0]
+        if raw is None:
+            return None
+        try:
+            project_id = int(raw)
+        except (TypeError, ValueError):
+            self._error(400, f"Bad project: {raw!r}")
+            return False
+        if self.store.get_project(project_id) is None:
+            self._error(404, f"No project {project_id}")
+            return False
+        return project_id
+
     def _tool_requests_list(self, query: dict) -> None:
         """GET /api/tool_requests[?task_id=&status=].
 
@@ -618,6 +685,35 @@ class _Handler(BaseHTTPRequestHandler):
         if status is not None and status not in {s.value for s in ToolRequestStatus}:
             self._error(400, f"Bad status: {status!r}")
             return
+        project_id = self._parse_project_query(query)
+        if project_id is False:
+            return
+        if project_id is not None and task_id is None:
+            # store.tool_requests is keyed by task_id, not project_id -- no
+            # new store method needed, since a project's set of task ids is
+            # cheap to compute here and cross-reference against.
+            project_task_ids = {
+                t.id for t in self.store.list_tasks(project_id=project_id)
+            }
+            body = self._tool_requests_json(task_id=None, status=status)
+            body["tool_requests"] = [
+                r for r in body["tool_requests"] if r["task_id"] in project_task_ids
+            ]
+            self._send_json(body)
+            return
+        if project_id is not None and task_id is not None:
+            # Both filters given together: `?project=X&task_id=Y` where Y
+            # does not belong to X used to silently ignore `project` and
+            # answer with task Y's requests regardless -- a real leak across
+            # the project boundary this whole endpoint exists to enforce.
+            # Empty, not an error: an inconsistent combination is a client
+            # bug, but this is a *read* filter, and the existing task_id-only
+            # branch below already answers "no such task" with an empty list
+            # rather than a 404, so this stays consistent with that.
+            task = self.store.get_task(task_id)
+            if task is None or task.project_id != project_id:
+                self._send_json({"tool_requests": []})
+                return
         self._send_json(self._tool_requests_json(task_id=task_id, status=status))
 
     def _charter_json(self) -> dict:
@@ -696,6 +792,61 @@ class _Handler(BaseHTTPRequestHandler):
             json.dump(data, f, indent=2)
         self._send_json({"repo_root": repo_root, "workspace_mode": workspace_mode})
 
+    def _create_project(self, body: dict) -> None:
+        """POST /api/projects — register a new project.
+
+        `Store.create_project` itself does the "validate whole, write once"
+        shape (name uniqueness, workspace_mode, an absolute existing
+        repo_root) and raises `ValueError` on any failure, mapped to a clean
+        400 by `do_POST`'s existing handler."""
+        name = body.get("name")
+        repo_root = body.get("repo_root")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("name is required")
+        if not isinstance(repo_root, str) or not repo_root.strip():
+            raise ValueError("repo_root is required")
+        workspace_mode = body.get("workspace_mode", "scratch")
+        pid = self.store.create_project(name, repo_root, workspace_mode=workspace_mode)
+        self._send_json({"project": self.store.get_project(pid)}, status=201)
+
+    def _project_action(self, project_id: int, verb: str, body: dict) -> None:
+        """POST /api/projects/{id}/{rename|repoint|archive|use}. A bad id
+        raises `KeyError` -> 404; a bad name/repo_root/workspace_mode or a
+        refused archive (default project, non-terminal tasks) raises
+        `ValueError` -> 400, both through `do_POST`'s existing handlers."""
+        if verb == "rename":
+            new_name = body.get("name")
+            if not isinstance(new_name, str) or not new_name.strip():
+                raise ValueError("name is required")
+            self.store.rename_project(project_id, new_name)
+        elif verb == "repoint":
+            repo_root = body.get("repo_root")
+            if not isinstance(repo_root, str) or not repo_root.strip():
+                raise ValueError("repo_root is required")
+            # Omitted workspace_mode preserves the project's current one --
+            # never a silent reset to scratch (the same fix cli.py's own
+            # `project repoint` needed).
+            workspace_mode = body.get("workspace_mode")
+            if workspace_mode is None:
+                current = self.store.get_project(project_id)
+                if current is None:
+                    raise KeyError(f"unknown project {project_id!r}")
+                workspace_mode = current["workspace_mode"]
+            self.store.repoint_project(project_id, repo_root, workspace_mode)
+        elif verb == "archive":
+            self.store.archive_project(project_id)
+        elif verb == "use":
+            self.store.set_default_project(project_id)
+        else:
+            # do_POST's own routing guard (`parts[3] in (...)`) is the only
+            # thing stopping an unrecognized verb from reaching here today --
+            # without this branch, one ever would silently fall through to
+            # the 200 success response below, having done nothing. Fail
+            # closed here too, so this function's own contract does not
+            # depend on staying in sync with a guard three call-frames away.
+            raise ValueError(f"unknown project action {verb!r}")
+        self._send_json({"project": self.store.get_project(project_id)})
+
     def _task_detail(self, path: str) -> None:
         try:
             task_id = int(path.rsplit("/", 1)[-1])
@@ -728,6 +879,9 @@ class _Handler(BaseHTTPRequestHandler):
         except (TypeError, ValueError):
             self._error(400, f"Bad cursor: {raw!r}")
             return
+        project_id = self._parse_project_query(query)
+        if project_id is False:
+            return
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -739,13 +893,15 @@ class _Handler(BaseHTTPRequestHandler):
         last_beat = time.time()
         try:
             while not self.server._shutdown_flag.is_set():
-                rows = self.store.events_since(cursor)
+                rows = self.store.events_since(cursor, project_id=project_id)
                 for row in rows:
                     cursor = row["id"]
                     self._emit(row["id"], "event", row)
                 if rows:
                     # State changed; push the rollup so tiles update in step.
-                    self._emit(cursor, "metrics", self.store.run_metrics())
+                    self._emit(
+                        cursor, "metrics", self.store.run_metrics(project_id=project_id)
+                    )
                 elif time.time() - last_beat > 15:
                     # Comment frame keeps proxies/idle sockets from timing out.
                     self.wfile.write(b": keep-alive\n\n")
@@ -824,6 +980,7 @@ class _Handler(BaseHTTPRequestHandler):
             "control": task.control,
             "kind": task.kind,
             "plan_id": task.plan_id,
+            "project_id": task.project_id,
             "depends_on": self.store.dependencies(task.id) if task.id else [],
             "plan_approved": (
                 self.store.is_plan_approved(task.id)

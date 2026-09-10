@@ -55,6 +55,12 @@ class Task:
     # Which plan produced this task (None for hand-defined tasks). Provenance,
     # and the handle the plan's approval gate is applied through.
     plan_id: int | None = None
+    # Which project this task belongs to. None on a bare `Task(...)` a caller
+    # constructs before it has an id — `Store.add_task` resolves it to the
+    # default project's id before the INSERT, so every existing call site that
+    # never sets it keeps working unchanged. Once persisted this is always a
+    # real project id, never None.
+    project_id: int | None = None
 
 
 class ToolRequestStatus(str, Enum):

@@ -56,6 +56,7 @@ class MemoryService:
         pinned_limit: int = _MAX_PINNED_FACTS,
         query: str = "",
         task_id: int | None = None,
+        project_id: int | None = None,
     ) -> tuple[str, dict | None]:
         """Approved facts as a prompt block, plus the provenance of that block.
 
@@ -79,8 +80,16 @@ class MemoryService:
         `task_id` is what a hit is counted against. Without it a fact's
         `hit_count` counted prompts, and worker + validator + one revision is
         three prompts inside a single task — so one ordinary task promoted a
-        fact on its own at the default threshold of three."""
-        approved = list(self.store.memory_list(approved_only=True))
+        fact on its own at the default threshold of three.
+
+        `project_id` is resolved here (never passed raw to `Store.memory_list`,
+        whose own `None` means "every project" — the opposite meaning this call
+        site needs): a caller passing `None` still gets ONE project's facts,
+        never a blend of every registered project's."""
+        project_id = self.store.resolve_project(project_id)
+        approved = list(
+            self.store.memory_list(approved_only=True, project_id=project_id)
+        )
 
         def order(r):
             return (0 if r["tier"] == "loop" else 1, r["key"])
@@ -106,7 +115,7 @@ class MemoryService:
         provenance = (
             self._provenance(query, rows, scores, len(approved)) if ranked else None
         )
-        self._record_reads(rows, scores, ranked, task_id)
+        self._record_reads(rows, scores, ranked, task_id, project_id=project_id)
         return "\n".join(lines), provenance
 
     def _rank(
@@ -165,10 +174,26 @@ class MemoryService:
             ],
         }
 
-    def read(self, tier: str, key: str, task_id: int | None = None) -> str | None:
-        value = self.store.memory_read(tier, key, approved_only=True, task_id=task_id)
+    def read(
+        self,
+        tier: str,
+        key: str,
+        task_id: int | None = None,
+        project_id: int | None = None,
+    ) -> str | None:
+        """`project_id` appended after `task_id`, matching `Store.memory_read`'s
+        own parameter order (Phase 2) — every existing call site passes
+        `task_id=` as a keyword, but an inconsistent order here would still be
+        a latent trap for a future positional caller."""
+        value = self.store.memory_read(
+            tier, key, approved_only=True, task_id=task_id, project_id=project_id
+        )
         if value is not None:
-            self.maybe_promote(tier, key)
+            # Threaded, not left to default-resolve: `maybe_promote`'s own
+            # default would resolve to "the active project," which is not
+            # necessarily the project this read was just asked about — a
+            # project-scoped read must promote against ITS OWN project.
+            self.maybe_promote(tier, key, project_id=project_id)
         return value
 
     # -- writes --------------------------------------------------------------
@@ -180,15 +205,18 @@ class MemoryService:
         value: str,
         approved: bool = False,
         pinned: bool = False,
+        project_id: int | None = None,
     ) -> None:
         """Record a candidate fact. Unapproved by default: a human gates it
         before it can ever influence a prompt. Pinning still requires approval
         to be injected — a pinned but unapproved fact is not read."""
-        self.store.memory_write(tier, key, value, approved=approved, pinned=pinned)
+        self.store.memory_write(
+            tier, key, value, approved=approved, pinned=pinned, project_id=project_id
+        )
 
     # -- promotion -----------------------------------------------------------
 
-    def maybe_promote(self, tier: str, key: str) -> bool:
+    def maybe_promote(self, tier: str, key: str, project_id: int | None = None) -> bool:
         """Promote a hot project fact to loop memory. Returns True if promoted.
 
         The read of `hit_count` and the move it justifies happen in one
@@ -199,11 +227,20 @@ class MemoryService:
 
         Promotion is a *transition* — `Store.memory_promote` moves the row
         rather than copying it, so this cannot fire twice for one fact: the row
-        is no longer `project`, and nothing else is."""
+        is no longer `project`, and nothing else is.
+
+        Resolved here, mirroring `facts_for_prompt`'s own pattern: `_find`
+        calls `Store.memory_list`, whose `project_id=None` deliberately means
+        "every project" (Phase 2) — the opposite of what an omitted
+        `project_id` should mean at THIS seam. Left unresolved, an omitted
+        `project_id` would let `_find` scan every registered project's rows
+        of this tier+key and promote whichever one sorts first — not
+        necessarily the caller's own project, silently."""
+        project_id = self.store.resolve_project(project_id)
         if tier != "project":
             return False
         with self.store.transaction():
-            row = self._find(tier, key)
+            row = self._find(tier, key, project_id=project_id)
             if row is None or row["hit_count"] < self.promote_threshold:
                 return False
             self.store.memory_promote(int(row["id"]))
@@ -215,6 +252,7 @@ class MemoryService:
         scores: dict[int, float],
         ranked: bool,
         task_id: int | None = None,
+        project_id: int | None = None,
     ) -> None:
         """Count a hit only where there is evidence the fact was relevant.
 
@@ -242,12 +280,16 @@ class MemoryService:
             if scores.get(int(r["id"]), 0.0) <= 0.0:
                 continue
             self.store.memory_read(
-                r["tier"], r["key"], approved_only=True, task_id=task_id
+                r["tier"],
+                r["key"],
+                approved_only=True,
+                task_id=task_id,
+                project_id=project_id,
             )
-            self.maybe_promote(r["tier"], r["key"])
+            self.maybe_promote(r["tier"], r["key"], project_id=project_id)
 
-    def _find(self, tier: str, key: str) -> dict | None:
-        for r in self.store.memory_list(tier=tier):
+    def _find(self, tier: str, key: str, project_id: int | None = None) -> dict | None:
+        for r in self.store.memory_list(tier=tier, project_id=project_id):
             if r["key"] == key:
                 return r
         return None

@@ -751,7 +751,10 @@ def _charter_block(store: Store) -> tuple[str, int | None]:
 
 
 def _memory_block(
-    memory: MemoryService | None, query: str = "", task_id: int | None = None
+    memory: MemoryService | None,
+    query: str = "",
+    task_id: int | None = None,
+    project_id: int | None = None,
 ) -> tuple[str, dict | None]:
     """Approved facts only — unvetted memory never reaches a prompt.
 
@@ -764,10 +767,14 @@ def _memory_block(
     (no query, or ranking disabled) has no provenance and logs nothing.
 
     `task_id` is what any hit this injection earns is counted against — see
-    `MemoryService._record_reads`."""
+    `MemoryService._record_reads`. `project_id` is the task's own project
+    (slice 10) — never left to default-resolve, or a task belonging to a
+    non-default project would be shown a different project's facts."""
     if memory is None:
         return "", None
-    facts, provenance = memory.facts_for_prompt(query=query, task_id=task_id)
+    facts, provenance = memory.facts_for_prompt(
+        query=query, task_id=task_id, project_id=project_id
+    )
     block = f"\n## Known project facts\n{facts}\n" if facts else ""
     return block, provenance
 
@@ -907,7 +914,7 @@ def run_worker(
     charter, charter_version = _charter_block(store)
     prompt += charter
     memory_block, retrieval = _memory_block(
-        memory, _retrieval_query(task, feedback), task.id
+        memory, _retrieval_query(task, feedback), task.id, project_id=task.project_id
     )
     prompt += memory_block
     prompt += _upstream_block(store, task)
@@ -1053,7 +1060,10 @@ def run_planner(
     charter, charter_version = _charter_block(store)
     prompt += charter
     memory_block, retrieval = _memory_block(
-        memory, _retrieval_query(plan_task), plan_task.id
+        memory,
+        _retrieval_query(plan_task),
+        plan_task.id,
+        project_id=plan_task.project_id,
     )
     prompt += memory_block
     prompt += (
@@ -1239,7 +1249,10 @@ def run_validator(
     charter, charter_version = _charter_block(store)
     prompt += charter
     memory_block, retrieval = _memory_block(
-        memory, _retrieval_query(task, worker_output), task.id
+        memory,
+        _retrieval_query(task, worker_output),
+        task.id,
+        project_id=task.project_id,
     )
     prompt += memory_block
     prompt += _test_block(test_result)

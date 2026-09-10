@@ -3,7 +3,18 @@ import { api } from '../api'
 
 // Task definition is the first human-in-the-loop step (spec §4.1), so it
 // belongs in the dashboard rather than being CLI-only.
-export function NewTaskForm({ onCreated }: { onCreated: () => void }) {
+export function NewTaskForm({
+  onCreated,
+  projectId,
+}: {
+  onCreated: () => void
+  // `null` ("All projects" is selected) resolves to the server's own
+  // default project, matching every CLI call site that never sets this —
+  // never omitted silently while a *specific* project is selected, which
+  // would create the task in Default while the board visibly shows another
+  // project's tasks.
+  projectId: number | null
+}) {
   const [title, setTitle] = useState('')
   const [goal, setGoal] = useState('')
   const [criteria, setCriteria] = useState('')
@@ -21,6 +32,7 @@ export function NewTaskForm({ onCreated }: { onCreated: () => void }) {
         goal,
         acceptance_criteria: criteria,
         risk_level: risk,
+        ...(projectId === null ? {} : { project_id: projectId }),
       })
       setTitle('')
       setGoal('')
